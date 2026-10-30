@@ -40,6 +40,23 @@ pub(crate) fn gamma_target_format(format: TextureFormat) -> TextureFormat {
     gamma_target_format_for(format, enabled())
 }
 
+/// GL picks a texture target from the layer count, ignoring the requested view dimension.
+/// Array textures therefore need at least two layers and must not look like a cube map.
+pub fn array_storage_layers(square: bool, layers: u32) -> u32 {
+    array_storage_layers_for(square, layers, enabled())
+}
+
+fn array_storage_layers_for(square: bool, layers: u32, gl: bool) -> u32 {
+    if !gl {
+        return layers;
+    }
+    let mut storage = layers.max(2);
+    if square && storage % 6 == 0 {
+        storage += 1;
+    }
+    storage
+}
+
 fn view_formats_for(formats: &'static [TextureFormat], gl: bool) -> &'static [TextureFormat] {
     if gl { &[] } else { formats }
 }
@@ -85,5 +102,16 @@ mod tests {
         assert_eq!(view_format_for(Some(RAW), false), Some(RAW));
         assert_eq!(scene_storage_format_for(ENCODED, false), RAW);
         assert_eq!(gamma_target_format_for(ENCODED, false), RAW);
+    }
+
+    #[test]
+    fn gl_array_storage_avoids_one_and_cube_layer_counts() {
+        assert_eq!(array_storage_layers_for(true, 1, true), 2);
+        assert_eq!(array_storage_layers_for(false, 1, true), 2);
+        assert_eq!(array_storage_layers_for(true, 6, true), 7);
+        assert_eq!(array_storage_layers_for(true, 12, true), 13);
+        assert_eq!(array_storage_layers_for(false, 6, true), 6);
+        assert_eq!(array_storage_layers_for(true, 5, true), 5);
+        assert_eq!(array_storage_layers_for(true, 6, false), 6);
     }
 }

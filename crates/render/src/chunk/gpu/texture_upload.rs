@@ -614,13 +614,15 @@ fn upload_texture_page_format(
 ) -> (Texture, TextureView, u64) {
     let mip_level_count = u32::try_from(texture_array.mips.len())
         .expect("validated texture pages have a bounded mip count");
+    let side = texture_array.mips.first().map_or(1, |mip| mip.size);
+    let storage_layers = crate::gl_compat::array_storage_layers(true, texture_array.layers);
     let texture = render_device.create_texture(&TextureDescriptor {
         label: Some(label),
         // Pages may differ in layer size; server overlay pages keep source resolution.
         size: Extent3d {
-            width: texture_array.mips.first().map_or(1, |mip| mip.size),
-            height: texture_array.mips.first().map_or(1, |mip| mip.size),
-            depth_or_array_layers: texture_array.layers,
+            width: side,
+            height: side,
+            depth_or_array_layers: storage_layers,
         },
         mip_level_count,
         sample_count: 1,
@@ -654,7 +656,7 @@ fn upload_texture_page_format(
         label: Some(label),
         dimension: Some(TextureViewDimension::D2Array),
         mip_level_count: Some(mip_level_count),
-        array_layer_count: Some(texture_array.layers),
+        array_layer_count: Some(storage_layers),
         ..Default::default()
     });
     (texture, view, queue_upload_bytes)

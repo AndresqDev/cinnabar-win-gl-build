@@ -380,11 +380,19 @@ impl UiGpuTextures {
     }
 }
 
+/// GL cannot allocate a one-layer or six-layer square texture and bind it as D2Array.
+fn bucket_storage_layers(bucket: &render_model::UiTextureBucket) -> u32 {
+    crate::gl_compat::array_storage_layers(
+        bucket.dimensions[0] == bucket.dimensions[1],
+        bucket.layers,
+    )
+}
+
 /// Counts the storage requested by a validated dimension bucket.
 fn bucket_bytes(bucket: &render_model::UiTextureBucket) -> u64 {
     u64::from(bucket.dimensions[0])
         * u64::from(bucket.dimensions[1])
-        * u64::from(bucket.layers)
+        * u64::from(bucket_storage_layers(bucket))
         * bucket.format.bytes_per_texel() as u64
 }
 
@@ -417,7 +425,7 @@ fn create_texture(device: &RenderDevice, bucket: &render_model::UiTextureBucket)
         size: Extent3d {
             width: bucket.dimensions[0],
             height: bucket.dimensions[1],
-            depth_or_array_layers: bucket.layers,
+            depth_or_array_layers: bucket_storage_layers(bucket),
         },
         mip_level_count: 1,
         sample_count: 1,
