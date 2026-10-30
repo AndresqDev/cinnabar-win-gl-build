@@ -409,6 +409,8 @@ pub(super) fn upload_skin(
         return;
     }
     let side = render_model::actor_skin_side(&frame.skin).expect("admitted hand skin") as u32;
+    let storage_layers = crate::gl_compat::array_storage_layers(true, 1);
+    let pixels = crate::gl_compat::array_pixels(true, 1, &frame.skin);
     let texture = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -416,7 +418,7 @@ pub(super) fn upload_skin(
             size: Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: 1,
+                depth_or_array_layers: storage_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -426,7 +428,7 @@ pub(super) fn upload_skin(
             view_formats: gpu.raw_views.view_formats(),
         },
         TextureDataOrder::LayerMajor,
-        &frame.skin,
+        &pixels,
     );
     let view = texture.create_view(&TextureViewDescriptor {
         label: Some("first-person rig skin layer"),
@@ -480,6 +482,10 @@ pub(super) fn upload_atlas(
         }) {
             continue;
         }
+        let storage_layers =
+            crate::gl_compat::array_storage_layers(atlas.width == atlas.height, atlas.layers);
+        let pixels =
+            crate::gl_compat::array_pixels(atlas.width == atlas.height, atlas.layers, &atlas.rgba8);
         let texture = device.create_texture_with_data(
             queue,
             &TextureDescriptor {
@@ -487,7 +493,7 @@ pub(super) fn upload_atlas(
                 size: Extent3d {
                     width: u32::from(atlas.width),
                     height: u32::from(atlas.height),
-                    depth_or_array_layers: atlas.layers,
+                    depth_or_array_layers: storage_layers,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
@@ -497,7 +503,7 @@ pub(super) fn upload_atlas(
                 view_formats: raw_views.view_formats(),
             },
             TextureDataOrder::LayerMajor,
-            &atlas.rgba8,
+            &pixels,
         );
         let view = texture.create_view(&TextureViewDescriptor {
             label: Some("first-person item atlas layers"),

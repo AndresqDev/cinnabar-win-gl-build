@@ -137,6 +137,8 @@ fn texture_array(
     layers: u32,
     pixels: &[u8],
 ) -> (Texture, TextureView) {
+    let storage_layers = crate::gl_compat::array_storage_layers(true, layers);
+    let pixels = crate::gl_compat::array_pixels(true, layers, pixels);
     let texture = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -144,7 +146,7 @@ fn texture_array(
             size: Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: layers,
+                depth_or_array_layers: storage_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -154,7 +156,7 @@ fn texture_array(
             view_formats: &[],
         },
         TextureDataOrder::LayerMajor,
-        pixels,
+        &pixels,
     );
     let view = texture.create_view(&TextureViewDescriptor {
         label: Some("screen overlay texture layers"),

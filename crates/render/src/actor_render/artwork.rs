@@ -467,10 +467,17 @@ fn upload_page(
         height: u32::from(page.height),
         depth_or_array_layers: page.layers,
     };
+    let storage_size = Extent3d {
+        depth_or_array_layers: crate::gl_compat::array_storage_layers(
+            page.width == page.height,
+            page.layers,
+        ),
+        ..size
+    };
     let texture = gpu_allocation::checked(device, label, page.rgba8.len() as u64, || {
         device.create_texture(&TextureDescriptor {
             label: Some(label),
-            size,
+            size: storage_size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,

@@ -147,6 +147,8 @@ fn texture_array(
     side: u32,
     pixels: &[u8],
 ) -> (Texture, TextureView) {
+    let storage_layers = crate::gl_compat::array_storage_layers(true, 6);
+    let pixels = crate::gl_compat::array_pixels(true, 6, pixels);
     let texture = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -154,7 +156,7 @@ fn texture_array(
             size: Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: 6,
+                depth_or_array_layers: storage_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -164,7 +166,7 @@ fn texture_array(
             view_formats: &[],
         },
         TextureDataOrder::LayerMajor,
-        pixels,
+        &pixels,
     );
     let view = texture.create_view(&TextureViewDescriptor {
         label: Some("menu panorama face layers"),

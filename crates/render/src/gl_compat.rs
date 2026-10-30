@@ -57,6 +57,22 @@ fn array_storage_layers_for(square: bool, layers: u32, gl: bool) -> u32 {
     storage
 }
 
+/// Pads layer-major upload data when the GL storage has extra blank layers.
+pub fn array_pixels<'a>(square: bool, layers: u32, pixels: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    if !enabled() || layers == 0 {
+        return std::borrow::Cow::Borrowed(pixels);
+    }
+    let storage = array_storage_layers(square, layers);
+    if storage == layers {
+        return std::borrow::Cow::Borrowed(pixels);
+    }
+    let layer_bytes = pixels.len() / layers as usize;
+    let mut padded = Vec::with_capacity(layer_bytes * storage as usize);
+    padded.extend_from_slice(pixels);
+    padded.resize(layer_bytes * storage as usize, 0);
+    std::borrow::Cow::Owned(padded)
+}
+
 fn view_formats_for(formats: &'static [TextureFormat], gl: bool) -> &'static [TextureFormat] {
     if gl { &[] } else { formats }
 }

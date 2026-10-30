@@ -46,7 +46,7 @@ fn skin_array(
                 size: Extent3d {
                     width: side,
                     height: side,
-                    depth_or_array_layers: layers,
+                    depth_or_array_layers: crate::gl_compat::array_storage_layers(true, layers),
                 },
                 mip_level_count: 1,
                 sample_count: 1,

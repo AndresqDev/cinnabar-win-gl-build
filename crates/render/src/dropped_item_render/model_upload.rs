@@ -256,6 +256,8 @@ fn upload(
             BufferUsages::VERTEX,
         )?)
     };
+    let storage_layers = crate::gl_compat::array_storage_layers(true, layers);
+    let pixels = crate::gl_compat::array_pixels(true, layers, atlas);
     let texture = gpu_allocation::texture_with_data(
         device,
         queue,
@@ -264,7 +266,7 @@ fn upload(
             size: Extent3d {
                 width: side,
                 height: side,
-                depth_or_array_layers: layers,
+                depth_or_array_layers: storage_layers,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -273,7 +275,7 @@ fn upload(
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         },
-        atlas,
+        &pixels,
     )?;
     let view = gpu_allocation::checked(device, "dropped item texture layer array", 0, || {
         texture.create_view(&TextureViewDescriptor {

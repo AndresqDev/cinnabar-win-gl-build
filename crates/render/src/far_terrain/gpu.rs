@@ -637,7 +637,7 @@ fn colour_texture(device: &RenderDevice, layers: u32) -> (Texture, TextureView) 
         size: Extent3d {
             width: TILE_CELLS as u32,
             height: TILE_CELLS as u32,
-            depth_or_array_layers: layers,
+            depth_or_array_layers: crate::gl_compat::array_storage_layers(true, layers),
         },
         mip_level_count: 1,
         sample_count: 1,
