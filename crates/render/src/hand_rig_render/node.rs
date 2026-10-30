@@ -13,7 +13,7 @@ use bevy::{
 
 type HandRigViewQuery = (
     &'static ViewTarget,
-    &'static crate::scene_target::SceneTarget,
+    Option<&'static crate::scene_target::SceneTarget>,
     &'static Msaa,
     Has<render_scene::EnhancedRendering>,
     Has<render_scene::shaderpack::ShaderPackRendering>,
@@ -50,8 +50,14 @@ pub(crate) fn hand_rig<const AFTER_PACK: bool>(
     let Some(lightmap) = world.get_resource::<crate::lighting::LightmapGpu>() else {
         return Ok(());
     };
-    let color = &scene_target.texture;
-    let extent = color.size();
+    let extent = scene_target.map_or_else(
+        || target.main_texture().size(),
+        |scene| scene.texture.size(),
+    );
+    let samples = scene_target.map_or(msaa.samples(), |scene| scene.texture.sample_count());
+    if scene_target.is_none() && samples > 1 {
+        return Ok(());
+    }
     let (Some(depth), Some(binding), Some(pipeline)) = (
         &gpu.depth,
         &gpu.bind_group,
@@ -61,19 +67,27 @@ pub(crate) fn hand_rig<const AFTER_PACK: bool>(
     };
     // The depth target must match the view it composites over; a stale size skips this frame.
     if depth.size != [extent.width, extent.height]
-        || depth.samples != color.sample_count()
+        || depth.samples != samples
         || depth.samples != msaa.samples()
         || gpu.maximum_vertex_count == 0
     {
         return Ok(());
     }
-    let final_world_draw =
-        !(render_model::enhanced_rendering_enabled() && enhanced) && msaa.samples() > 1;
-    let attachments = [Some(if final_world_draw {
-        scene_target.final_attachment(target.main_texture_view())
+    let final_world_draw = !(render_model::enhanced_rendering_enabled() && enhanced) && samples > 1;
+    let color = if final_world_draw {
+        let Some(scene) = scene_target else {
+            return Ok(());
+        };
+        scene.final_attachment(target.main_texture_view())
     } else {
-        scene_target.color_attachment(target, false)
-    })];
+        let Some(color) =
+            crate::scene_target::retained_color_attachment(world, view_entity, target, false)
+        else {
+            return Ok(());
+        };
+        color
+    };
+    let attachments = [Some(color)];
     let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("first-person animated rig"),
         color_attachments: &attachments,

@@ -23,7 +23,7 @@ use bevy::{
             TextureViewDescriptor, TextureViewDimension, TextureViewId, VertexState,
         },
         renderer::{RenderDevice, RenderQueue},
-        view::{ExtractedView, Msaa, ViewUniform, ViewUniforms},
+        view::{ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniforms},
     },
 };
 use far_terrain::{
@@ -787,8 +787,9 @@ type FarViews<'w, 's> = Query<
     (
         Entity,
         &'static ExtractedView,
+        &'static ViewTarget,
         &'static Msaa,
-        &'static crate::scene_target::SceneTarget,
+        Option<&'static crate::scene_target::SceneTarget>,
         Option<&'static mut FarTerrainView>,
     ),
     With<Camera3d>,
@@ -828,8 +829,18 @@ pub(super) fn prepare_far_terrain_views(
         colours: gpu.colours_view.id(),
         mask: gpu.mask.id(),
     };
-    for (entity, view, msaa, scene, state) in &mut views {
-        let pipeline = gpu.pipeline(&cache, scene.format(), msaa.samples());
+    for (entity, view, target, msaa, scene, state) in &mut views {
+        // GL renders directly into the single-sample view target. A view whose retained
+        // multisampled target is unavailable skips until its fallback lowers the sample count.
+        let samples = scene.map_or(msaa.samples(), |scene| scene.texture.sample_count());
+        if scene.is_none() && samples > 1 {
+            if let Some(mut state) = state {
+                state.release();
+            }
+            continue;
+        }
+        let format = scene.map_or_else(|| target.main_texture_format(), |scene| scene.format());
+        let pipeline = gpu.pipeline(&cache, format, samples);
         let mut state = match state {
             Some(state) => state,
             None => {

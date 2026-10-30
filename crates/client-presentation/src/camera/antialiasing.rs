@@ -56,20 +56,35 @@ pub fn device_support(adapter: &RenderAdapter, device: &RenderDevice) -> CameraA
             format.guaranteed_format_features(features)
         }
     };
-    let colors = if adapter.get_info().backend == wgpu::Backend::Gl {
-        // GL compatibility renders one sRGB scene attachment; do not require the linear alias.
-        [render_scene::SCENE_COLOR_FORMAT; 3]
-    } else {
-        [
-            render_scene::SCENE_COLOR_FORMAT,
-            render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix(),
-            render_scene::SCENE_HDR_FORMAT,
-        ]
-    }
+    let colors = [
+        render_scene::SCENE_COLOR_FORMAT,
+        render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix(),
+        render_scene::SCENE_HDR_FORMAT,
+    ]
     .map(format_features);
     let depth = format_features(CORE_3D_DEPTH_FORMAT);
     let stencil = format_features(TextureFormat::Stencil8);
-    CameraAntiAliasingSupport(attachment_support(&colors, depth, stencil))
+    CameraAntiAliasingSupport(backend_attachment_support(
+        adapter.get_info().backend,
+        &colors,
+        depth,
+        stencil,
+    ))
+}
+
+/// GL reports guaranteed multisample counts even where wgpu cannot allocate the attachment.
+/// Keep the world camera single-sampled so the retained scene target never becomes an
+/// incomplete framebuffer, and so no multisampled pipeline variants are warmed.
+fn backend_attachment_support(
+    backend: wgpu::Backend,
+    colors: &[TextureFormatFeatures],
+    depth: TextureFormatFeatures,
+    stencil: TextureFormatFeatures,
+) -> ui::AntiAliasingSupport {
+    if backend == wgpu::Backend::Gl {
+        return ui::AntiAliasingSupport::from_counts([1]);
+    }
+    attachment_support(colors, depth, stencil)
 }
 
 /// Accepts only counts that can resolve color and expose multisampled depth to the shaders.
@@ -174,6 +189,30 @@ mod tests {
             .counts()
             .collect::<Vec<_>>(),
             [1]
+        );
+    }
+
+    #[test]
+    fn gl_never_reports_multisample_support() {
+        let color = features(
+            TextureFormatFeatureFlags::MULTISAMPLE_X2
+                | TextureFormatFeatureFlags::MULTISAMPLE_X4
+                | TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE,
+        );
+        let depth = features(
+            TextureFormatFeatureFlags::MULTISAMPLE_X4 | TextureFormatFeatureFlags::MULTISAMPLE_X8,
+        );
+        assert_eq!(
+            backend_attachment_support(wgpu::Backend::Gl, &[color], depth, depth)
+                .counts()
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(
+            backend_attachment_support(wgpu::Backend::Vulkan, &[color], depth, depth)
+                .counts()
+                .collect::<Vec<_>>(),
+            [1, 4]
         );
     }
 

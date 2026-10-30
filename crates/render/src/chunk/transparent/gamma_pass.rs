@@ -70,7 +70,7 @@ type GammaView = (
     Option<&'static MainPassResolutionOverride>,
     &'static Msaa,
     Option<&'static render_scene::EnhancedRendering>,
-    &'static SceneTarget,
+    Option<&'static SceneTarget>,
     Option<&'static bevy::anti_alias::smaa::Smaa>,
     Option<&'static render_scene::shaderpack::ShaderPackRendering>,
 );
@@ -84,7 +84,9 @@ pub(crate) fn gamma_transparent<const NAMETAGS_ONLY: bool, const AFTER_PACK: boo
     mut render_context: RenderContext,
 ) -> bevy::ecs::error::Result {
     let view_entity = query.entity();
-    if !crate::shaderpack::native_pass_enabled(world, view_entity, AFTER_PACK) {
+    if !crate::shaderpack::native_pass_enabled(world, view_entity, AFTER_PACK)
+        || crate::scene_target::unavailable(world, view_entity)
+    {
         return Ok(());
     }
     let (camera, view, target, depth, resolution, msaa, enhanced, scene, smaa, pack) =
@@ -160,19 +162,25 @@ pub(crate) fn gamma_transparent<const NAMETAGS_ONLY: bool, const AFTER_PACK: boo
         client.plot(plot_name!("transparent pipeline switches"), switches as f64);
     }
     // `None` keeps the full target; `Some(None)` is a camera viewport outside the attachment.
+    // GL renders directly into the view target, so both spaces share its default view.
+    let scene_view = scene.map_or_else(
+        || target.main_texture_view(),
+        |scene| scene.color_view(false),
+    );
     let viewport = Viewport::from_viewport_and_override(camera.viewport.as_ref(), resolution).map(
         |viewport| {
-            crate::render_bounds::viewport(
-                &viewport,
-                crate::render_bounds::extent(scene.color_view(false)),
-            )
+            crate::render_bounds::viewport(&viewport, crate::render_bounds::extent(scene_view))
         },
     );
     // Phase encoding holds the shared draw-functions lock, so worker ranges cannot draw
     // concurrently. Keep their ordered colour-space passes in one encoder without a worker wait.
     let mut ranges = ranges().peekable();
     while let Some(gamma) = ranges.peek().map(|(_, gamma)| *gamma) {
-        let attachments = [Some(scene.color_attachment(target, gamma))];
+        let color = scene.map_or_else(
+            || target.get_color_attachment(),
+            |scene| scene.color_attachment(target, gamma),
+        );
+        let attachments = [Some(color)];
         let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("sorted ordinary transparent colour-space range"),
             color_attachments: &attachments,

@@ -4,7 +4,7 @@ use bevy::{ecs::query::QueryItem, render::render_resource::RenderPassDepthStenci
 
 pub(crate) type UiViewQuery = (
     &'static ViewTarget,
-    &'static crate::scene_target::SceneTarget,
+    Option<&'static crate::scene_target::SceneTarget>,
     &'static MainEntity,
     &'static ExtractedCamera,
     Option<&'static ViewDepthStencilTexture>,
@@ -68,7 +68,7 @@ pub(crate) fn draw_ui_view(
                 .page_binding(batch.texture_page as usize)
                 .is_some()
     });
-    let depth = depth.filter(|depth| world_depth_compatible(depth, scene_target));
+    let depth = depth.filter(|depth| world_depth_compatible(depth, target, scene_target));
     let ready = |test: bool, write: bool, attached: bool| {
         if (test || write) && depth.is_none() {
             return None;
@@ -131,7 +131,13 @@ pub(crate) fn draw_ui_view(
         #[cfg(test)]
         gpu.world_passes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let attachments = [Some(scene_target.color_attachment(target, false))];
+        let Some(color) =
+            crate::scene_target::retained_color_attachment(world, view_entity, target, false)
+        else {
+            return Ok(());
+        };
+        let extent = crate::render_bounds::extent(color.view);
+        let attachments = [Some(color)];
         let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
             label: Some("retained world-projected UI"),
             color_attachments: &attachments,
@@ -153,10 +159,7 @@ pub(crate) fn draw_ui_view(
             multiview_mask: None,
         });
         if let Some(viewport) = overlay_viewport(camera.viewport.as_ref(), resolution_override) {
-            let Some(viewport) = crate::render_bounds::viewport(
-                &viewport,
-                crate::render_bounds::extent(scene_target.color_view(false)),
-            ) else {
+            let Some(viewport) = crate::render_bounds::viewport(&viewport, extent) else {
                 return Ok(());
             };
             pass.set_camera_viewport(&viewport);
@@ -178,7 +181,6 @@ pub(crate) fn draw_ui_view(
                     .unwrap(),
                 &[],
             );
-            let extent = crate::render_bounds::extent(scene_target.color_view(false));
             let scissor = match output {
                 Some(output) => {
                     super::layer::scaled_scissor(batch.scissor, output.0.to_array(), extent)
@@ -200,9 +202,10 @@ pub(crate) fn draw_ui_view(
 /// Only binds depth with the owning color target's dimensions and sample count.
 fn world_depth_compatible(
     depth: &ViewDepthStencilTexture,
-    target: &crate::scene_target::SceneTarget,
+    target: &ViewTarget,
+    scene: Option<&crate::scene_target::SceneTarget>,
 ) -> bool {
-    let color = &target.texture;
+    let color = scene.map_or_else(|| target.main_texture(), |scene| &scene.texture);
     depth.texture().format() == CORE_3D_DEPTH_FORMAT
         && depth.texture().sample_count() == color.sample_count()
         && depth.texture().size() == color.size()

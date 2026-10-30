@@ -6,7 +6,7 @@ type HandViewQuery = (
     &'static ExtractedView,
     &'static bevy::render::camera::ExtractedCamera,
     &'static ViewTarget,
-    &'static crate::scene_target::SceneTarget,
+    Option<&'static crate::scene_target::SceneTarget>,
     &'static Msaa,
     Option<&'static crate::render_scale::RenderScaleOutput>,
 );
@@ -45,8 +45,16 @@ pub(crate) fn hand_view<const AFTER_PACK: bool>(
         gate.reject(token);
         return Ok(());
     }
-    let color = &scene_target.texture;
-    let extent = color.size();
+    let extent = scene_target.map_or_else(
+        || target.main_texture().size(),
+        |scene| scene.texture.size(),
+    );
+    let samples = scene_target.map_or(msaa.samples(), |scene| scene.texture.sample_count());
+    if scene_target.is_none() && samples > 1 {
+        ViewmodelCompletionGate::observe_stage(3, 5, Some(token));
+        gate.reject(token);
+        return Ok(());
+    }
     let main = target.main_texture().size();
     let render_size = [extent.width, extent.height];
     if hand_render_extent(
@@ -58,7 +66,7 @@ pub(crate) fn hand_view<const AFTER_PACK: bool>(
         scaled.map(|scaled| scaled.0.to_array()),
         [main.width, main.height],
     ) != Some(render_size)
-        || color.sample_count() != token.samples
+        || samples != token.samples
         || gpu
             .depth
             .as_ref()
@@ -78,7 +86,14 @@ pub(crate) fn hand_view<const AFTER_PACK: bool>(
         gate.reject(token);
         return Ok(());
     };
-    let attachments = [Some(scene_target.color_attachment(target, false))];
+    let Some(color) =
+        crate::scene_target::retained_color_attachment(world, view_entity, target, false)
+    else {
+        ViewmodelCompletionGate::observe_stage(3, 6, Some(token));
+        gate.reject(token);
+        return Ok(());
+    };
+    let attachments = [Some(color)];
     let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("camera-local neutral empty hand"),
         color_attachments: &attachments,

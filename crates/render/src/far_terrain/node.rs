@@ -9,12 +9,10 @@ use bevy::{
 };
 
 use super::gpu::FarTerrainView;
-use crate::scene_target::SceneTarget;
 
 type FarTerrainQuery = (
     &'static ExtractedCamera,
     &'static ViewTarget,
-    &'static SceneTarget,
     &'static ViewDepthStencilTexture,
     &'static ViewUniformOffset,
     &'static FarTerrainView,
@@ -26,7 +24,8 @@ pub(super) fn far_terrain(
     query: bevy::render::renderer::ViewQuery<FarTerrainQuery>,
     mut context: RenderContext,
 ) -> bevy::ecs::error::Result {
-    let (camera, target, scene, depth, offset, state) = query.into_inner();
+    let view = query.entity();
+    let (camera, target, depth, offset, state) = query.into_inner();
     let (Some((_, bind_group)), Some(pipeline), Some(lightmap)) = (
         state.bind_group.as_ref(),
         world
@@ -43,9 +42,14 @@ pub(super) fn far_terrain(
     {
         return Ok(());
     }
+    let Some(color) = crate::scene_target::retained_color_attachment(world, view, target, false)
+    else {
+        return Ok(());
+    };
+    let extent = crate::render_bounds::extent(color.view);
     let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("far terrain"),
-        color_attachments: &[Some(scene.color_attachment(target, false))],
+        color_attachments: &[Some(color)],
         depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
         timestamp_writes: crate::gpu_timing::render_pass_timestamps(
             world,
@@ -55,7 +59,6 @@ pub(super) fn far_terrain(
         multiview_mask: None,
     });
     if let Some(viewport) = camera.viewport.as_ref() {
-        let extent = crate::render_bounds::extent(scene.color_view(false));
         let Some(viewport) = crate::render_bounds::viewport(viewport, extent) else {
             return Ok(());
         };
