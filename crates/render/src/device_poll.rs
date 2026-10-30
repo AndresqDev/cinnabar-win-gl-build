@@ -28,9 +28,10 @@ mod tests;
 /// above the two frames a swap chain queues, so presented windows never wait here.
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
-/// Submission markers of the frames that may still be on the GPU, oldest first.
+/// Submission markers of the frames that may still be on the GPU, oldest first. GL keeps a
+/// marker without reserving an empty submission for it.
 #[derive(Resource, Default)]
-pub(crate) struct FramesInFlight(VecDeque<wgpu::SubmissionIndex>);
+pub(crate) struct FramesInFlight(VecDeque<Option<wgpu::SubmissionIndex>>);
 
 impl FramesInFlight {
     /// Marks the end of this frame's submissions and polls the device once: without blocking
@@ -41,10 +42,18 @@ impl FramesInFlight {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<wgpu::PollStatus, wgpu::PollError> {
-        self.0.push_back(queue.submit([]));
+        // The GL backend executes an empty submit under the context lock and signals a fence for
+        // it. Nothing needs that marker: a wait without an index waits for the latest real
+        // submission, and we already bound how many frames may be outstanding.
+        let marker = if crate::gl_compat::enabled() {
+            None
+        } else {
+            Some(queue.submit([]))
+        };
+        self.0.push_back(marker);
         let poll = if self.0.len() > MAX_FRAMES_IN_FLIGHT {
             PollType::Wait {
-                submission_index: self.0.pop_front(),
+                submission_index: self.0.pop_front().flatten(),
                 timeout: None,
             }
         } else {

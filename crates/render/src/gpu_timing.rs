@@ -419,6 +419,13 @@ pub(crate) struct GpuTimestamps {
 impl GpuTimestamps {
     /// `None` when the device lacks `TIMESTAMP_QUERY`.
     fn new(device: &RenderDevice, queue: &RenderQueue, profiling: bool) -> Option<Self> {
+        // wgpu's GL backend resolves query results with synchronous getQueryObject calls while
+        // it processes the resolve copy. That stalls the context for the whole frame, so the GL
+        // compatibility path opts out of GPU spans instead of paying for diagnostics.
+        if crate::gl_compat::enabled() {
+            info!("GPU pass timestamps disabled on the GL compatibility path");
+            return None;
+        }
         let features = device.features();
         if !features.contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
