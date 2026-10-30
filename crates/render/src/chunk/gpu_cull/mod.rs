@@ -64,7 +64,10 @@ fn gpu_cull_unstable(vendor: u32) -> bool {
 
 /// Keeps terrain on CPU culling when its driver, override or storage budget requires it.
 fn cpu_culling_required(vendor: u32, forced_cpu: bool, limits: &wgpu::Limits) -> bool {
-    gpu_cull_unstable(vendor)
+    // GL cannot read depth textures in compute shaders, and the direct path also builds a
+    // depth pyramid. Keep terrain on CPU visibility instead of compiling unusable kernels.
+    crate::gl_compat::enabled()
+        || gpu_cull_unstable(vendor)
         || forced_cpu
         || limits.max_storage_buffers_per_shader_stage < required_vertex_storage_buffers()
 }

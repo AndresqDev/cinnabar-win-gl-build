@@ -43,6 +43,10 @@ pub struct DepthSmaaPlugin;
 
 impl Plugin for DepthSmaaPlugin {
     fn build(&self, app: &mut App) {
+        // The edge pass reads the depth texture, which Naga cannot translate to GLSL.
+        if crate::gl_compat::enabled() {
+            return;
+        }
         app.add_plugins(SmaaPlugin);
         load_internal_asset!(
             app,
@@ -65,6 +69,9 @@ impl Plugin for DepthSmaaPlugin {
     }
 
     fn finish(&self, app: &mut App) {
+        if crate::gl_compat::enabled() {
+            return;
+        }
         if let Some(render) = app.get_sub_app_mut(RenderApp) {
             render.world_mut().run_system_once(sync_graph).unwrap();
         }

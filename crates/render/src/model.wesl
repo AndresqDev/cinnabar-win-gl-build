@@ -533,26 +533,40 @@ fn sample_ref(texture_ref: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> 
     @if(!ENHANCED)
     if (page == 0u) {
         let scale = texture_gradient_scale(texture_ref, textureDimensions(terrain_gamma_page_0, 0));
+        @if(GL_COMPAT)
+        return textureSampleGrad(terrain_gamma_page_0, block_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
+        @if(!GL_COMPAT)
         return textureSampleGrad(terrain_gamma_page_0, model_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
     }
     @if(!ENHANCED)
     if (page == 1u) {
         let scale = texture_gradient_scale(texture_ref, textureDimensions(terrain_gamma_page_1, 0));
+        @if(GL_COMPAT)
+        return textureSampleGrad(terrain_gamma_page_1, block_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
+        @if(!GL_COMPAT)
         return textureSampleGrad(terrain_gamma_page_1, model_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
     }
     @if(!ENHANCED)
     if (page == 2u) {
         let scale = texture_gradient_scale(texture_ref, textureDimensions(terrain_gamma_page_2, 0));
+        @if(GL_COMPAT)
+        return textureSampleGrad(terrain_gamma_page_2, block_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
+        @if(!GL_COMPAT)
         return textureSampleGrad(terrain_gamma_page_2, model_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
     }
     @if(!ENHANCED)
     if (page == 3u) {
         let scale = texture_gradient_scale(texture_ref, textureDimensions(terrain_gamma_page_3, 0));
+        @if(GL_COMPAT)
+        return textureSampleGrad(terrain_gamma_page_3, block_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
+        @if(!GL_COMPAT)
         return textureSampleGrad(terrain_gamma_page_3, model_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
     }
     @if(!ENHANCED)
     let scale = texture_gradient_scale(texture_ref, textureDimensions(terrain_gamma_page_4, 0));
-    @if(!ENHANCED)
+    @if(!ENHANCED && GL_COMPAT)
+    return textureSampleGrad(terrain_gamma_page_4, block_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
+    @if(!ENHANCED && !GL_COMPAT)
     return textureSampleGrad(terrain_gamma_page_4, model_sampler, texture_model_uv(texture_ref, uv), layer, dx * scale, dy * scale);
 }
 

@@ -109,13 +109,24 @@ pub(in crate::chunk) fn build(compact: bool) -> [RenderPipelineDescriptor; 5] {
     // Apply after cloning: model geometry includes the opaque stairs/slabs
     // that must win a shared plane against a two-sided cutout cube.
     terrain_cutout::apply(&mut descriptor);
-    [
+    let mut descriptors = [
         descriptor,
         solid_descriptor,
         model_descriptor,
         transparent_descriptor,
         depth_liquid_descriptor,
-    ]
+    ];
+    if crate::gl_compat::enabled() {
+        // GLSL combines images and samplers. The GL path uses one sampler for the native
+        // terrain pages and the shared block sampler for all opaque world draws.
+        for descriptor in &mut descriptors {
+            descriptor.vertex.shader_defs.push("GL_COMPAT".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("GL_COMPAT".into());
+            }
+        }
+    }
+    descriptors
 }
 
 #[cfg(test)]
