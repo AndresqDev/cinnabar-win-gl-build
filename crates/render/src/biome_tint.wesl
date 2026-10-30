@@ -186,8 +186,8 @@ fn packed_biome_tint_index(record: u32, source_coordinate: vec3<i32>) -> u32 {
     if (!biome_descriptor_valid(biome_records[record])) {
         return 0u;
     }
-    let offset = source_coordinate >> vec3(4u);
-    if (any(offset < vec3(-1)) || any(offset > vec3(1))) { return 0u; }
+    let offset = source_coordinate >> vec3<u32>(4u);
+    if (any(offset < vec3<i32>(-1)) || any(offset > vec3<i32>(1))) { return 0u; }
     let layer = select(select(2u, 1u, offset.y < 0), 0u, offset.y == 0);
     let slot = layer * 9u + u32((offset.z + 1) * 3 + offset.x + 1);
     let relative = biome_records[record + 2u + slot];
@@ -243,11 +243,11 @@ fn uniform_biome_tint_gamma(tint_kind: u32, material_flags: u32, record: u32) ->
     let tint = safe_tint_index(index);
     // Swamp grass varies with world-position noise even in a uniform biome.
     if (tint_kind == 0x10u && (tint_flags(tint) & BIOME_SWAMP_GRASS) != 0u) { return vec4(0.0); }
-    return vec4(tint_to_gamma(tint_domain_colour(tint, tint_kind, material_flags, vec3(0))).rgb, 1.0);
+    return vec4(tint_to_gamma(tint_domain_colour(tint, tint_kind, material_flags, vec3<i32>(0))).rgb, 1.0);
 }
 
 fn lattice_point_index(position: vec3<i32>) -> u32 {
-    let axis = vec3<u32>((position + vec3(BIOME_LATTICE_STEP)) / BIOME_LATTICE_STEP);
+    let axis = vec3<u32>((position + vec3<i32>(BIOME_LATTICE_STEP)) / BIOME_LATTICE_STEP);
     return (axis.x * BIOME_LATTICE_SIDE + axis.y) * BIOME_LATTICE_SIDE + axis.z;
 }
 
@@ -261,7 +261,7 @@ fn blended_biome_tint(
     // Blend the block that owns the fragment, the domain `blend_samples` answers. Interpolated
     // positions leave the sub-chunk at face edges and in derivative helper lanes extrapolated
     // past the horizon; unclamped, their lattice index reads unrelated words as sample counts.
-    let coordinate = clamp(vec3<i32>(floor(local_position)), vec3(0), vec3(BIOME_QUERY_SIDE - 1));
+    let coordinate = clamp(vec3<i32>(floor(local_position)), vec3<i32>(0), vec3<i32>(BIOME_QUERY_SIDE - 1));
     let block_position = coordinate + vec3<i32>(world_origin);
     if (!biome_record_span_valid(record, BIOME_DESCRIPTOR_WORDS)) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
     if (!biome_descriptor_valid(biome_records[record])) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
@@ -281,11 +281,11 @@ fn blended_biome_tint(
     let point_words = select(BIOME_WIDE_POINT_WORDS, BIOME_POINT_WORDS, compact);
     let lattice_words = BIOME_LATTICE_SIDE * BIOME_LATTICE_SIDE * BIOME_LATTICE_SIDE * point_words;
     if (!biome_record_span_valid(record, BIOME_DESCRIPTOR_WORDS + lattice_words)) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
-    let base = (coordinate - vec3(BIOME_CACHE_ORIGIN)) / BIOME_LATTICE_STEP * BIOME_LATTICE_STEP + vec3(BIOME_CACHE_ORIGIN);
-    let residue = vec3<u32>(coordinate - base + vec3(BIOME_RESIDUE_RADIUS));
-    if (any(residue >= vec3(BIOME_RESIDUE_SIDE))) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
+    let base = (coordinate - vec3<i32>(BIOME_CACHE_ORIGIN)) / BIOME_LATTICE_STEP * BIOME_LATTICE_STEP + vec3<i32>(BIOME_CACHE_ORIGIN);
+    let residue = vec3<u32>(coordinate - base + vec3<i32>(BIOME_RESIDUE_RADIUS));
+    if (any(residue >= vec3<u32>(BIOME_RESIDUE_SIDE))) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
     let stencil = query_stencil((residue.x * BIOME_RESIDUE_SIDE + residue.y) * BIOME_RESIDUE_SIDE + residue.z);
-    let magnitude = vec3<u32>(abs(vec3<i32>(residue) - vec3(BIOME_RESIDUE_RADIUS)));
+    let magnitude = vec3<u32>(abs(vec3<i32>(residue) - vec3<i32>(BIOME_RESIDUE_RADIUS)));
     let magnitude_side = u32(BIOME_RESIDUE_RADIUS) + 1u;
     let weights = ((magnitude.x * magnitude_side + magnitude.y) * magnitude_side + magnitude.z) * 2u;
     var sum = vec4(0.0);
@@ -293,7 +293,7 @@ fn blended_biome_tint(
     for (var point = 0u; point < BIOME_QUERY_POINTS; point += 1u) {
         let cell = (stencil[point / 4u] >> (point % 4u * 8u)) & 0xffu;
         let weight = biome_query_tables.weights[weights + point / 4u][point % 4u];
-        let position = base + (vec3<i32>(vec3(cell / 9u, cell / 3u % 3u, cell % 3u)) - vec3(1)) * BIOME_LATTICE_STEP;
+        let position = base + (vec3<i32>(vec3(cell / 9u, cell / 3u % 3u, cell % 3u)) - vec3<i32>(1)) * BIOME_LATTICE_STEP;
         if (lattice_point_index(position) >= BIOME_LATTICE_SIDE * BIOME_LATTICE_SIDE * BIOME_LATTICE_SIDE) { return tint_domain_colour(0u, tint_kind, material_flags, block_position); }
         let start = record + BIOME_DESCRIPTOR_WORDS + lattice_point_index(position) * point_words;
         var colour = vec4(0.0);
@@ -336,13 +336,13 @@ fn grass_palette_index(world_xz: vec2<i32>) -> u32 {
     let p = vec2<f32>(world_xz) * 0.0225;
     let skew = (p.x + p.y) * bitcast<f32>(0x3ebb67aeu);
     let skewed = p + vec2(skew);
-    let cell = vec2<i32>(skewed) - select(vec2(0), vec2(1), skewed <= vec2(0.0));
+    let cell = vec2<i32>(skewed) - select(vec2<i32>(0), vec2<i32>(1), skewed <= vec2(0.0));
     let unskew = f32(cell.x + cell.y) * bitcast<f32>(0x3e58658cu);
     let first = p - (vec2<f32>(cell) - vec2(unskew));
-    let step = select(vec2(0, 1), vec2(1, 0), first.x > first.y);
+    let step = select(vec2<i32>(0, 1), vec2<i32>(1, 0), first.x > first.y);
     let second = first - vec2<f32>(step) + vec2(bitcast<f32>(0x3e58658cu));
     let third = first - vec2(1.0) + vec2(bitcast<f32>(0x3e58658cu)) + vec2(bitcast<f32>(0x3e58658cu));
-    let noise = (grass_corner(cell, first) + grass_corner(cell + step, second) + grass_corner(cell + vec2(1), third)) * 70.0;
+    let noise = (grass_corner(cell, first) + grass_corner(cell + step, second) + grass_corner(cell + vec2<i32>(1), third)) * 70.0;
     let maximum = i32(BIOME_TINT_MAP_SIZE - 1u);
     return u32(clamp(i32((noise + 0.6) * f32(maximum)), 0, maximum));
 }

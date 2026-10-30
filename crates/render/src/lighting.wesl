@@ -34,8 +34,8 @@ fn cutout_mip_coverage(alpha: f32, threshold: f32) -> f32 {
 
 // Minification keeps mip coverage; magnification filters only the binary alpha contour.
 fn cutout_alpha_array(image: texture_2d_array<f32>, uv: vec2<f32>, layer: i32, dx: vec2<f32>, dy: vec2<f32>, sampled: vec4<f32>, repeat_uv: bool, threshold: f32) -> CutoutSample {
-    let limit = vec2<i32>(textureDimensions(image, 0)) - vec2(1);
-    return cutout_alpha_array_region(image, uv, layer, dx, dy, sampled, repeat_uv, threshold, vec4(vec2(0), limit));
+    let limit = vec2<i32>(textureDimensions(image, 0)) - vec2<i32>(1);
+    return cutout_alpha_array_region(image, uv, layer, dx, dy, sampled, repeat_uv, threshold, vec4<i32>(vec2<i32>(0), limit));
 }
 
 // An authored face chart repeats its border texels, preserving contours inside that chart.
@@ -50,9 +50,9 @@ fn cutout_alpha_array_region(image: texture_2d_array<f32>, uv: vec2<f32>, layer:
     let base = vec2<i32>(floor(position));
     let texels = array(
         textureLoad(image, cutout_region_texel_address(base, region, vec2<i32>(size), repeat_uv), layer, 0),
-        textureLoad(image, cutout_region_texel_address(base + vec2(1, 0), region, vec2<i32>(size), repeat_uv), layer, 0),
-        textureLoad(image, cutout_region_texel_address(base + vec2(0, 1), region, vec2<i32>(size), repeat_uv), layer, 0),
-        textureLoad(image, cutout_region_texel_address(base + vec2(1), region, vec2<i32>(size), repeat_uv), layer, 0),
+        textureLoad(image, cutout_region_texel_address(base + vec2<i32>(1, 0), region, vec2<i32>(size), repeat_uv), layer, 0),
+        textureLoad(image, cutout_region_texel_address(base + vec2<i32>(0, 1), region, vec2<i32>(size), repeat_uv), layer, 0),
+        textureLoad(image, cutout_region_texel_address(base + vec2<i32>(1), region, vec2<i32>(size), repeat_uv), layer, 0),
     );
     return cutout_sample(texels, fract(position), abs(texel_dx) + abs(texel_dy), threshold);
 }
@@ -65,7 +65,7 @@ fn cutout_region_texel_address(coordinate: vec2<i32>, region: vec4<i32>, size: v
 
 // Signed modulo keeps neighbours inside the same array layer at a repeating seam.
 fn cutout_texel_address(coordinate: vec2<i32>, size: vec2<i32>, repeat_uv: bool) -> vec2<i32> {
-    return select(clamp(coordinate, vec2(0), size - vec2(1)), (coordinate % size + size) % size, repeat_uv);
+    return select(clamp(coordinate, vec2<i32>(0), size - vec2<i32>(1)), (coordinate % size + size) % size, repeat_uv);
 }
 
 // Atlas cutouts use the same one-pixel contour and recover covered RGB at transparent texels.
@@ -78,12 +78,12 @@ fn cutout_alpha_2d(image: texture_2d<f32>, uv: vec2<f32>, dx: vec2<f32>, dy: vec
     }
     let position = uv * size - vec2(0.5);
     let base = vec2<i32>(floor(position));
-    let limit = vec2<i32>(size) - vec2(1);
+    let limit = vec2<i32>(size) - vec2<i32>(1);
     let texels = array(
-        textureLoad(image, clamp(base, vec2(0), limit), 0),
-        textureLoad(image, clamp(base + vec2(1, 0), vec2(0), limit), 0),
-        textureLoad(image, clamp(base + vec2(0, 1), vec2(0), limit), 0),
-        textureLoad(image, clamp(base + vec2(1), vec2(0), limit), 0),
+        textureLoad(image, clamp(base, vec2<i32>(0), limit), 0),
+        textureLoad(image, clamp(base + vec2<i32>(1, 0), vec2<i32>(0), limit), 0),
+        textureLoad(image, clamp(base + vec2<i32>(0, 1), vec2<i32>(0), limit), 0),
+        textureLoad(image, clamp(base + vec2<i32>(1), vec2<i32>(0), limit), 0),
     );
     return cutout_sample(texels, fract(position), abs(texel_dx) + abs(texel_dy), threshold);
 }
@@ -131,7 +131,7 @@ fn terrain_light_colour(levels: vec2<f32>) -> vec3<f32> {
     let last = TERRAIN_LIGHTMAP_SIDE - 1u;
     let coordinate = clamp(levels * (f32(TERRAIN_LIGHTMAP_SIDE) / f32(last)) - vec2(0.5), vec2(0.0), vec2(f32(last)));
     let lower = vec2<u32>(floor(coordinate));
-    let upper = min(lower + vec2(1u), vec2(last));
+    let upper = min(lower + vec2(1u), vec2<u32>(last));
     let fraction = coordinate - vec2<f32>(lower);
     return mix(
         mix(native_light_texel(lower.x | (lower.y << 4u)), native_light_texel(upper.x | (lower.y << 4u)), fraction.x),
