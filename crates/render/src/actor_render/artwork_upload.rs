@@ -10,7 +10,10 @@ pub(super) struct PendingPage {
     pub(super) source: TextureKey,
     texture: Texture,
     pixels: Arc<[u8]>,
+    /// GL storage size, including any layers added to keep a D2Array target valid.
     size: Extent3d,
+    /// Layers in the source page, excluding GL storage padding.
+    source_layers: u32,
     /// Rows written so far, counted across layers in layer-major order.
     written_rows: u32,
     pub(super) color_mask: bool,
@@ -31,10 +34,25 @@ pub(super) fn start_page(
         .fit_within(device.limits().max_texture_dimension_2d)
         .into_owned();
     loop {
+        let square = fitted.width == fitted.height;
+        let storage_layers = crate::gl_compat::array_storage_layers(square, fitted.layers);
         let size = Extent3d {
             width: u32::from(fitted.width),
             height: u32::from(fitted.height),
-            depth_or_array_layers: fitted.layers,
+            depth_or_array_layers: storage_layers,
+        };
+        // GL may need an extra blank layer to keep this page bound as a D2Array texture.
+        // Pad the upload as well so row-band writes never run past the pixel allocation.
+        let pixels = if storage_layers == fitted.layers {
+            fitted.shared_pixels()
+        } else {
+            let padded = crate::gl_compat::array_pixels(
+                square,
+                fitted.layers,
+                fitted.shared_pixels().as_ref(),
+            )
+            .into_owned();
+            Arc::from(padded)
         };
         let texture = gpu_allocation::texture(
             device,
@@ -53,8 +71,9 @@ pub(super) fn start_page(
             return Some(PendingPage {
                 source,
                 texture,
-                pixels: fitted.shared_pixels(),
+                pixels,
                 size,
+                source_layers: fitted.layers,
                 written_rows: 0,
                 color_mask: page.color_mask,
                 multitexture: page.multitexture,
@@ -158,11 +177,15 @@ fn retry_smaller(device: &RenderDevice, pending: PendingPage) -> Progress {
     if !pending.reduce || side <= 1 {
         return Progress::Failed;
     }
+    let source_bytes = pending.size.width as usize
+        * pending.size.height as usize
+        * pending.source_layers as usize
+        * 4;
     let page = render_model::ActorTexturePage {
         width: pending.size.width as u16,
         height: pending.size.height as u16,
-        layers: pending.size.depth_or_array_layers,
-        rgba8: pending.pixels,
+        layers: pending.source_layers,
+        rgba8: Arc::from(pending.pixels[..source_bytes].to_vec()),
         color_mask: pending.color_mask,
         multitexture: pending.multitexture,
     };

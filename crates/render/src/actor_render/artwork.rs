@@ -93,7 +93,16 @@ impl GpuGlint {
             return false;
         };
         let Some(view) = gpu_allocation::checked(device, "actor glint view", 0, || {
-            texture.create_view(&TextureViewDescriptor::default())
+            // Glints are sampled as a plain D2 texture. The GL array-layer padding may make
+            // the backing texture two layers deep, so select layer zero explicitly instead
+            // of taking the default view dimension (which would be D2Array).
+            texture.create_view(&TextureViewDescriptor {
+                label: Some("actor glint view"),
+                dimension: Some(TextureViewDimension::D2),
+                base_array_layer: 0,
+                array_layer_count: Some(1),
+                ..default()
+            })
         }) else {
             return false;
         };
