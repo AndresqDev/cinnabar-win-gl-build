@@ -61,7 +61,11 @@ pub(super) fn install(app: &mut App) {
         .init_resource::<materials::Materials>()
         .add_render_command::<bevy::core_pipeline::core_3d::Transparent3d, pipeline::Draw>();
     install_systems(app.sub_app_mut(RenderApp));
-    clips::install(app.sub_app_mut(RenderApp));
+    // The clip mask reads world depth in a fragment shader; Naga cannot translate that
+    // textureLoad to GLSL. Keep retained mod geometry, but omit clip masks on GL.
+    if !crate::gl_compat::enabled() {
+        clips::install(app.sub_app_mut(RenderApp));
+    }
     crate::chunk::blocks::install(app);
 }
 
