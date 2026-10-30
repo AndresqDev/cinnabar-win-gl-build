@@ -117,7 +117,9 @@ fn texture_cube_uv(reference: u32, uv: vec2<f32>) -> vec2<f32> {
 fn texture_gradient_scale(reference: u32, page_dimensions: vec2<u32>) -> vec2<f32> {
     let encoded = vec2((reference >> GPU_TEXTURE_WIDTH_SHIFT) & GPU_TEXTURE_SIZE_EXPONENT_MASK,
         (reference >> GPU_TEXTURE_HEIGHT_SHIFT) & GPU_TEXTURE_SIZE_EXPONENT_MASK);
-    let dimensions = select(vec2(1u) << (max(encoded, vec2(1u)) - vec2(1u)),
-        page_dimensions, encoded == vec2(0u));
+    var dimensions = page_dimensions;
+    if (any(encoded != vec2(0u))) {
+        dimensions = vec2(1u) << (max(encoded, vec2(1u)) - vec2(1u));
+    }
     return vec2<f32>(dimensions) / vec2<f32>(page_dimensions) * texture_uv_scale(reference);
 }

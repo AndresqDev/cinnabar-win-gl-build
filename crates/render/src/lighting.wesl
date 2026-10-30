@@ -60,12 +60,14 @@ fn cutout_alpha_array_region(image: texture_2d_array<f32>, uv: vec2<f32>, layer:
 
 // Clamp sampling stays inside its chart; repeating materials retain whole-image modulo.
 fn cutout_region_texel_address(coordinate: vec2<i32>, region: vec4<i32>, size: vec2<i32>, repeat_uv: bool) -> vec2<i32> {
-    return select(clamp(coordinate, region.xy, region.zw), cutout_texel_address(coordinate, size, true), repeat_uv);
+    if (repeat_uv) { return cutout_texel_address(coordinate, size, true); }
+    return clamp(coordinate, region.xy, region.zw);
 }
 
 // Signed modulo keeps neighbours inside the same array layer at a repeating seam.
 fn cutout_texel_address(coordinate: vec2<i32>, size: vec2<i32>, repeat_uv: bool) -> vec2<i32> {
-    return select(clamp(coordinate, vec2<i32>(0), size - vec2<i32>(1)), (coordinate % size + size) % size, repeat_uv);
+    if (repeat_uv) { return (coordinate % size + size) % size; }
+    return clamp(coordinate, vec2<i32>(0), size - vec2<i32>(1));
 }
 
 // Atlas cutouts use the same one-pixel contour and recover covered RGB at transparent texels.

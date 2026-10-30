@@ -98,7 +98,8 @@ struct BiomeQueryTables {
 
 fn query_stencil(index: u32) -> vec2<u32> {
     let pair = biome_query_tables.stencils[index / 2u];
-    return select(pair.xy, pair.zw, (index & 1u) != 0u);
+    if ((index & 1u) == 0u) { return pair.xy; }
+    return pair.zw;
 }
 
 fn grass_permutation(index: u32) -> u32 {
@@ -336,10 +337,13 @@ fn grass_palette_index(world_xz: vec2<i32>) -> u32 {
     let p = vec2<f32>(world_xz) * 0.0225;
     let skew = (p.x + p.y) * bitcast<f32>(0x3ebb67aeu);
     let skewed = p + vec2(skew);
-    let cell = vec2<i32>(skewed) - select(vec2<i32>(0), vec2<i32>(1), skewed <= vec2(0.0));
+    var cell = vec2<i32>(skewed);
+    if (skewed.x <= 0.0) { cell.x -= 1; }
+    if (skewed.y <= 0.0) { cell.y -= 1; }
     let unskew = f32(cell.x + cell.y) * bitcast<f32>(0x3e58658cu);
     let first = p - (vec2<f32>(cell) - vec2(unskew));
-    let step = select(vec2<i32>(0, 1), vec2<i32>(1, 0), first.x > first.y);
+    var step = vec2<i32>(0, 1);
+    if (first.x > first.y) { step = vec2<i32>(1, 0); }
     let second = first - vec2<f32>(step) + vec2(bitcast<f32>(0x3e58658cu));
     let third = first - vec2(1.0) + vec2(bitcast<f32>(0x3e58658cu)) + vec2(bitcast<f32>(0x3e58658cu));
     let noise = (grass_corner(cell, first) + grass_corner(cell + step, second) + grass_corner(cell + vec2<i32>(1), third)) * 70.0;
