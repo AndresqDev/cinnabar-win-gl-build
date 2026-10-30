@@ -360,6 +360,16 @@ fn apply_multisample_fallback(
     mut fallback: ResMut<MultisampleFallback>,
     mut views: Query<(&ExtractedCamera, &mut Msaa)>,
 ) {
+    // The GL compatibility path renders straight into Bevy's single-sample view target.
+    // Keeping the separate retained scene target there requires a copy/resolve that some
+    // Windows GL drivers do not apply to the destination, leaving the whole world black.
+    if crate::gl_compat::enabled() {
+        fallback.0.clear();
+        for (_, mut msaa) in &mut views {
+            *msaa = Msaa::Off;
+        }
+        return;
+    }
     fallback
         .0
         .retain(|entity, size| match views.get_mut(*entity) {
@@ -390,6 +400,17 @@ pub(crate) fn prepare_scene_targets(
 ) {
     for entity in &removed {
         commands.entity(entity).remove::<SceneTarget>();
+    }
+    // GL writes the scene directly into Bevy's view target; the retained target exists for
+    // alternate linear/encoded views and MSAA, neither of which the compatibility path uses.
+    if crate::gl_compat::enabled() {
+        for (entity, ..) in &views {
+            commands
+                .entity(entity)
+                .remove::<SceneTarget>()
+                .remove::<SceneTargetUnavailable>();
+        }
+        return;
     }
     failed.retain(|view| views.contains(view));
     for (entity, target, camera, msaa, previous) in &views {
