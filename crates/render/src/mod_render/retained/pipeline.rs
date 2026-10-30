@@ -293,16 +293,18 @@ impl crate::pipeline_warmup::PrewarmPipelines for Pipeline {
                 }
             }
         }
-        ids.push(self.masks.specialize(
-            cache,
-            Key {
-                msaa: view.msaa,
-                hdr: view.hdr,
-                always: false,
-                additive: false,
-                clipped: true,
-            },
-        )?);
+        if !crate::gl_compat::enabled() {
+            ids.push(self.masks.specialize(
+                cache,
+                Key {
+                    msaa: view.msaa,
+                    hdr: view.hdr,
+                    always: false,
+                    additive: false,
+                    clipped: true,
+                },
+            )?);
+        }
         Ok(())
     }
 }
