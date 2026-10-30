@@ -207,6 +207,13 @@ pub(super) fn render_plugin(
         "{}",
         summary(environment.as_deref(), video, chosen, fallback.as_ref())
     ));
+    let gl_compat = chosen == Backend::Gl;
+    render::gl_compat::install(gl_compat);
+    if gl_compat {
+        log(format_args!(
+            "Renderer GL compatibility: single sRGB scene target, no HDR/Enhanced or shader packs"
+        ));
+    }
     install_guard(app, guard);
     if let Some(fallback) = fallback {
         install_notice(app, notice(&fallback, chosen, platform));

@@ -129,7 +129,8 @@ impl crate::pipeline_warmup::PrewarmPipelines for EntityShadowGpu {
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };
-        ids.push(self.pipeline(cache, format.remove_srgb_suffix(), view.msaa.samples()));
+        let format = crate::gl_compat::gamma_target_format(format);
+        ids.push(self.pipeline(cache, format, view.msaa.samples()));
         Ok(())
     }
 }
@@ -241,7 +242,19 @@ pub(super) fn shadow_params(atmosphere: &AtmosphereFrame) -> EntityShadowParams 
         [0.0; 4]
     };
     let sky = atmosphere.sky_zenith().map(linear_to_srgb);
-    EntityShadowParams::new(entity_shadow_colour(sky, sunrise))
+    EntityShadowParams::new(shadow_colour(sky, sunrise, crate::gl_compat::enabled()))
+}
+
+/// The sRGB attachment in GL compatibility mode blends in linear space, so its multiplier must
+/// be linearized to keep the encoded-space shadow strength.
+pub(super) fn shadow_colour(sky: [f32; 3], sunrise: [f32; 4], gl_compat: bool) -> [f32; 4] {
+    let mut colour = entity_shadow_colour(sky, sunrise);
+    if gl_compat {
+        for channel in &mut colour[..3] {
+            *channel = render_model::celestial::srgb_to_linear(*channel);
+        }
+    }
+    colour
 }
 
 /// Converts the sky tint to the encoded space used by ordinary shadow blending.

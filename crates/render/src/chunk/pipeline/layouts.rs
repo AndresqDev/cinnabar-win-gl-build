@@ -114,14 +114,14 @@ impl Specializer<RenderPipeline> for ChunkPipelineSpecializer {
                     || fragment.shader == MODEL_SHADER_HANDLE)
         });
         crate::alpha_coverage::apply(descriptor, cutout);
-        let native_gamma =
-            super::super::transparent::gamma_pass::admitted(key.hdr, key.msaa, key.enhanced)
-                && descriptor
-                    .fragment
-                    .as_ref()
-                    .unwrap()
-                    .shader_defs
-                    .contains(&"NATIVE_GAMMA_BLEND".into());
+        let native_gamma = !crate::gl_compat::enabled()
+            && super::super::transparent::gamma_pass::admitted(key.hdr, key.msaa, key.enhanced)
+            && descriptor
+                .fragment
+                .as_ref()
+                .unwrap()
+                .shader_defs
+                .contains(&"NATIVE_GAMMA_BLEND".into());
         if !native_gamma {
             descriptor
                 .fragment
@@ -136,7 +136,7 @@ impl Specializer<RenderPipeline> for ChunkPipelineSpecializer {
             .format = if key.hdr {
             render_scene::SCENE_HDR_FORMAT
         } else if native_gamma {
-            render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix()
+            crate::gl_compat::gamma_target_format(render_scene::SCENE_COLOR_FORMAT)
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };

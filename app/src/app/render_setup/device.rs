@@ -207,6 +207,7 @@ const REQUIRED_DOWNLEVEL_FLAGS: wgpu::DownlevelFlags = wgpu::DownlevelFlags::BAS
 
 /// A candidate's capability snapshot, independent of native device creation.
 pub(super) struct AdapterCapabilities {
+    backend: wgpu::Backend,
     flags: wgpu::DownlevelFlags,
     limits: wgpu::Limits,
 }
@@ -215,16 +216,26 @@ impl From<&wgpu::Adapter> for AdapterCapabilities {
     /// Reads the capabilities without opening a device.
     fn from(adapter: &wgpu::Adapter) -> Self {
         Self {
+            backend: adapter.get_info().backend,
             flags: adapter.get_downlevel_capabilities().flags,
             limits: adapter.limits(),
         }
     }
 }
 
+/// The GL fallback flattens alternate views, so it does not require VIEW_FORMATS.
+fn required_downlevel_flags(backend: wgpu::Backend) -> wgpu::DownlevelFlags {
+    if backend == wgpu::Backend::Gl {
+        REQUIRED_DOWNLEVEL_FLAGS - wgpu::DownlevelFlags::VIEW_FORMATS
+    } else {
+        REQUIRED_DOWNLEVEL_FLAGS
+    }
+}
+
 /// Rejects candidates lacking the capabilities or limits used by the renderer.
 pub(super) fn meets_requirements(adapter: impl Into<AdapterCapabilities>) -> Result<()> {
     let adapter = adapter.into();
-    let missing = REQUIRED_DOWNLEVEL_FLAGS - adapter.flags;
+    let missing = required_downlevel_flags(adapter.backend) - adapter.flags;
     anyhow::ensure!(
         missing.is_empty(),
         "GPU lacks renderer capabilities: {missing:?}"

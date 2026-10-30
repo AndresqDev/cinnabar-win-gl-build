@@ -28,11 +28,12 @@ impl ArtworkRawViews {
 
     /// The view formats artwork textures are created with.
     pub(crate) fn view_formats(self) -> &'static [bevy::render::render_resource::TextureFormat] {
-        if self.0 {
+        let formats: &'static [bevy::render::render_resource::TextureFormat] = if self.0 {
             &[bevy::render::render_resource::TextureFormat::Rgba8Unorm]
         } else {
             &[]
-        }
+        };
+        crate::gl_compat::view_formats(formats)
     }
 }
 
@@ -57,7 +58,7 @@ pub(crate) fn extract_artwork_raw_views(
     >,
     mut raw: bevy::prelude::ResMut<ArtworkRawViews>,
 ) {
-    let wanted = ArtworkRawViews(!cameras.is_empty());
+    let wanted = ArtworkRawViews(!cameras.is_empty() && !crate::gl_compat::enabled());
     if *raw != wanted {
         *raw = wanted;
     }

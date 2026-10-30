@@ -163,9 +163,9 @@ impl Specializer<RenderPipeline> for ShapeSpecializer {
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };
-        if key.gamma {
+        if key.gamma && !crate::gl_compat::enabled() {
             let target = fragment.targets[0].as_mut().unwrap();
-            target.format = target.format.remove_srgb_suffix();
+            target.format = crate::gl_compat::gamma_target_format(target.format);
             fragment.shader_defs.push("SHAPE_GAMMA".into());
         }
         let depth = descriptor.depth_stencil.as_mut().unwrap();

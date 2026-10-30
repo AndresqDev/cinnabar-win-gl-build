@@ -159,7 +159,7 @@ pub(super) fn update_authored_textures(
     };
     // A Vanilla fallback on an unsupported device never decodes or attaches authored maps.
     let mode = if ENHANCED_RENDERING_ENABLED {
-        settings.user_settings_update().1.video.render_mode
+        super::compiled_render_mode(settings.user_settings_update().1.video.render_mode)
     } else {
         RenderMode::Vanilla
     };

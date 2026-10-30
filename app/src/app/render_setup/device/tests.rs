@@ -2,12 +2,24 @@ use super::*;
 
 #[test]
 fn vulkan_minimum_storage_limit_is_accepted() {
-    assert!(meets_requirements(capabilities(REQUIRED_DOWNLEVEL_FLAGS, 4)).is_ok());
+    assert!(
+        meets_requirements(capabilities(
+            REQUIRED_DOWNLEVEL_FLAGS,
+            4,
+            wgpu::Backend::Vulkan
+        ))
+        .is_ok()
+    );
 }
 
 /// Supplies native-independent capabilities to the production candidate filter.
-fn capabilities(flags: wgpu::DownlevelFlags, storage_buffers: u32) -> AdapterCapabilities {
+fn capabilities(
+    flags: wgpu::DownlevelFlags,
+    storage_buffers: u32,
+    backend: wgpu::Backend,
+) -> AdapterCapabilities {
     AdapterCapabilities {
+        backend,
         flags,
         limits: wgpu::Limits {
             max_storage_buffers_per_shader_stage: storage_buffers,
@@ -19,26 +31,54 @@ fn capabilities(flags: wgpu::DownlevelFlags, storage_buffers: u32) -> AdapterCap
 #[test]
 fn adapters_must_support_every_renderer_capability_and_storage_limit() {
     let required = render::minimum_vertex_storage_buffers();
-    assert!(meets_requirements(capabilities(REQUIRED_DOWNLEVEL_FLAGS, required)).is_ok());
+    assert!(
+        meets_requirements(capabilities(
+            REQUIRED_DOWNLEVEL_FLAGS,
+            required,
+            wgpu::Backend::Dx12
+        ))
+        .is_ok()
+    );
     for flag in REQUIRED_DOWNLEVEL_FLAGS.iter() {
         assert!(
-            meets_requirements(capabilities(REQUIRED_DOWNLEVEL_FLAGS - flag, required)).is_err()
+            meets_requirements(capabilities(
+                REQUIRED_DOWNLEVEL_FLAGS - flag,
+                required,
+                wgpu::Backend::Dx12
+            ))
+            .is_err()
         );
     }
-    assert!(meets_requirements(capabilities(REQUIRED_DOWNLEVEL_FLAGS, required - 1)).is_err());
+    assert!(
+        meets_requirements(capabilities(
+            REQUIRED_DOWNLEVEL_FLAGS,
+            required - 1,
+            wgpu::Backend::Dx12
+        ))
+        .is_err()
+    );
 }
 
 #[test]
-fn adapters_without_alternate_texture_views_are_not_candidates() {
+fn dx12_requires_alternate_texture_views_but_gl_flattens_them() {
     let view_formats = wgpu::DownlevelFlags::VIEW_FORMATS;
+    let required = render::required_vertex_storage_buffers();
     assert!(REQUIRED_DOWNLEVEL_FLAGS.contains(view_formats));
-    // Keep every other capability, isolating the missing GL/GLES texture-view support.
-    let adapter = capabilities(
-        wgpu::DownlevelFlags::all() - view_formats,
-        render::required_vertex_storage_buffers(),
-    );
-    let error = meets_requirements(adapter).unwrap_err();
+    let flags = wgpu::DownlevelFlags::all() - view_formats;
+    let error = meets_requirements(capabilities(flags, required, wgpu::Backend::Dx12)).unwrap_err();
     assert!(error.to_string().contains("VIEW_FORMATS"));
+    assert!(meets_requirements(capabilities(flags, required, wgpu::Backend::Gl)).is_ok());
+}
+
+#[test]
+fn gl_still_requires_every_other_renderer_capability() {
+    let required = render::minimum_vertex_storage_buffers();
+    let flags = required_downlevel_flags(wgpu::Backend::Gl);
+    for flag in flags.iter() {
+        assert!(
+            meets_requirements(capabilities(flags - flag, required, wgpu::Backend::Gl)).is_err()
+        );
+    }
 }
 
 #[test]

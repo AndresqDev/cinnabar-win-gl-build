@@ -28,6 +28,7 @@ pub(crate) struct SceneTarget {
     encoded: TextureView,
     linear: TextureView,
     format: TextureFormat,
+    gl_compat: bool,
     resolved: AtomicBool,
 }
 
@@ -40,12 +41,18 @@ impl SceneTarget {
         format: TextureFormat,
         samples: u32,
     ) -> Option<Self> {
+        let gl_compat = crate::gl_compat::enabled();
         let encoded_format = format.remove_srgb_suffix();
-        let view_formats = (format != encoded_format).then_some([format]);
+        let storage_format = crate::gl_compat::scene_storage_format(format);
+        let view_formats: &[TextureFormat] = if gl_compat || format == encoded_format {
+            &[]
+        } else {
+            std::slice::from_ref(&format)
+        };
         let bytes = u64::from(size.width)
             * u64::from(size.height)
             * u64::from(samples)
-            * u64::from(encoded_format.block_copy_size(None).unwrap_or(8));
+            * u64::from(storage_format.block_copy_size(None).unwrap_or(8));
         let texture =
             crate::gpu_allocation::checked(device, "shared main-pass colour", bytes, || {
                 device.create_texture(&TextureDescriptor {
@@ -54,26 +61,31 @@ impl SceneTarget {
                     mip_level_count: 1,
                     sample_count: samples,
                     dimension: TextureDimension::D2,
-                    format: encoded_format,
+                    format: storage_format,
                     usage: TextureUsages::RENDER_ATTACHMENT
                         | if samples == 1 {
                             TextureUsages::COPY_SRC | TextureUsages::COPY_DST
                         } else {
                             TextureUsages::empty()
                         },
-                    view_formats: view_formats.as_ref().map_or(&[], |formats| formats),
+                    view_formats,
                 })
             })?;
         let encoded = texture.create_view(&TextureViewDescriptor::default());
-        let linear = texture.create_view(&TextureViewDescriptor {
-            format: Some(format),
-            ..default()
-        });
+        let linear = if gl_compat {
+            texture.create_view(&TextureViewDescriptor::default())
+        } else {
+            texture.create_view(&TextureViewDescriptor {
+                format: Some(format),
+                ..default()
+            })
+        };
         Some(Self {
             texture,
             encoded,
             linear,
             format,
+            gl_compat,
             resolved: AtomicBool::new(false),
         })
     }
@@ -85,12 +97,13 @@ impl SceneTarget {
             && self.texture.sample_count() == samples
     }
 
-    /// The linear view's format, which pipelines writing `color_view(false)` target.
+    /// The attachment format shared by every scene pipeline.
     pub(crate) const fn format(&self) -> TextureFormat {
         self.format
     }
 
     /// Selects the material's blend colour space without changing the underlying samples.
+    /// The GL compatibility path has one sRGB view and returns it for both spaces.
     pub(crate) fn color_view(&self, encoded: bool) -> &TextureView {
         if encoded { &self.encoded } else { &self.linear }
     }
@@ -103,6 +116,7 @@ impl SceneTarget {
     ) -> RenderPassColorAttachment<'a> {
         let mut load = target.get_unsampled_color_attachment().ops.load;
         if encoded
+            && !self.gl_compat
             && self.format.is_srgb()
             && let LoadOp::Clear(colour) = load
         {

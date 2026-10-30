@@ -219,7 +219,7 @@ fn dispatch(
     )?;
     let artwork = texture.create_view(&wgpu::TextureViewDescriptor {
         label: Some("shader-pack actor artwork array"),
-        format: Some(texture.format().remove_srgb_suffix()),
+        format: crate::gl_compat::view_format(Some(texture.format().remove_srgb_suffix())),
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
     });

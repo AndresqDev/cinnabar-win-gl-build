@@ -211,7 +211,7 @@ fn share(slot: &mut Option<Shared>, label: &str, texture: Option<&Texture>) -> b
         texture,
         &wgpu::TextureViewDescriptor {
             label: Some(label),
-            format: Some(ATLAS_FORMAT),
+            format: crate::gl_compat::view_format(Some(ATLAS_FORMAT)),
             ..Default::default()
         },
     );

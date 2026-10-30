@@ -56,11 +56,16 @@ pub fn device_support(adapter: &RenderAdapter, device: &RenderDevice) -> CameraA
             format.guaranteed_format_features(features)
         }
     };
-    let colors = [
-        render_scene::SCENE_COLOR_FORMAT,
-        render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix(),
-        render_scene::SCENE_HDR_FORMAT,
-    ]
+    let colors = if adapter.get_info().backend == wgpu::Backend::Gl {
+        // GL compatibility renders one sRGB scene attachment; do not require the linear alias.
+        [render_scene::SCENE_COLOR_FORMAT; 3]
+    } else {
+        [
+            render_scene::SCENE_COLOR_FORMAT,
+            render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix(),
+            render_scene::SCENE_HDR_FORMAT,
+        ]
+    }
     .map(format_features);
     let depth = format_features(CORE_3D_DEPTH_FORMAT);
     let stencil = format_features(TextureFormat::Stencil8);

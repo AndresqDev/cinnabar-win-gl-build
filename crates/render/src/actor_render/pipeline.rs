@@ -523,10 +523,11 @@ impl ActorPipelineKey {
         };
         let format = if self.hdr {
             render_scene::SCENE_HDR_FORMAT
-        } else if super::phase::sorted(self.material)
+        } else if !crate::gl_compat::enabled()
+            && super::phase::sorted(self.material)
             && crate::chunk::transparent::gamma_pass::admitted(self.hdr, self.msaa, self.enhanced)
         {
-            render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix()
+            crate::gl_compat::gamma_target_format(render_scene::SCENE_COLOR_FORMAT)
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };
@@ -616,7 +617,8 @@ impl Specializer<RenderPipeline> for ActorPipelineSpecializer {
         let fragment = descriptor.fragment.as_mut().unwrap();
         fragment.targets[0].as_mut().unwrap().format = contract.format;
         // Sorted-pass spans share the transparent pass's gamma-encoded target.
-        if super::phase::sorted(key.material)
+        if !crate::gl_compat::enabled()
+            && super::phase::sorted(key.material)
             && crate::chunk::transparent::gamma_pass::admitted(key.hdr, key.msaa, key.enhanced)
         {
             fragment.shader_defs.push(bevy::shader::ShaderDefVal::Bool(

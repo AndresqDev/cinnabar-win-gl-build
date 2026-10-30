@@ -165,3 +165,13 @@ fn neutral_sky_shades_with_the_plain_grey_and_the_end_has_no_glow() {
     let end = noon.with_sky_kind(SkyKind::End);
     assert_eq!(shadow_params(&end).colour, [0.7, 0.7, 0.7, 1.0]);
 }
+
+#[test]
+fn gl_shadow_multiplier_is_linearized_for_the_srgb_attachment() {
+    let colour = shadow_colour([0.5; 3], [0.0; 4], true);
+    let expected = render_model::celestial::srgb_to_linear(0.7);
+    for channel in &colour[..3] {
+        assert!((*channel - expected).abs() < 1.0e-6);
+    }
+    assert_eq!(colour[3], 1.0);
+}

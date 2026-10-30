@@ -119,6 +119,9 @@ fn save_render_mode(path: &Path, mode: RenderMode) -> Result<()> {
 
 /// The mode itself when this build compiles it, else Vanilla.
 fn compiled_render_mode(mode: RenderMode) -> RenderMode {
+    if render::gl_compat::enabled() {
+        return RenderMode::Vanilla;
+    }
     match mode {
         RenderMode::Enhanced if enhanced_rendering_enabled() => mode,
         RenderMode::ShaderPack => mode,
@@ -328,7 +331,11 @@ type RenderModeCameraQuery = (
 fn effective_render_mode(
     requested: RenderMode,
     shader_pack: Option<&ShaderPackStatus>,
+    gl_compat: bool,
 ) -> RenderMode {
+    if gl_compat {
+        return RenderMode::Vanilla;
+    }
     match compiled_render_mode(requested) {
         RenderMode::ShaderPack if matches!(shader_pack, Some(ShaderPackStatus::Failed { .. })) => {
             RenderMode::Vanilla
@@ -348,6 +355,7 @@ fn apply_render_mode_to_cameras(
     let mode = effective_render_mode(
         settings.user_settings_update().1.video.render_mode,
         status.as_deref(),
+        render::gl_compat::enabled(),
     );
     let enhanced = mode == RenderMode::Enhanced;
     let shader_pack =
@@ -593,19 +601,33 @@ mod tests {
             reason: "no shaders folder".to_owned(),
         };
         assert_eq!(
-            effective_render_mode(RenderMode::ShaderPack, Some(&failed)),
+            effective_render_mode(RenderMode::ShaderPack, Some(&failed), false),
             RenderMode::Vanilla
         );
         let loading = ShaderPackStatus::Loading(PathBuf::from("Dusk.zip"));
         let compiled = RenderMode::ShaderPack;
         assert_eq!(
-            effective_render_mode(RenderMode::ShaderPack, Some(&loading)),
+            effective_render_mode(RenderMode::ShaderPack, Some(&loading), false),
             compiled
         );
         assert_eq!(
-            effective_render_mode(RenderMode::ShaderPack, None),
+            effective_render_mode(RenderMode::ShaderPack, None, false),
             compiled
         );
+    }
+
+    #[test]
+    fn gl_compatibility_draws_vanilla_only() {
+        for requested in [
+            RenderMode::Vanilla,
+            RenderMode::Enhanced,
+            RenderMode::ShaderPack,
+        ] {
+            assert_eq!(
+                effective_render_mode(requested, None, true),
+                RenderMode::Vanilla
+            );
+        }
     }
 
     /// Startup accepts a selected shader pack; evidence runs stay Vanilla.

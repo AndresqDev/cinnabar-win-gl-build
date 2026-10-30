@@ -2620,6 +2620,7 @@ dependencies = [
  "tracing",
  "ui",
  "ui-engine",
+ "wgpu",
  "world",
  "zip",
 ]

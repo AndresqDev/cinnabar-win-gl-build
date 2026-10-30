@@ -11,6 +11,11 @@ Windows executable. It is not affiliated with or endorsed by the Cinnabar projec
   **Auto / Vulkan / DX12 / GL**.
 - `app/Cargo.toml`: enables wgpu's `gles` feature on Windows so the native WGL backend is
   compiled.
+- `crates/render/src/gl_compat.rs`: a small runtime compatibility layer, active only when the
+  selected backend is GL. It flattens the scene and artwork views, preserves the native leaf
+  filtering with a linear companion atlas, and forces Vanilla rendering.
+- `SceneTarget` uses one sRGB attachment on GL. The gamma-space transparent/name-tag pipelines
+  are retargeted to sRGB so they remain valid without alternate texture views.
 
 Everything else is upstream source. The default startup order stays **DX12 → Vulkan → GL**.
 To force OpenGL, set `WGPU_BACKEND=gl` before launching `cinnabar.exe`, or pick **GL** under
@@ -18,13 +23,40 @@ To force OpenGL, set `WGPU_BACKEND=gl` before launching `cinnabar.exe`, or pick 
 
 ## Why not DX11?
 
-Cinnabar renders with Bevy + wgpu. wgpu has no Direct3D 11 backend; its Windows backends are
-DX12, Vulkan and (here, experimentally) OpenGL. DX11 support would require replacing the
-renderer, not changing a build flag.
+Cinnabar renders with Bevy + wgpu. wgpu's old Direct3D 11 backend was only an adapter
+skeleton: `wgpu-hal/src/dx11/device.rs` and `command.rs` were full of `todo!()`, and it
+never rendered anything. It was removed in wgpu 0.19 (PR #4828). No wgpu fork implements it.
+`gfx-rs/gfx` has a DX11 backend, but it is a different, maintenance-only HAL and cannot be
+dropped into wgpu/Bevy.
 
-OpenGL was removed from the upstream backend policy in PR #1010 (October 2026). It is
-re-enabled here on a best-effort basis and may be less stable or slower than DX12/Vulkan.
-If the game refuses OpenGL startup, use Auto/DX12/Vulkan or an older GPU driver with OpenGL 4.3+.
+Upstream wgpu now has an ANGLE/GLES backend for Windows (PR #9422), which translates GLES to
+D3D11. ANGLE's D3D11 backend only exposes GLES 3.0, however, while Cinnabar requires GLES 3.1
+storage/compute features, so ANGLE cannot replace a real DX11 backend here.
+
+## OpenGL status (important)
+
+This build compiles wgpu's native WGL/OpenGL backend on Windows and runs the renderer in a
+degraded GL compatibility mode. It no longer requires `wgpu::DownlevelFlags::VIEW_FORMATS`,
+because the compatibility layer removes every alternate-format view:
+
+- The shared main-pass target is one sRGB attachment instead of a linear texture plus an sRGB
+  view.
+- Chunk leaves use a companion `Rgba8Unorm` atlas, so their gamma-space filtering is preserved.
+- Raw artwork and shader-pack views are flattened; shader packs and Enhanced/HDR are disabled
+  while GL is selected.
+
+Requirements and known sacrifices:
+
+- Native OpenGL 4.3+ is required by the remaining renderer capabilities.
+- Ordinary transparents, name tags, and entity shadows blend in **linear** space instead of the
+  native gamma-space path. This can change water, glass, particle, and shadow tint slightly;
+  it is a deliberate compatibility trade-off, not a random corruption.
+- HDR/Enhanced and shader packs are unavailable in this mode.
+- DX12 and Vulkan keep the original quality and are still the default backends.
+
+If GL is selected but the driver lacks another required capability, startup reports the missing
+flag or limit instead of using an unsupported path. DX12 and Vulkan remain the recommended
+backends.
 
 ## Artifact layout
 

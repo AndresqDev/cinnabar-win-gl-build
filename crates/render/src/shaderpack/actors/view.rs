@@ -212,7 +212,7 @@ fn layer_view(texture: &Texture, layer: u32) -> TextureView {
         texture,
         &wgpu::TextureViewDescriptor {
             label: Some("shader-pack actor texture layer"),
-            format: Some(texture.format().remove_srgb_suffix()),
+            format: crate::gl_compat::view_format(Some(texture.format().remove_srgb_suffix())),
             dimension: Some(wgpu::TextureViewDimension::D2),
             base_array_layer: layer,
             array_layer_count: Some(1),

@@ -29,6 +29,9 @@ mod gpu_snapshot;
 #[path = "../src/startup_presentation.rs"]
 mod startup_presentation;
 
+#[path = "../src/gl_compat.rs"]
+#[allow(dead_code, reason = "shared scene compatibility policy")]
+mod gl_compat;
 #[path = "../src/material_shader.rs"]
 #[allow(dead_code, reason = "shared checked shader constructor dependencies")]
 mod material_shader;

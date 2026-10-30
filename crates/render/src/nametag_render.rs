@@ -361,10 +361,10 @@ impl Specializer<RenderPipeline> for NametagPipelineSpecializer {
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };
-        if key.gamma_blend {
+        if key.gamma_blend && !crate::gl_compat::enabled() {
             let fragment = descriptor.fragment.as_mut().unwrap();
             let target = fragment.targets[0].as_mut().unwrap();
-            target.format = target.format.remove_srgb_suffix();
+            target.format = crate::gl_compat::gamma_target_format(target.format);
             fragment.shader_defs.push("NAMETAG_GAMMA_BLEND".into());
         }
         // Reverse-Z: nearer fragments carry larger depth.

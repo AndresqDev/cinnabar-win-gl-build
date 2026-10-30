@@ -221,6 +221,8 @@ pub(in crate::chunk) struct PreparedChunkTextureAssets {
     pub(in crate::chunk) animation_frame_buffer: Buffer,
     pub(in crate::chunk) model_template_buffer: Buffer,
     pub(in crate::chunk) _textures: [Texture; assets::MAX_TEXTURE_PAGES],
+    /// Linear companion pages used by the GL compatibility path for native leaves.
+    pub(in crate::chunk) _native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]>,
     pub(in crate::chunk) views: [TextureView; assets::MAX_TEXTURE_PAGES],
     /// Neutral normal and MER pages that stand in for detached authored maps.
     #[cfg(feature = "enhanced")]

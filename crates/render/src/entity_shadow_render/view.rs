@@ -51,7 +51,7 @@ pub(crate) fn prepare_shadow_views(
             .unwrap_or_else(|| view.clip_from_view * view.world_from_view.to_matrix().inverse());
         let rect = shadow_screen_rect(clip_from_world, &scene.0.shadows, view.viewport.to_array());
         let main = target.main_texture();
-        let format = main.format().remove_srgb_suffix();
+        let format = crate::gl_compat::gamma_target_format(main.format());
         if let Some(mut state) = state {
             state.rect = rect;
             if rect.is_none()

@@ -307,24 +307,46 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
     });
     let mut uploaded_bytes = 0u64;
+    let gl_compat = crate::gl_compat::enabled();
     let mut textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
+    let mut native_leaf_textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
+    let mut native_leaf_views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
+    let mut native_leaf_bytes = 0u64;
     // Upload the mip-rebuilt pages the validator measured, not the raw sources.
-    for (index, (texture, plans)) in terrain_pages.iter().zip(upload_plans).enumerate() {
-        let (texture, view, uploaded) = upload_texture_page(
-            render_device,
-            render_queue,
-            texture,
-            &plans,
-            match index {
-                0 => "global chunk texture page 0",
-                1 => "global chunk texture page 1",
-                2 => "global chunk texture page 2",
-                3 => "global chunk texture page 3",
-                _ => "global chunk texture page 4",
-            },
-        );
+    for (index, (page, plans)) in terrain_pages.iter().zip(upload_plans).enumerate() {
+        let label = match index {
+            0 => "global chunk texture page 0",
+            1 => "global chunk texture page 1",
+            2 => "global chunk texture page 2",
+            3 => "global chunk texture page 3",
+            _ => "global chunk texture page 4",
+        };
+        let (texture, view, uploaded) =
+            upload_texture_page(render_device, render_queue, page, &plans, label);
         uploaded_bytes = uploaded_bytes.saturating_add(uploaded);
+        if gl_compat {
+            // GL cannot alias the sRGB allocation as raw UNORM. Upload a companion linear page
+            // so leaves keep their original gamma-space filtering.
+            let (leaf_texture, leaf_view, leaf_uploaded) =
+                upload_linear_texture_page(render_device, render_queue, page, &plans, label);
+            uploaded_bytes = uploaded_bytes.saturating_add(leaf_uploaded);
+            native_leaf_bytes = native_leaf_bytes.saturating_add(
+                page.mips
+                    .iter()
+                    .map(|mip| mip.rgba8.len() as u64)
+                    .sum::<u64>(),
+            );
+            native_leaf_textures.push(leaf_texture);
+            native_leaf_views.push(leaf_view);
+        } else {
+            native_leaf_views.push(texture.create_view(&TextureViewDescriptor {
+                label: Some("world leaf atlas gamma view"),
+                format: Some(TextureFormat::Rgba8Unorm),
+                dimension: Some(TextureViewDimension::D2Array),
+                ..Default::default()
+            }));
+        }
         textures.push(texture);
         views.push(view);
     }
@@ -420,22 +442,14 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         contents: bytemuck::cast_slice(enhanced_texture_refs),
         usage: BufferUsages::STORAGE,
     });
-    // Current atlas upload retains RGBA8_UNORM.
-    // A view of each existing allocation preserves gamma-space filtering for
-    // world leaves without duplicating texture memory or changing other art.
-    let native_leaf_views = textures
-        .iter()
-        .map(|texture| {
-            texture.create_view(&TextureViewDescriptor {
-                label: Some("native world leaf atlas view"),
-                format: Some(TextureFormat::Rgba8Unorm),
-                dimension: Some(TextureViewDimension::D2Array),
-                ..Default::default()
-            })
-        })
-        .collect::<Vec<_>>()
+    let native_leaf_views: [TextureView; assets::MAX_TEXTURE_PAGES] = native_leaf_views
         .try_into()
-        .expect("every physical page uploads a view");
+        .expect("every physical page uploads a native leaf view");
+    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> = gl_compat.then(|| {
+        native_leaf_textures
+            .try_into()
+            .expect("every physical page uploads a native leaf texture")
+    });
     let sampler = render_device.create_sampler(&chunk_sampler_descriptor());
     let native_leaf_sampler =
         render_device.create_sampler(&crate::material_shader::native_leaf_sampler_descriptor());
@@ -451,7 +465,8 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         .iter()
         .flat_map(|texture| texture.mips.iter())
         .map(|mip| mip.rgba8.len() as u64)
-        .sum();
+        .sum::<u64>()
+        .saturating_add(native_leaf_bytes);
     stats.queue_upload_bytes = uploaded_bytes;
     #[cfg(feature = "enhanced")]
     {
@@ -491,6 +506,7 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         animation_frame_buffer,
         model_template_buffer,
         _textures: textures.try_into().expect("every physical page uploads"),
+        _native_leaf_textures: native_leaf_textures,
         views: views
             .try_into()
             .expect("every physical page uploads a view"),
@@ -551,6 +567,11 @@ pub(in crate::chunk) fn upload_texture_page(
     upload_plans: &[TextureMipUploadPlan],
     label: &'static str,
 ) -> (Texture, TextureView, u64) {
+    let view_formats = if crate::gl_compat::enabled() {
+        &[][..]
+    } else {
+        &[TextureFormat::Rgba8Unorm][..]
+    };
     upload_texture_page_format(
         render_device,
         render_queue,
@@ -558,12 +579,11 @@ pub(in crate::chunk) fn upload_texture_page(
         upload_plans,
         label,
         TextureFormat::Rgba8UnormSrgb,
-        &[TextureFormat::Rgba8Unorm],
+        view_formats,
     )
 }
 
-/// Uploads authored normal or material channels without sRGB conversion.
-#[cfg(feature = "enhanced")]
+/// Uploads raw linear pages for native leaves and authored normal/material channels.
 fn upload_linear_texture_page(
     render_device: &RenderDevice,
     render_queue: &RenderQueue,

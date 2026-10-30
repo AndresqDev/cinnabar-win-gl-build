@@ -21,6 +21,8 @@ mod aim_assist;
 pub use aim_assist::AimAssistHighlightPlugin;
 mod actor;
 mod actor_render;
+/// Native OpenGL compatibility policy; see the module documentation for its sacrifices.
+pub mod gl_compat;
 #[cfg(test)]
 #[global_allocator]
 static ALLOCATOR: test_alloc::CountingAllocator = test_alloc::CountingAllocator;
