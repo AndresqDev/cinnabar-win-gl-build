@@ -39,14 +39,6 @@ jobs:
           cargo --version
           go version
 
-      # wgpu's WGL backend aborts when its 1-second context-lock watchdog
-      # expires. Slow Intel uploads can exceed that without a real deadlock.
-      - name: Patch wgpu WGL context-lock timeout
-        shell: bash
-        run: |
-          cargo fetch --locked
-          bash scripts/patch-wgpu-gl-timeout.sh
-
       - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
@@ -61,6 +53,14 @@ jobs:
           script: |
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # wgpu's WGL backend aborts when its 1-second context-lock watchdog
+      # expires. Slow Intel uploads can exceed that without a real deadlock.
+      - name: Patch wgpu WGL context-lock timeout
+        shell: bash
+        run: |
+          cargo fetch --locked
+          bash scripts/patch-wgpu-gl-timeout.sh
 
       - name: Build Rust client and tools
         shell: bash
