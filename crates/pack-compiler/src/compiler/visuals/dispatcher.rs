@@ -1,0 +1,949 @@
+use super::super::*;
+use super::context::{
+    ButtonTemplateKey, CuboidTemplateKey, GateTemplateKey, ModelStorage, PaleMossCarpetTemplateKey,
+    PressurePlateTemplateKey, RuleInputs, SignTemplateKey, ThinTemplateKey, diagnostic_visual,
+};
+use super::fallback::FallbackInventory;
+use assets::facts::pack::PackBlock as B;
+
+#[derive(Clone, Copy)]
+pub(in crate::compiler) struct ExactAdmissions {
+    pub(in crate::compiler) mineral_cubes: bool,
+    pub(in crate::compiler) chiseled_bookshelves: bool,
+    pub(in crate::compiler) resin_clumps: bool,
+    pub(in crate::compiler) selector_alias_cubes: bool,
+    pub(in crate::compiler) cacti: bool,
+    pub(in crate::compiler) cakes: bool,
+    pub(in crate::compiler) farmland: bool,
+    pub(in crate::compiler) bee_housing: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::compiler) enum CompileRuleResult {
+    NoMatch,
+    Reject,
+    Compiled(BlockVisual),
+}
+/// Wire identity of the one record that resolves as canonical air for a
+/// compiled registry. Derived from registry content at compile time instead
+/// of pinning one legacy protocol's sequential ID and network hash, so a
+/// protocol-2225 triple whose air sits at different identities compiles the
+/// same exact Invisible route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::compiler) struct CanonicalAirIdentity {
+    pub(in crate::compiler) sequential_id: u32,
+    pub(in crate::compiler) network_hash: u32,
+}
+
+fn air_candidate(record: &RegistryRecord) -> bool {
+    record.name.as_ref() == B::Air.identifier()
+        && record.canonical_state.as_ref() == "{}"
+        && record.flags.contains(BlockFlags::AIR)
+        && record.contributor_role == ContributorRole::Air
+}
+
+/// Resolves the unique canonical-air identity from registry content.
+///
+/// Fails closed when no record satisfies the full predicate, when more than
+/// one does, or when any other record wearing the `minecraft:air` name fails
+/// the predicate (a decoy that would make the canonical identity ambiguous).
+/// Air-flagged records under other names stay non-fatal decoys and keep the
+/// established diagnostic-stripping route.
+pub(in crate::compiler) fn resolve_canonical_air(
+    records: &[RegistryRecord],
+) -> Result<CanonicalAirIdentity, AssetError> {
+    let mut canonical = None;
+    for record in records
+        .iter()
+        .filter(|record| record.name.as_ref() == B::Air.identifier())
+    {
+        if !air_candidate(record) {
+            return Err(AssetError::InvalidCompiledAssets {
+                detail: format!(
+                    "registry record {} names minecraft:air but fails the canonical-air state/flags/role contract",
+                    record.sequential_id
+                )
+                .into(),
+            });
+        }
+        if canonical.replace(record).is_some() {
+            return Err(AssetError::InvalidCompiledAssets {
+                detail: "registry declares more than one canonical minecraft:air record".into(),
+            });
+        }
+    }
+    let canonical = canonical.ok_or_else(|| AssetError::InvalidCompiledAssets {
+        detail: "registry declares no canonical minecraft:air record".into(),
+    })?;
+    Ok(CanonicalAirIdentity {
+        sequential_id: canonical.sequential_id,
+        network_hash: canonical.network_hash,
+    })
+}
+
+fn is_canonical_air(record: &RegistryRecord, canonical_air: CanonicalAirIdentity) -> bool {
+    record.sequential_id == canonical_air.sequential_id
+        && record.network_hash == canonical_air.network_hash
+        && air_candidate(record)
+}
+
+fn diagnostic_for_unmatched_record(
+    record: &RegistryRecord,
+    canonical_air: CanonicalAirIdentity,
+) -> BlockVisual {
+    let mut visual = diagnostic_visual(record);
+    if record.flags.contains(BlockFlags::AIR)
+        && record.contributor_role == ContributorRole::Air
+        && !is_canonical_air(record, canonical_air)
+    {
+        visual.flags.remove(BlockFlags::AIR);
+        visual.contributor_role = ContributorRole::Primary;
+    }
+    visual
+}
+
+#[derive(Default)]
+struct VisualCompiler {
+    authored_templates: BTreeMap<(u32, Box<str>, u8), u32>,
+    model_templates: Vec<ModelTemplate>,
+    model_quads: Vec<ModelQuad>,
+    cross_templates: BTreeMap<super::cross::TemplateKey, u32>,
+    stem_templates: BTreeMap<super::stem::TemplateKey, u32>,
+    pitcher_crop_templates: BTreeMap<super::pitcher_crop::TemplateKey, u32>,
+    kelp_templates: BTreeMap<[u32; 6], u32>,
+    transparent_cube_templates: BTreeMap<[u32; 6], u32>,
+    honey_templates: BTreeMap<[u32; 6], u32>,
+    portal_templates: BTreeMap<[u32; 6], u32>,
+    dragon_egg_templates: BTreeMap<[u32; 6], u32>,
+    heavy_core_templates: BTreeMap<[u32; 6], u32>,
+    beacon_templates: BTreeMap<[u32; 3], u32>,
+    anvil_templates: BTreeMap<super::anvil::TemplateKey, u32>,
+    end_portal_frame_templates: BTreeMap<super::end_portal_frame::TemplateKey, u32>,
+    end_rod_templates: BTreeMap<(u32, usize), u32>,
+    lightning_rod_templates: BTreeMap<(u32, usize), u32>,
+    flowerbed_templates: BTreeMap<[u32; 4], u32>,
+    leaf_litter_templates: BTreeMap<[u32; 3], u32>,
+    slab_templates: BTreeMap<[u32; 7], u32>,
+    stair_templates: BTreeMap<[u32; 7], u32>,
+    vine_templates: BTreeMap<[u32; 2], u32>,
+    multiface_templates: BTreeMap<[u32; 3], u32>,
+    cuboid_templates: BTreeMap<CuboidTemplateKey, u32>,
+    door_templates: BTreeMap<super::doors::TemplateKey, u32>,
+    trapdoor_templates: BTreeMap<super::trapdoor::TemplateKey, u32>,
+    wall_templates: BTreeMap<[u32; 7], u32>,
+    pressure_plate_templates: BTreeMap<PressurePlateTemplateKey, u32>,
+    button_templates: BTreeMap<ButtonTemplateKey, u32>,
+    pale_moss_carpet_templates: BTreeMap<PaleMossCarpetTemplateKey, u32>,
+    gate_templates: BTreeMap<GateTemplateKey, u32>,
+    pane_templates: BTreeMap<[u32; 2], u32>,
+    fence_templates: BTreeMap<[u32; 3], u32>,
+    sign_templates: BTreeMap<SignTemplateKey, u32>,
+    thin_templates: BTreeMap<ThinTemplateKey, u32>,
+    lily_pad_templates: BTreeMap<u32, u32>,
+    fire_templates: BTreeMap<[u32; 2], u32>,
+    flower_pot_templates: BTreeMap<[u32; 7], u32>,
+    bamboo_templates: BTreeMap<(u32, u32, i16, u8), u32>,
+    lantern_templates: BTreeMap<(u32, bool), u32>,
+    lever_templates: BTreeMap<super::lever::TemplateKey, u32>,
+    flower_pot_soil: Option<u32>,
+    chiseled_bookshelf_templates: BTreeMap<[u32; 5], u32>,
+    shelf_templates: BTreeMap<([u32; 6], u8, u8), u32>,
+    grindstone_templates: BTreeMap<([u32; 6], u8, u8), u32>,
+    stonecutter_templates: BTreeMap<([u32; 6], bool), u32>,
+    sea_pickle_templates: BTreeMap<(u32, u8, bool), u32>,
+    tripwire_hook_templates: BTreeMap<([u32; 6], u8, bool, bool), u32>,
+    coral_templates: BTreeMap<(u32, super::coral::Shape), u32>,
+    barrel_templates: BTreeMap<([u32; 6], usize), u32>,
+    facing_cube_templates: BTreeMap<([u32; 6], [u8; 6]), u32>,
+    command_block_templates: BTreeMap<([u32; 6], usize), u32>,
+    mapped_face_templates: BTreeMap<([u32; 6], [u8; 6]), u32>,
+    brewing_stand_templates: BTreeMap<([u32; 6], [bool; 3]), u32>,
+    campfire_templates: BTreeMap<([u32; 6], bool, u8), u32>,
+    bubble_column_templates: BTreeMap<[u32; 9], u32>,
+    candle_cake_templates: BTreeMap<[u32; 4], u32>,
+    hollow_container_templates: BTreeMap<(super::hollow_containers::VesselState, Vec<u32>), u32>,
+    hopper_templates: BTreeMap<([u32; 6], u8), u32>,
+}
+
+impl VisualCompiler {
+    /// Dedicated rules win over the provisional envelope; the plain cube is the last resort.
+    fn compile_record(
+        &mut self,
+        record: &RegistryRecord,
+        inputs: &RuleInputs<'_>,
+        admissions: ExactAdmissions,
+        canonical_air: CanonicalAirIdentity,
+    ) -> Result<CompileRuleResult, AssetError> {
+        match self.compile_dedicated(record, inputs, admissions, canonical_air)? {
+            CompileRuleResult::NoMatch => {}
+            outcome => return Ok(outcome),
+        }
+        match super::fallback::compile_rule(
+            record,
+            inputs,
+            &mut self.cuboid_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        )? {
+            CompileRuleResult::NoMatch => Ok(super::cube::compile_rule(record, inputs)),
+            outcome => Ok(outcome),
+        }
+    }
+
+    /// Returns the first dedicated rule result, leaving unmatched records for fallback handling.
+    fn compile_dedicated(
+        &mut self,
+        record: &RegistryRecord,
+        inputs: &RuleInputs<'_>,
+        admissions: ExactAdmissions,
+        canonical_air: CanonicalAirIdentity,
+    ) -> Result<CompileRuleResult, AssetError> {
+        macro_rules! ordered_rule {
+            ($rule:expr) => {
+                match $rule? {
+                    CompileRuleResult::NoMatch => {}
+                    outcome => return Ok(outcome),
+                }
+            };
+        }
+        if is_canonical_air(record, canonical_air) {
+            let mut visual = diagnostic_visual(record);
+            visual.kind = VisualKind::Invisible;
+            visual.support = VisualSupport::Exact;
+            return Ok(CompileRuleResult::Compiled(visual));
+        }
+
+        ordered_rule!(super::authored::compile_rule(
+            record,
+            inputs,
+            &mut self.authored_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::bubble_column::compile_rule(
+            record,
+            inputs,
+            &mut self.bubble_column_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::beacon::compile_rule(
+            record,
+            inputs,
+            &mut self.beacon_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::lever::compile_rule(
+            record,
+            inputs,
+            &mut self.lever_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::barrel::compile_rule(
+            record,
+            inputs,
+            &mut self.barrel_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::facing_cube::compile_rule(
+            record,
+            inputs,
+            &mut self.facing_cube_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::command_block::compile_rule(
+            record,
+            inputs,
+            &mut self.command_block_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::mapped_face::compile_rule(
+            record,
+            inputs,
+            &mut self.mapped_face_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::coral::compile_rule(
+            record,
+            inputs,
+            &mut self.coral_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::bamboo::compile_rule(
+            record,
+            inputs,
+            &mut self.bamboo_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::anvil::compile_rule(
+            record,
+            inputs,
+            &mut self.anvil_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::dragon_egg::compile_rule(
+            record,
+            inputs,
+            &mut self.dragon_egg_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::heavy_core::compile_rule(
+            record,
+            inputs,
+            &mut self.heavy_core_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::entity_drawn::compile_rule(
+            record,
+            inputs,
+            &mut self.cuboid_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::lily_pad::compile_rule(
+            record,
+            inputs,
+            &mut self.lily_pad_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::fire::compile_rule(
+            record,
+            inputs,
+            &mut self.fire_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::portal::compile_rule(
+            record,
+            inputs,
+            &mut self.portal_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::end_portal_frame::compile_rule(
+            record,
+            inputs,
+            &mut self.end_portal_frame_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::lightning_rod::compile_rule(
+            record,
+            inputs,
+            &mut self.lightning_rod_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::grindstone::compile_rule(
+            record,
+            inputs,
+            &mut self.grindstone_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::stonecutter::compile_rule(
+            record,
+            inputs,
+            &mut self.stonecutter_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::tripwire_hook::compile_rule(
+            record,
+            inputs,
+            &mut self.tripwire_hook_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::sea_pickle::compile_rule(
+            record,
+            inputs,
+            &mut self.sea_pickle_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::brewing_stand::compile_rule(
+            record,
+            inputs,
+            &mut self.brewing_stand_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::campfire::compile_rule(
+            record,
+            inputs,
+            &mut self.campfire_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::end_rod::compile_rule(
+            record,
+            inputs,
+            &mut self.end_rod_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::flower_pot::compile_rule(
+            record,
+            inputs,
+            self.flower_pot_soil,
+            &mut self.flower_pot_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::lantern::compile_rule(
+            record,
+            inputs,
+            &mut self.lantern_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::honey::compile_rule(
+            record,
+            inputs,
+            &mut self.honey_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::shelf::compile_rule(
+            record,
+            inputs,
+            &mut self.shelf_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::candle_cake::compile_rule(
+            record,
+            inputs,
+            &mut self.candle_cake_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::hollow_containers::compile_rule(
+            record,
+            inputs,
+            &mut self.hollow_container_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::hopper::compile_rule(
+            record,
+            inputs,
+            &mut self.hopper_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        match super::respawn_anchor::compile_rule(record, inputs) {
+            CompileRuleResult::NoMatch => {}
+            outcome => return Ok(outcome),
+        }
+        ordered_rule!(super::leaf_litter::compile_rule(
+            record,
+            inputs,
+            &mut self.leaf_litter_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        match super::literal::compile_rule(record, inputs) {
+            CompileRuleResult::NoMatch => {}
+            outcome => return Ok(outcome),
+        }
+        let mut exact_visual = diagnostic_visual(record);
+        ordered_rule!(super::exact::compile_exact_families(
+            record,
+            &mut super::exact::ExactRuleContext {
+                pack: inputs.pack,
+                material_by_descriptor: inputs.material_by_descriptor,
+                admissions,
+                visual: &mut exact_visual,
+                cuboid_template_by_key: &mut self.cuboid_templates,
+                chiseled_bookshelf_template_by_key: &mut self.chiseled_bookshelf_templates,
+                model_templates: &mut self.model_templates,
+                model_quads: &mut self.model_quads,
+            },
+        ));
+
+        let mut surface_visual = diagnostic_visual(record);
+        ordered_rule!(super::surfaces::compile_surface_rule(
+            record,
+            &mut super::surfaces::SurfaceRuleContext {
+                pack: inputs.pack,
+                material_by_descriptor: inputs.material_by_descriptor,
+                fallback: inputs.fallback,
+                visual: &mut surface_visual,
+                transparent_cube_template_by_material: &mut self.transparent_cube_templates,
+                flowerbed_template_by_key: &mut self.flowerbed_templates,
+                vine_template_by_key: &mut self.vine_templates,
+                multiface_template_by_key: &mut self.multiface_templates,
+                model_templates: &mut self.model_templates,
+                model_quads: &mut self.model_quads,
+            },
+        ));
+
+        ordered_rule!(super::signs::compile_rule(
+            record,
+            inputs,
+            &mut self.sign_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::trapdoor::compile_rule(
+            record,
+            inputs,
+            &mut self.trapdoor_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::doors::compile_rule(
+            record,
+            inputs,
+            &mut self.door_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::panes::compile_rule(
+            record,
+            inputs,
+            &mut self.pane_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::fences::compile_rule(
+            record,
+            inputs,
+            &mut self.fence_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::walls::compile_rule(
+            record,
+            inputs,
+            &mut self.wall_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::pressure_plates::compile_rule(
+            record,
+            inputs,
+            &mut self.pressure_plate_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::button::compile_rule(
+            record,
+            inputs,
+            &mut self.button_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::carpets::compile_rule(
+            record,
+            inputs,
+            &mut super::carpets::CarpetRuleTemplates {
+                cuboids: &mut self.cuboid_templates,
+                pale: &mut self.pale_moss_carpet_templates,
+            },
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::gates::compile_rule(
+            record,
+            inputs,
+            &mut self.gate_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::slabs::compile_rule(
+            record,
+            inputs,
+            &mut self.slab_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::stairs::compile_rule(
+            record,
+            inputs,
+            &mut self.stair_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::torches::compile_rule(
+            record,
+            inputs,
+            &mut self.thin_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::ladders::compile_rule(
+            record,
+            inputs,
+            &mut self.thin_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::chains::compile_rule(
+            record,
+            inputs,
+            &mut self.thin_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::rails::compile_rule(
+            record,
+            inputs,
+            &mut self.thin_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::named_blocks::compile_rule(
+            record,
+            inputs,
+            &mut self.cuboid_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::crystals::compile_rule(
+            record,
+            inputs,
+            &mut self.thin_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::translucent_cubes::compile_rule(
+            record,
+            inputs,
+            &mut self.transparent_cube_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::kelp::compile_rule(
+            record,
+            inputs,
+            &mut self.kelp_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        ordered_rule!(super::stem::compile_rule(
+            record,
+            inputs,
+            &mut self.stem_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::pitcher_crop::compile_rule(
+            record,
+            inputs,
+            &mut self.pitcher_crop_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads
+            },
+        ));
+        ordered_rule!(super::cross::compile_rule(
+            record,
+            inputs,
+            &mut self.cross_templates,
+            &mut ModelStorage {
+                templates: &mut self.model_templates,
+                quads: &mut self.model_quads,
+            },
+        ));
+        Ok(CompileRuleResult::NoMatch)
+    }
+}
+
+pub(in crate::compiler) fn compile_visuals(
+    records: &[RegistryRecord],
+    pack: &PackSources,
+    material_by_descriptor: &BTreeMap<Descriptor, u32>,
+    vanilla_fallback_material: u32,
+    fallback: &'static FallbackInventory<'static>,
+    admissions: ExactAdmissions,
+) -> Result<CompiledVisuals, AssetError> {
+    let canonical_air = resolve_canonical_air(records)?;
+    let visual_count = records
+        .iter()
+        .map(|record| record.sequential_id as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut visuals =
+        vec![BlockVisual::diagnostic(BlockFlags::empty(), ContributorRole::Primary); visual_count];
+    let mut hashed = Vec::with_capacity(records.len());
+    let mut compiler = VisualCompiler::default();
+    let inputs = RuleInputs {
+        pack,
+        material_by_descriptor,
+        vanilla_fallback_material,
+        fallback,
+    };
+    compiler.flower_pot_soil = super::flower_pot::soil_material(records, &inputs);
+    let mut ordered_records = records.iter().collect::<Vec<_>>();
+    let mut potted_templates = BTreeMap::new();
+    ordered_records.sort_unstable_by_key(|record| record.sequential_id);
+    for record in ordered_records {
+        visuals[record.sequential_id as usize] =
+            match compiler.compile_record(record, &inputs, admissions, canonical_air)? {
+                CompileRuleResult::Compiled(mut visual) => {
+                    if visual.kind != VisualKind::Diagnostic
+                        && visual.support == VisualSupport::Diagnostic
+                    {
+                        visual.support = VisualSupport::Exact;
+                    }
+                    super::snowy_grass::apply(record, &mut visual, &inputs);
+                    super::fire_admission::apply(record, &mut visual);
+                    super::potted_plants::apply(
+                        record,
+                        &mut visual,
+                        &inputs,
+                        &mut potted_templates,
+                        &mut ModelStorage {
+                            templates: &mut compiler.model_templates,
+                            quads: &mut compiler.model_quads,
+                        },
+                    )?;
+                    visual
+                }
+                CompileRuleResult::NoMatch | CompileRuleResult::Reject => {
+                    diagnostic_for_unmatched_record(record, canonical_air)
+                }
+            };
+        hashed.push((record.network_hash, record.sequential_id));
+    }
+    hashed.sort_unstable_by_key(|entry| entry.0);
+    Ok((
+        visuals.into_boxed_slice(),
+        hashed.into_boxed_slice(),
+        compiler.model_templates.into_boxed_slice(),
+        compiler.model_quads.into_boxed_slice(),
+    ))
+}
+
+#[cfg(test)]
+#[path = "dispatcher/precedence_tests.rs"]
+mod precedence_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use assets::RegistryProvenance;
+
+    #[test]
+    fn resolution_pins_the_unique_pinned_registry_air_identity() {
+        let records = assets::read_registry(include_bytes!(
+            "../../../../assets/data/block-registry-v1001.bin"
+        ))
+        .expect("decode pinned registry");
+        let identity = resolve_canonical_air(&records).expect("unique canonical air");
+
+        // The pinned protocol-1001 registry must keep resolving today's
+        // exact identity so default v1001 compilation stays byte-identical.
+        assert_eq!(identity.sequential_id, 13_094);
+        assert_eq!(identity.network_hash, 0xdbf4_4120);
+
+        let air = records
+            .iter()
+            .find(|record| record.name.as_ref() == "minecraft:air")
+            .expect("canonical air");
+        assert!(is_canonical_air(air, identity));
+
+        let mut custom = air.clone();
+        custom.name = "custom:air".into();
+        assert!(!is_canonical_air(&custom, identity));
+
+        let mut wrong_state = air.clone();
+        wrong_state.canonical_state = r#"{"custom":true}"#.into();
+        assert!(!is_canonical_air(&wrong_state, identity));
+
+        let mut wrong_hash = air.clone();
+        wrong_hash.network_hash ^= 1;
+        assert!(!is_canonical_air(&wrong_hash, identity));
+
+        let mut wrong_id = air.clone();
+        wrong_id.sequential_id -= 1;
+        assert!(!is_canonical_air(&wrong_id, identity));
+    }
+
+    fn synthetic_record(name: &str, state: &str, id: u32, hash: u32) -> RegistryRecord {
+        RegistryRecord {
+            beacon_tint: assets::BeaconTint::Unresolved,
+            traits: assets::registry::BlockTraits::empty(),
+            survival: assets::registry::SurvivalRule::None,
+            properties: Box::new([]),
+            sequential_id: id,
+            network_hash: hash,
+            name: name.into(),
+            canonical_state: state.into(),
+            flags: BlockFlags::AIR,
+            model_family: ModelFamily::Air,
+            contributor_role: ContributorRole::Air,
+            model_state: Default::default(),
+            face_coverage: 0,
+            collision_seed: Default::default(),
+            provenance: RegistryProvenance::PMMP,
+        }
+    }
+
+    #[test]
+    fn resolution_fails_closed_with_distinct_errors_for_zero_multiple_and_decoy_air() {
+        let zero = [synthetic_record("minecraft:stone", "{}", 1, 0x0000_0001)];
+        let multiple = [
+            synthetic_record("minecraft:air", "{}", 10, 0x0000_000a),
+            synthetic_record("minecraft:air", "{}", 11, 0x0000_000b),
+        ];
+        let decoy = [synthetic_record(
+            "minecraft:air",
+            r#"{"legacy":true}"#,
+            12,
+            0x0000_000c,
+        )];
+
+        let zero_error = resolve_canonical_air(&zero).expect_err("no canonical air record");
+        let multiple_error =
+            resolve_canonical_air(&multiple).expect_err("conflicting canonical air records");
+        let decoy_error = resolve_canonical_air(&decoy).expect_err("decoy canonical air name");
+
+        for error in [&zero_error, &multiple_error, &decoy_error] {
+            assert!(matches!(error, AssetError::InvalidCompiledAssets { .. }));
+        }
+        assert_ne!(zero_error.to_string(), multiple_error.to_string());
+        assert_ne!(multiple_error.to_string(), decoy_error.to_string());
+        assert_ne!(zero_error.to_string(), decoy_error.to_string());
+    }
+
+    #[test]
+    fn resolution_rejects_a_decoy_even_after_a_valid_candidate() {
+        let records = [
+            synthetic_record("minecraft:air", "{}", 20, 0x0000_0014),
+            synthetic_record("minecraft:air", r#"{"legacy":true}"#, 21, 0x0000_0015),
+        ];
+        let error = resolve_canonical_air(&records).expect_err("decoy after valid candidate");
+        assert!(
+            error.to_string().contains("fails the canonical-air"),
+            "unexpected error: {error}"
+        );
+    }
+}

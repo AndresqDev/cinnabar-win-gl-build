@@ -1,0 +1,667 @@
+//! First-person hand frame publication, including independent main/offhand artwork.
+
+use super::*;
+use crate::presentation::equipment::ActorEquipmentInput;
+use crate::presentation::{
+    actors::{ActorRigPresentation, rig_world_from_actor},
+    equipment::{FirstPersonArms, FirstPersonHand, FirstPersonItem},
+};
+use bevy::math::Mat4;
+use render_model::{ActorRigSubmission, HandItemAtlas, HandRigLight};
+
+#[cfg(test)]
+mod bootstrap_tests;
+#[cfg(test)]
+mod item_switch_tests;
+#[cfg(test)]
+mod lighting_tests;
+mod maps;
+#[cfg(test)]
+mod maps_tests;
+mod native_pose;
+#[cfg(test)]
+mod native_tests;
+#[cfg(test)]
+mod remote_body_tests;
+#[cfg(test)]
+mod shield_tests;
+#[cfg(test)]
+mod spear_tests;
+#[cfg(test)]
+mod third_person_tests;
+pub(super) use native_pose::NativePoseCache;
+
+/// Vanilla draws the first-person rig in view space as a zero-yaw actor, feet one eye height
+/// below the camera; the pack's first-person arm offsets are authored for that facing.
+pub(super) fn hand_camera_from_rig(scale: f32, motion: Mat4) -> [[f32; 4]; 3] {
+    let rows = rig_world_from_actor(
+        [
+            0.0,
+            -crate::local_player::LOCAL_AVATAR_EYE_HEIGHT_BLOCKS,
+            0.0,
+        ],
+        0.0,
+        scale,
+    );
+    let placement = Mat4::from_cols_array_2d(&[
+        [rows[0][0], rows[1][0], rows[2][0], 0.0],
+        [rows[0][1], rows[1][1], rows[2][1], 0.0],
+        [rows[0][2], rows[1][2], rows[2][2], 0.0],
+        [rows[0][3], rows[1][3], rows[2][3], 1.0],
+    ]);
+    // The vanilla first-person actor root retains its 1/128-model-unit lift
+    // after the player model scale.
+    camera_space_rows(motion * placement * Mat4::from_translation(bevy::math::Vec3::Y / 128.0))
+}
+
+pub(super) fn camera_space_rows(matrix: Mat4) -> [[f32; 4]; 3] {
+    let composed = matrix.transpose().to_cols_array_2d();
+    [composed[0], composed[1], composed[2]]
+}
+
+/// Resolves one hand's actual sheet, including shield cloth on either animation route.
+pub(super) fn decorated_item_atlas(
+    equipment: &mut EquipmentRuntime,
+    item: &crate::presentation::equipment::WornItem,
+    layer: &mut FirstPersonItem,
+    artwork: &render_model::ActorArtworkPages,
+) -> Option<HandItemAtlas> {
+    if let Some((raster, rig)) = equipment.shield_raster(
+        item,
+        artwork,
+        layer.presentation.location,
+        layer.presentation.submission.input.rig,
+    ) {
+        layer.presentation.submission.input.rig = rig;
+        layer.presentation.location.layer = 0;
+        layer.presentation.submission.texture_layer = 0;
+        Some(HandItemAtlas {
+            width: raster.width,
+            height: raster.height,
+            layers: 1,
+            rgba8: raster.rgba8,
+        })
+    } else {
+        item_atlas(layer, artwork)
+    }
+}
+
+/// Builds and publishes the local player's first-person rig for the near-camera pass, or clears
+/// it when not in first person, when the look FOV is unavailable, or when no skin resolved.
+pub(super) fn publish_hand_rig(
+    builder: &mut ActorRigFrameBuilder,
+    scene: &mut HandRigScene,
+    revision: &mut u64,
+    source: Option<HandSource>,
+    fov_radians: Option<f32>,
+    mut light: HandRigLight,
+    (partial_tick, glint): (f32, Option<&render_scene::UiGlintSettings>),
+) {
+    let (Some(source), Some(fov)) = (source, fov_radians) else {
+        scene.clear();
+        return;
+    };
+    let Some(skin) = source.presentation.skin_rgba8.clone() else {
+        scene.clear();
+        return;
+    };
+    let frame = builder.build(
+        partial_tick,
+        None,
+        source.all_submissions().map(|mut submission| {
+            super::equipment_layers::animate_glint(&mut submission, partial_tick, glint);
+            submission
+        }),
+    );
+    let mut atlases = [None, None];
+    for (index, entry) in source.items.into_iter().enumerate() {
+        if let Some((layer, atlas)) = entry {
+            light.java_normal_axes[index + 1] = layer.java_normal_axis.extend(0.0).to_array();
+            atlases[index] = Some(atlas);
+        }
+    }
+    *revision = revision.wrapping_add(1).max(1);
+    if scene.publish(frame, skin, light, fov, *revision) {
+        scene.set_item_atlases(atlases);
+        scene.set_item_glint(source.item_glint);
+        scene.set_map_background(source.maps.background);
+    }
+}
+
+/// The arm's state at `partial_tick` between the rig's last two ticks, as vanilla's first-person
+/// pass interpolates it: the swing wraps forward past its end, and an eat or drink use of
+/// `consume_ticks` counts from its first using tick.
+pub(super) fn hand_progress(
+    hand: [actor_animation::HandPhase; 2],
+    consume_ticks: Option<u32>,
+    partial_tick: f32,
+) -> FirstPersonHand {
+    let [previous, current] = hand;
+    let mut swing = current.attack_time - previous.attack_time;
+    if swing < 0.0 {
+        swing += 1.0;
+    }
+    FirstPersonHand {
+        swing: previous.attack_time + swing * partial_tick,
+        equip: previous.arm_height + (current.arm_height - previous.arm_height) * partial_tick,
+        consume: consume_ticks
+            .filter(|_| current.use_ticks > 0)
+            .map(|ticks| (current.use_ticks as f32 - 1.0 + partial_tick, ticks as f32)),
+        aspect: 1.0,
+    }
+}
+
+/// The local eat or drink use's position for `consume_ticks`, in ticks since it began, with the
+/// use's duration: the use's elapsed ticks and frame fraction both come from the local physics
+/// clock that times it. Adding the actor clock's fraction to them instead jumps the food back
+/// and forth at tick boundaries.
+pub(super) fn local_consume(
+    item_animation: Option<&actor_animation::AttachableAnimationInput<'_>>,
+    consume_ticks: Option<u32>,
+) -> Option<(f32, f32)> {
+    let ticks = consume_ticks? as f32;
+    let input = item_animation?;
+    let alpha = if input.frame_alpha.is_finite() {
+        input.frame_alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some(((input.use_elapsed_ticks? as f32 + alpha).min(ticks), ticks))
+}
+
+/// What the first-person pass draws: arm-masked body pose and/or a held item with its atlas page
+/// and whether its bone is in camera space.
+pub(super) struct HandSource {
+    pub(super) presentation: ActorRigPresentation,
+    pub(super) body: Option<ActorRigSubmission>,
+    pub(super) items: [Option<(FirstPersonItem, HandItemAtlas)>; 2],
+    pub(super) maps: maps::MapLayers,
+    /// The held-item glint raster, bound whenever an item draws with the glint material.
+    pub(super) item_glint: Option<render_model::EquipmentRaster>,
+    /// View-space hurt tilt, walk bob and sway applied before the rig placement.
+    pub(super) motion: Mat4,
+    /// Camera from the body's rig frame under the selected bare-arm stack.
+    pub(super) body_camera: Option<Mat4>,
+}
+
+impl HandSource {
+    /// Includes each received map's paper with the current camera motion.
+    pub(super) fn all_submissions(&self) -> impl Iterator<Item = ActorRigSubmission> + '_ {
+        self.maps
+            .paper
+            .iter()
+            .flatten()
+            .map(|(paper, camera)| {
+                let mut paper = paper.clone();
+                paper.world_from_actor = camera_space_rows(self.motion * *camera);
+                paper
+            })
+            .chain(self.submissions().into_iter().flatten())
+    }
+
+    /// Places the exact body/item submissions shared by validation and final construction.
+    pub(super) fn submissions(&self) -> [Option<ActorRigSubmission>; 3] {
+        let placement = hand_camera_from_rig(self.presentation.authored_scale, self.motion);
+        let body = self.body.clone().map(|mut body| {
+            body.world_from_actor = self
+                .body_camera
+                .map_or(placement, |camera| camera_space_rows(self.motion * camera));
+            body.texture_layer = 0;
+            body
+        });
+        let items = std::array::from_fn::<_, 2, _>(|index| {
+            let (layer, _) = self.items[index].as_ref()?;
+            let mut item = layer.presentation.submission.clone();
+            item.world_from_actor = match layer.java_camera {
+                Some(camera) => camera_space_rows(self.motion * camera),
+                None if layer.camera_space => camera_space_rows(self.motion),
+                None => placement,
+            };
+            item.texture_layer = layer.presentation.location.layer()
+                | render_model::HAND_ITEM_LAYER_FLAG
+                | layer.alpha_mode.texture_layer_flag()
+                | if index == 1 {
+                    render_model::HAND_OFFHAND_LAYER_FLAG
+                } else {
+                    0
+                };
+            Some(item)
+        });
+        let [main, off] = items;
+        [body, main, off]
+    }
+}
+
+/// Checks the same bounded near-camera draws without building a second frame.
+pub(super) fn is_ready(
+    builder: &ActorRigFrameBuilder,
+    source: Option<&HandSource>,
+    fov: Option<f32>,
+) -> bool {
+    let (Some(source), Some(fov)) = (source, fov) else {
+        return false;
+    };
+    let Some(skin) = source.presentation.skin_rgba8.as_ref() else {
+        return false;
+    };
+    HandRigScene::accepts_skin_and_fov(skin, fov)
+        && source
+            .all_submissions()
+            .any(|draw| builder.can_draw_submission(&draw))
+}
+
+/// Inputs shared by the built-in hand stacks and authored attachables.
+#[derive(Clone)]
+pub(super) struct HandInputs<'a> {
+    pub(super) stream: &'a WorldStream,
+    pub(super) presentation: ActorRigPresentation,
+    pub(super) equipment_input: &'a ActorEquipmentInput,
+    pub(super) owner_equipment: &'a ActorEquipmentInput,
+    pub(super) consume_ticks: Option<u32>,
+    pub(super) item_animation: Option<actor_animation::AttachableAnimationInput<'static>>,
+    pub(super) alpha: f32,
+    pub(super) artwork: &'a render_model::ActorArtworkPages,
+    pub(super) motion: Mat4,
+    pub(super) sampling_camera: Option<([f32; 2], [f32; 3])>,
+    /// Viewport width over height for the first-person eating offset.
+    pub(super) aspect: f32,
+}
+
+/// Builds vanilla arms and attachables with the displayed stack and its actual owner.
+pub(super) fn vanilla_hand_source(
+    mut inputs: HandInputs<'_>,
+    equipment: &mut EquipmentRuntime,
+    hand: FirstPersonHand,
+    native_pose: &mut NativePoseCache,
+    java_mode: bool,
+    main_selection: Option<(
+        &crate::presentation::equipment::HeldSelection,
+        actor_animation::AttachableAnimationInput<'_>,
+    )>,
+) -> Option<HandSource> {
+    let runtime_id = inputs.presentation.submission.input.identity.runtime_id;
+    let stream = inputs.stream;
+    let mut rig = stream.authority().actor_rig(runtime_id)?;
+    // Java body, arm and item poses win over the combat profile, including native fallbacks.
+    let legacy = !java_mode
+        && stream
+            .authority()
+            .actor(runtime_id)
+            .is_some_and(|actor| rig.animation_variables.uses_legacy_swing(actor));
+    let bare = legacy && inputs.equipment_input.main.is_none();
+    if !bare || inputs.equipment_input.off.is_some() {
+        native_pose.apply(&mut inputs);
+        rig.held_item_scale = native_pose.held_item_scale;
+    }
+    let map_inputs = inputs.clone();
+    let HandInputs {
+        stream,
+        presentation,
+        equipment_input,
+        owner_equipment,
+        item_animation,
+        alpha,
+        artwork,
+        motion,
+        ..
+    } = inputs;
+    let profile = if legacy {
+        render_api::CombatVisuals::Legacy112
+    } else {
+        render_api::CombatVisuals::Modern
+    };
+    let body_camera =
+        bare.then(|| render_model::legacy_combat::legacy_first_person_arm(hand.swing, hand.equip));
+    let mut items = std::array::from_fn(|index| {
+        let item = [equipment_input.main.as_ref(), equipment_input.off.as_ref()][index]?;
+        if item.identifier.as_ref() == assets::facts::FILLED_MAP_IDENTIFIER {
+            return None;
+        }
+        let mut icon_fallback = false;
+        let modern = item_animation.and_then(|mut render_input| {
+            render_input.frame_alpha = alpha;
+            let render_input =
+                attachable_hand_input(equipment_input, owner_equipment, render_input, index == 1);
+            let actor = stream.authority().actor(runtime_id)?;
+            let (selected, selected_input) = if index == 0 {
+                if let Some((selected, selected_input)) = main_selection {
+                    (selected, selected_input)
+                } else {
+                    let selected = equipment.select_held_item(item, actor, &rig, render_input);
+                    icon_fallback = selected.uses_icon_fallback();
+                    if icon_fallback {
+                        return equipment.first_person_item_icon_with_use(
+                            &presentation.submission,
+                            item,
+                            hand,
+                            profile,
+                            render_input,
+                        );
+                    }
+                    return equipment.first_person_selected_attachable(
+                        &presentation.submission,
+                        item,
+                        &selected,
+                        actor,
+                        &rig,
+                        render_input,
+                        None,
+                    );
+                }
+            } else {
+                let selected = equipment.select_held_item(item, actor, &rig, render_input);
+                icon_fallback = selected.uses_icon_fallback();
+                if icon_fallback {
+                    return equipment.first_person_offhand_icon(&presentation.submission, item);
+                }
+                return equipment.first_person_selected_attachable(
+                    &presentation.submission,
+                    item,
+                    &selected,
+                    actor,
+                    &rig,
+                    render_input,
+                    None,
+                );
+            };
+            icon_fallback = selected.uses_icon_fallback();
+            equipment.first_person_selected_attachable(
+                &presentation.submission,
+                item,
+                selected,
+                actor,
+                &rig,
+                selected_input,
+                None,
+            )
+        });
+        let mut layer = modern.or_else(|| {
+            if index == 0 {
+                if icon_fallback {
+                    equipment.first_person_item_icon_with_use(
+                        &presentation.submission,
+                        item,
+                        hand,
+                        profile,
+                        item_animation
+                            .map(|input| {
+                                attachable_hand_input(
+                                    equipment_input,
+                                    owner_equipment,
+                                    input,
+                                    false,
+                                )
+                            })
+                            .map(|input| actor_animation::AttachableAnimationInput {
+                                held_item_scale: rig.held_item_scale,
+                                ..input
+                            })
+                            .unwrap_or(actor_animation::AttachableAnimationInput {
+                                held_item_scale: rig.held_item_scale,
+                                ..Default::default()
+                            }),
+                    )
+                } else {
+                    equipment.first_person_item_with_use(
+                        &presentation.submission,
+                        item,
+                        hand,
+                        profile,
+                        item_animation
+                            .map(|input| {
+                                attachable_hand_input(
+                                    equipment_input,
+                                    owner_equipment,
+                                    input,
+                                    false,
+                                )
+                            })
+                            .map(|input| actor_animation::AttachableAnimationInput {
+                                held_item_scale: rig.held_item_scale,
+                                ..input
+                            })
+                            .unwrap_or(actor_animation::AttachableAnimationInput {
+                                held_item_scale: rig.held_item_scale,
+                                ..Default::default()
+                            }),
+                    )
+                }
+            } else if icon_fallback {
+                equipment.first_person_offhand_icon(&presentation.submission, item)
+            } else {
+                equipment.first_person_offhand(&presentation.submission, item)
+            }
+        })?;
+        let atlas = decorated_item_atlas(equipment, item, &mut layer, artwork)?;
+        Some((layer, atlas))
+    });
+    let maps = maps::layers(
+        &map_inputs,
+        equipment,
+        hand,
+        &mut native_pose.maps,
+        &mut items,
+    );
+    let arms = FirstPersonArms::for_hands(
+        equipment_input
+            .main
+            .as_ref()
+            .map(|item| item.identifier.as_ref()),
+        equipment_input
+            .off
+            .as_ref()
+            .map(|item| item.identifier.as_ref()),
+    )
+    .with_undrawn_main(items[0].is_some());
+    let body = if bare {
+        // The right arm uses rest geometry; offhand items retain their sampled native parent.
+        let mut arm = presentation.submission.clone();
+        let rest = native_pose.rest_pose(&rig)?;
+        arm.input.previous_bones = Arc::clone(&rest);
+        arm.input.current_bones = rest;
+        equipment.mask_first_person(&arm, arms)
+    } else {
+        equipment.mask_first_person(&presentation.submission, arms)
+    };
+    (body.is_some() || items.iter().any(Option::is_some) || maps.paper.iter().any(Option::is_some))
+        .then_some(HandSource {
+            presentation,
+            body,
+            items,
+            maps,
+            item_glint: artwork.item_glint.clone(),
+            motion,
+            body_camera,
+        })
+}
+
+/// An outgoing main draw stays idle in its retained item frame; the offhand reads the actual
+/// owner's equipment and main-hand use timing.
+pub(super) fn attachable_hand_input<'a>(
+    rendered: &'a ActorEquipmentInput,
+    owner: &'a ActorEquipmentInput,
+    timing: actor_animation::AttachableAnimationInput<'a>,
+    off_hand: bool,
+) -> actor_animation::AttachableAnimationInput<'a> {
+    let selected = match (rendered.main.as_ref(), owner.main.as_ref()) {
+        (Some(rendered), Some(owner)) => {
+            rendered.identifier == owner.identifier
+                && rendered.damage.unwrap_or(rendered.metadata)
+                    == owner.damage.unwrap_or(owner.metadata)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let timing = if off_hand || selected {
+        timing
+    } else {
+        actor_animation::AttachableAnimationInput {
+            animation_frame: 0,
+            use_elapsed_ticks: None,
+            hand_charged: false,
+            ..timing
+        }
+    };
+    let equipment = if off_hand { owner } else { rendered };
+    equipment.attachable_input(timing.for_hand(off_hand))
+}
+
+/// The artwork page an item layer samples, as the hand pass binds it.
+pub(super) fn item_atlas(
+    layer: &FirstPersonItem,
+    artwork: &render_model::ActorArtworkPages,
+) -> Option<HandItemAtlas> {
+    let page = usize::from(layer.presentation.location.page()).checked_sub(1)?;
+    let page = artwork.pages().get(page)?;
+    if layer.presentation.location.layer() >= page.layers() {
+        return None;
+    }
+    let (width, height) = page.dimensions();
+    Some(HandItemAtlas {
+        width,
+        height,
+        layers: page.layers(),
+        rgba8: page.shared_pixels(),
+    })
+}
+
+/// Vanilla's hand stack order: hurt tilt, walk bob, then sway about X and Y.
+pub(super) fn hand_motion_matrix(motion: &crate::camera::FirstPersonHandMotion) -> Mat4 {
+    motion
+        .legacy_effect
+        .unwrap_or_else(|| motion.hurt * motion.bob.matrix())
+        * Mat4::from_rotation_x(motion.sway_pitch_radians)
+        * Mat4::from_rotation_y(motion.sway_yaw_radians)
+}
+
+/// Java sets fixed lights after the camera effects and world look, before the lagging hand sway.
+pub(super) fn java_light_matrix(
+    motion: Option<&crate::camera::FirstPersonHandMotion>,
+    look: bevy::math::Quat,
+) -> Mat4 {
+    let (yaw, pitch, _) = look.to_euler(bevy::math::EulerRot::YXZ);
+    let effects = motion.map_or(Mat4::IDENTITY, |motion| {
+        motion
+            .legacy_effect
+            .unwrap_or_else(|| motion.hurt * motion.bob.matrix())
+    });
+    effects * Mat4::from_rotation_x(-pitch) * Mat4::from_rotation_y(std::f32::consts::PI - yaw)
+}
+
+/// Selects the same arm and item layers for readiness and final first-person publication.
+pub(super) fn source(
+    inputs: HandInputs<'_>,
+    java_mode: bool,
+    equipment: &mut EquipmentRuntime,
+    cache: &mut java::HandCache,
+) -> Option<HandSource> {
+    let runtime_id = inputs.presentation.submission.input.identity.runtime_id;
+    let rig = inputs.stream.authority().actor_rig(runtime_id)?;
+    cache.remember(&rig, inputs.equipment_input.main.as_ref());
+    if java_mode
+        && let Some(source) = java::hand_source(
+            HandInputs {
+                presentation: inputs.presentation.clone(),
+                ..inputs
+            },
+            equipment,
+            cache,
+        )
+    {
+        return Some(source);
+    }
+    let mut hand = hand_progress(rig.hand, inputs.consume_ticks, inputs.alpha);
+    let alpha = rig.java.local_swing_alpha.unwrap_or(inputs.alpha);
+    hand.swing = hand_progress(rig.hand, None, alpha).swing;
+    hand.consume =
+        local_consume(inputs.item_animation.as_ref(), inputs.consume_ticks).or(hand.consume);
+    hand.aspect = inputs.aspect;
+    let rendered = ActorEquipmentInput {
+        main: cache
+            .native_displayed_main(rig.main_hand_equipped, inputs.equipment_input.main.as_ref()),
+        ..inputs.equipment_input.clone()
+    };
+    if rendered.main.as_ref().map(|item| &item.identifier)
+        != inputs
+            .owner_equipment
+            .main
+            .as_ref()
+            .map(|item| &item.identifier)
+    {
+        hand.consume = None;
+    }
+    vanilla_hand_source(
+        HandInputs {
+            equipment_input: &rendered,
+            ..inputs
+        },
+        equipment,
+        hand,
+        &mut cache.native_pose,
+        java_mode,
+        None,
+    )
+}
+
+type AnimationFrameKey = (u32, Option<u32>, u32, bool, u32);
+
+/// Local hand source inputs whose changes require reselection after interaction admission.
+#[derive(PartialEq)]
+pub(super) struct SourceKey {
+    lifetime: actor_animation::ActorLifetimeId,
+    bones: [(usize, usize); 2],
+    hand: [actor_animation::HandPhase; 2],
+    java: actor_animation::JavaMotion,
+    sampled_swing: [f32; 2],
+    sampled_equip: [f32; 2],
+    /// The eat or drink position moves every frame, between the ticks the other fields follow.
+    sampled_consume: Option<(f32, f32)>,
+    sampled_body_yaw: f32,
+    equipped: Option<actor_animation::JavaHeldItem>,
+    use_frame: (Option<u32>, Option<AnimationFrameKey>),
+}
+
+/// Retains unchanged hand layers while admitted actions update their sampled swing and equip.
+pub(super) fn source_key(
+    stream: &WorldStream,
+    consume: Option<u32>,
+    animation: Option<actor_animation::AttachableAnimationInput<'_>>,
+    alpha: f32,
+) -> Option<SourceKey> {
+    let rig = stream
+        .authority()
+        .actor_rig(stream.local_player_runtime_id())?;
+    let mut java = rig.java;
+    java.local_swing_alpha = None;
+    java.body_frame_alpha = None;
+    let swing_alpha = rig.java.local_swing_alpha.unwrap_or(alpha);
+    Some(SourceKey {
+        sampled_body_yaw: rig.java.body_yaw_at(alpha),
+        sampled_swing: [
+            hand_progress(rig.hand, None, swing_alpha).swing,
+            rig.java.swing_progress(alpha),
+        ],
+        sampled_equip: [
+            hand_progress(rig.hand, None, alpha).equip,
+            rig.java.equip[0] + (rig.java.equip[1] - rig.java.equip[0]) * alpha,
+        ],
+        sampled_consume: local_consume(animation.as_ref(), consume),
+        lifetime: rig.actor,
+        bones: [rig.previous, rig.current].map(|bones| (bones.as_ptr() as usize, bones.len())),
+        hand: rig.hand,
+        java,
+        equipped: rig.java_equipped.cloned(),
+        use_frame: (
+            consume,
+            animation.map(|input| {
+                (
+                    input.animation_frame,
+                    input.use_elapsed_ticks,
+                    input.max_use_ticks,
+                    input.hand_charged,
+                    input.frame_alpha.to_bits(),
+                )
+            }),
+        ),
+    })
+}

@@ -1,0 +1,237 @@
+//! Ordered crack events and their progress across rendered frames.
+
+use super::*;
+
+/// A client resource budget, not a gameplay limit.
+pub const MAX_ACTIVE_BLOCK_CRACKS: usize = 1_024;
+
+#[derive(Default)]
+pub(super) struct BlockCracks {
+    columns: BTreeMap<ChunkKey, BTreeMap<[i32; 3], ActiveBlockCrack>>,
+    status: BlockCrackStatus,
+    dimension_sequence: Option<u64>,
+}
+
+impl WorldStream {
+    pub fn block_crack_snapshot(&self) -> BlockCrackSnapshot {
+        let entries = self
+            .block_cracks
+            .columns
+            .values()
+            .flat_map(|column| column.values().cloned())
+            .collect::<Vec<_>>();
+        BlockCrackSnapshot {
+            session_id: self.authority.actor_session_id(),
+            dimension: self.authority.current_dimension(),
+            dimension_sequence: self.block_cracks.dimension_sequence,
+            status: BlockCrackStatus {
+                server_value_sum: entries
+                    .iter()
+                    .map(|entry| i64::from(entry.server_value))
+                    .sum(),
+                ..self.block_cracks.status
+            },
+            entries,
+        }
+    }
+
+    /// Advances cracks once per rendered frame. A zero elapsed time pauses progression.
+    pub fn advance_block_cracks(&mut self, elapsed_seconds: f32) {
+        let ticks = elapsed_seconds / simulation_clock::TICK_DURATION.as_secs_f32();
+        let mut completed = 0;
+        self.block_cracks.columns.retain(|_, entries| {
+            entries.retain(|_, entry| {
+                let rate = entry.server_value as f32 / f32::from(u16::MAX);
+                entry.progress += rate * ticks;
+                if entry.progress < 1.0 {
+                    true
+                } else {
+                    completed += 1;
+                    false
+                }
+            });
+            !entries.is_empty()
+        });
+        self.block_cracks.status.active -= completed;
+        self.block_cracks.status.completed = self
+            .block_cracks
+            .status
+            .completed
+            .saturating_add(completed as u64);
+    }
+
+    fn crack_column(&self, position: [i32; 3]) -> ChunkKey {
+        ChunkKey::new(
+            self.authority.current_dimension(),
+            position[0].div_euclid(16),
+            position[2].div_euclid(16),
+        )
+    }
+
+    fn crack_layers(
+        &self,
+        column: ChunkKey,
+        position: [i32; 3],
+    ) -> Option<[Option<u32>; world::MAX_STORAGE_COUNT]> {
+        let key = SubChunkKey::from_chunk(column, position[1].div_euclid(16));
+        if !self.authority.terrain().is_sub_chunk_loaded(key) {
+            return None;
+        }
+        let chunk = self.authority.terrain().sub_chunk(key)?;
+        let [x, y, z] =
+            position.map(|value| u8::try_from(value.rem_euclid(16)).expect("local coordinate"));
+        let runtime_id = chunk.runtime_id(0, x, y, z)?;
+        let block = self
+            .authority
+            .runtime_assets()
+            .resolve(self.authority.network_id_mode(), runtime_id);
+        if !block.is_known() || block.flags().contains(assets::BlockFlags::AIR) {
+            return None;
+        }
+        Some(std::array::from_fn(|layer| {
+            chunk.runtime_id(layer, x, y, z)
+        }))
+    }
+
+    pub(super) fn consume_block_crack(&mut self, sequence: u64, event: BlockCrackEvent) {
+        self.block_cracks.status.consumed = self.block_cracks.status.consumed.saturating_add(1);
+        let column = self.crack_column(event.position);
+        match event.action {
+            client_world::ingestion::BlockCrackAction::Stop => {
+                if let Some(entries) = self.block_cracks.columns.get_mut(&column) {
+                    if entries.remove(&event.position).is_some() {
+                        self.block_cracks.status.active -= 1;
+                    }
+                    if entries.is_empty() {
+                        self.block_cracks.columns.remove(&column);
+                    }
+                }
+            }
+            client_world::ingestion::BlockCrackAction::Start { progress_per_tick } => {
+                if self
+                    .block_cracks
+                    .columns
+                    .get(&column)
+                    .is_some_and(|entries| entries.contains_key(&event.position))
+                {
+                    return;
+                }
+                let Some(layers) = self.crack_layers(column, event.position) else {
+                    self.block_cracks.status.unsupported_targets = self
+                        .block_cracks
+                        .status
+                        .unsupported_targets
+                        .saturating_add(1);
+                    return;
+                };
+                if self.block_cracks.status.active >= MAX_ACTIVE_BLOCK_CRACKS {
+                    self.block_cracks.status.capacity_rejections = self
+                        .block_cracks
+                        .status
+                        .capacity_rejections
+                        .saturating_add(1);
+                    return;
+                }
+                self.block_cracks.columns.entry(column).or_default().insert(
+                    event.position,
+                    ActiveBlockCrack {
+                        position: event.position,
+                        start_sequence: sequence,
+                        server_value: progress_per_tick,
+                        progress: 0.0,
+                        layers,
+                    },
+                );
+                self.block_cracks.status.active += 1;
+            }
+            client_world::ingestion::BlockCrackAction::UpdateSpeed { progress_per_tick } => {
+                if let Some(entry) = self
+                    .block_cracks
+                    .columns
+                    .get_mut(&column)
+                    .and_then(|entries| entries.get_mut(&event.position))
+                {
+                    entry.server_value = progress_per_tick;
+                } else {
+                    self.block_cracks.status.orphan_updates =
+                        self.block_cracks.status.orphan_updates.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Reports whether a section needs its intermediate packet states retained.
+    pub(super) fn block_crack_section_active(&self, key: SubChunkKey) -> bool {
+        self.block_cracks
+            .columns
+            .get(&key.chunk())
+            .is_some_and(|entries| {
+                entries
+                    .keys()
+                    .any(|position| position[1].div_euclid(16) == key.y)
+            })
+    }
+
+    /// Retires cracks changed by earlier packets after the final atomic commit succeeds.
+    pub(super) fn reconcile_intermediate_block_cracks(
+        &mut self,
+        mutations: &[PreparedSubChunkMutation],
+    ) {
+        for mutation in mutations.iter().filter(|mutation| mutation.changed()) {
+            let key = mutation.key();
+            let Some(mut entries) = self.block_cracks.columns.remove(&key.chunk()) else {
+                continue;
+            };
+            let before = entries.len();
+            entries.retain(|position, entry| {
+                if position[1].div_euclid(16) != key.y {
+                    return true;
+                }
+                let [x, y, z] = position.map(|value| value.rem_euclid(16) as u8);
+                mutation.replacement().is_some_and(|section| {
+                    std::array::from_fn(|layer| section.runtime_id(layer, x, y, z)) == entry.layers
+                })
+            });
+            self.retire_block_crack_count(before - entries.len());
+            if !entries.is_empty() {
+                self.block_cracks.columns.insert(key.chunk(), entries);
+            }
+        }
+    }
+
+    /// Called at each successful mutation, before the next ordered event can commit.
+    pub(super) fn reconcile_block_crack_column(&mut self, column: ChunkKey) {
+        let Some(mut entries) = self.block_cracks.columns.remove(&column) else {
+            return;
+        };
+        let before = entries.len();
+        entries
+            .retain(|position, entry| self.crack_layers(column, *position) == Some(entry.layers));
+        self.retire_block_crack_count(before - entries.len());
+        if !entries.is_empty() {
+            self.block_cracks.columns.insert(column, entries);
+        }
+    }
+
+    fn retire_block_crack_count(&mut self, count: usize) {
+        self.block_cracks.status.active -= count;
+        self.block_cracks.status.retired_targets = self
+            .block_cracks
+            .status
+            .retired_targets
+            .saturating_add(count as u64);
+    }
+
+    pub(super) fn evict_block_crack_column(&mut self, column: ChunkKey) {
+        if let Some(entries) = self.block_cracks.columns.remove(&column) {
+            self.retire_block_crack_count(entries.len());
+        }
+    }
+
+    pub(super) fn replace_block_crack_dimension(&mut self, sequence: u64) {
+        let count = self.block_cracks.status.active;
+        self.block_cracks.columns.clear();
+        self.retire_block_crack_count(count);
+        self.block_cracks.dimension_sequence = Some(sequence);
+    }
+}

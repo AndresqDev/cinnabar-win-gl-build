@@ -1,0 +1,323 @@
+//! Launcher state construction and persisted settings startup.
+
+use super::input::command_macros::macro_editors;
+use super::input::fields::field_editor;
+#[cfg(feature = "developer-control")]
+use launcher::menu::MenuDialog;
+#[cfg(test)]
+use launcher::menu::settings_options::SettingId;
+use launcher::menu::settings_options::{SETTINGS_FILE, SettingsOptions};
+use {
+    super::*, launcher::install_layout::InstallLayout, launcher::menu::MenuField,
+    launcher::menu::view::MenuView,
+};
+
+impl MenuRuntime {
+    /// Creates a menu over the checkout's assets with private, empty user roots, so parallel test
+    /// processes never share saved settings, servers or accounts.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new(visible: bool, gui_scale: u8, display_name: String) -> Self {
+        let player_skin = crate::player_skin::LocalPlayerSkin::generated_default(&display_name);
+        let mut layout = launcher::test_support::checkout();
+        let user = launcher::test_support::scratch("menu");
+        layout.user_config_root = user.user_config_root;
+        layout.user_data_root = user.user_data_root;
+        Self::new_with_layout(visible, Some(gui_scale), display_name, layout, player_skin)
+    }
+
+    /// Loads saved launcher state without probing the host for Minecraft installations.
+    pub fn new_with_layout(
+        visible: bool,
+        gui_scale: Option<u8>,
+        display_name: String,
+        layout: InstallLayout,
+        player_skin: crate::player_skin::LocalPlayerSkin,
+    ) -> Self {
+        Self::new_with_import_snapshot(
+            visible,
+            gui_scale,
+            display_name,
+            layout,
+            player_skin,
+            launcher::minecraft_import::Snapshot::default(),
+        )
+    }
+
+    /// Loads launcher state with an import offer explicitly supplied by startup or a fixture.
+    pub fn new_with_import_snapshot(
+        visible: bool,
+        gui_scale: Option<u8>,
+        display_name: String,
+        layout: InstallLayout,
+        player_skin: crate::player_skin::LocalPlayerSkin,
+        minecraft_import: launcher::minecraft_import::Snapshot,
+    ) -> Self {
+        let config_path = layout.server_file();
+        let loaded = load_servers(&config_path);
+        let mut message = loaded.recovery_message;
+        let saved_video_settings = launcher_host::video_settings::load(&layout.user_config_root)
+            .unwrap_or_else(|error| {
+                let warning = format!("Video settings could not be read: {error:#}");
+                message = Some(message.take().map_or_else(
+                    || warning.clone(),
+                    |previous| format!("{previous}\n{warning}"),
+                ));
+                launcher_host::video_settings::SavedVideoSettings::default()
+            });
+        let settings_options = SettingsOptions::load(&config_path.with_file_name(SETTINGS_FILE));
+        let language_asset_path = layout.world_assets();
+        let language_pending = settings_options.language().is_some();
+        let language_choices = SettingsOptions::language_choices(&layout.resource_root);
+        let mut initial = MenuView::new(visible, display_name);
+        // The Shaders tab's folder button and drop prompt need these before Storage is first
+        // measured.
+        let storage = std::sync::Arc::make_mut(&mut initial.storage);
+        storage.opens_folders = launcher_host::desktop::opens_folders();
+        storage.accepts_file_drops = launcher_host::desktop::accepts_file_drops();
+        if visible && minecraft_import.phase == launcher::minecraft_import::Phase::Offered {
+            initial.dialog = Some(launcher::menu::MenuDialog::MinecraftImport);
+        }
+        #[cfg(feature = "developer-control")]
+        let sign_in_fixture = super::sign_in_fixture::startup();
+        #[cfg(feature = "developer-control")]
+        let account_lookup = sign_in_fixture.is_none();
+        #[cfg(not(feature = "developer-control"))]
+        let account_lookup = true;
+        if account_lookup && layout.auth_cache().is_file() {
+            let store = launcher::accounts::AccountStore::new(layout.auth_cache());
+            initial.feeds.accounts = store.list().unwrap_or_default();
+            initial.feeds.account_active_id = store.active_id().ok().flatten();
+        }
+        #[cfg(feature = "developer-control")]
+        if sign_in_fixture.is_some() {
+            initial.dialog = Some(MenuDialog::Accounts);
+            initial.feeds.account_adding = true;
+        }
+        Self {
+            // The launcher owns the session lifecycle only when the client
+            // started on the menu. `--address` keeps the historical behaviour
+            // of exiting the process when its one session fails.
+            launcher: visible,
+            visible,
+            screen: initial.screen,
+            focused: 0,
+            hovered: initial.hovered,
+            pressed: initial.pressed,
+            pointer_down: false,
+            touch_available: launcher::TOUCH_PRIMARY,
+            touch_editor_open: false,
+            server_tab: initial.server_tab,
+            profile_tab: initial.profile_tab,
+            dialog: initial.dialog,
+            field: initial.field,
+            caret_revision: 0,
+            field_activation: 0,
+            history: {
+                let mut history = json_ui::ScreenNav::default();
+                history.reset(initial.screen);
+                history
+            },
+            navigation_focus: navigation::NavigationFocus::default(),
+            session_origin: None,
+            retry_target: None,
+            name: field_editor(MenuField::Name),
+            address: field_editor(MenuField::Address),
+            port: field_editor(MenuField::Port),
+            skin_name: field_editor(MenuField::SkinName),
+            friend_query: field_editor(MenuField::FriendQuery),
+            settings_query: field_editor(MenuField::SettingsQuery),
+            macro_commands: macro_editors(&settings_options),
+            message,
+            gui_scale_preference: gui_scale
+                .filter(|scale| *scale > 0)
+                .map(|scale| scale.clamp(1, 4)),
+            gui_scale_offset: saved_video_settings.gui_scale_offset,
+            gui_scale_display_offset: saved_video_settings.gui_scale_offset,
+            gui_scale_choices: initial.gui_scale_choices,
+            fullscreen: saved_video_settings.fullscreen,
+            fullscreen_change: saved_video_settings.fullscreen.then_some(true),
+            video_settings_writer: None,
+            last_saved_video_settings: saved_video_settings,
+            failed_video_settings_save: None,
+            render_mode: initial.render_mode,
+            render_mode_request: None,
+            shader_packs: initial.shader_packs,
+            shader_packs_revision: initial.shader_packs_revision,
+            shader_pack: None,
+            shader_pack_request: None,
+            shader_pack_status: Default::default(),
+            shader_pack_reload: false,
+            shader_pack_removing: None,
+            shader_pack_remove_request: None,
+            shader_pack_import: Default::default(),
+            vsync_override: None,
+            display_name: initial.display_name,
+            servers: loaded.servers.into(),
+            saves: ServerWriter::new(config_path.clone(), loaded.allow_writes),
+            config_path,
+            intents: SessionIntents::default(),
+            session: SessionStatus::default(),
+            featured: initial.featured,
+            realms: initial.realms,
+            friends: initial.friends,
+            catalog_message: initial.catalog_message,
+            catalog_started: false,
+            catalog: launcher_host::catalog::Catalog::new(layout.catalog_file(std::process::id())),
+            catalog_art: None,
+            auth_process: None,
+            auth_attempted: false,
+            auth_restart_requested: false,
+            account_core: None,
+            layout,
+            default_player_skin: player_skin
+                .default_fallback
+                .then(|| player_skin.standard_skin()),
+            player_skin,
+            dressing_room: initial.dressing_room,
+            dressing_room_worker: None,
+            skin_update_pending: false,
+            skin_outbound: None,
+            skin_packet_pending: None,
+            editing: initial.editing,
+            disconnect_message: initial.disconnect_message,
+            death_shown: false,
+            death_lifecycle: None,
+            death_loading: false,
+            death_presentation: launcher::menu::death::DeathPresentation::default(),
+            death_retry_remaining: None,
+            local_worlds: initial.local_worlds,
+            local_world_requested: None,
+            local_ui: Default::default(),
+            control_auth: None,
+            sign_in_browser: Default::default(),
+            sign_in_requested: false,
+            sign_in_cancelled: false,
+            sign_in_failure: None,
+            #[cfg(feature = "developer-control")]
+            sign_in_fixture,
+            presentation_accounts: false,
+            sign_out_requested: false,
+            external: None,
+            accounts: Default::default(),
+            global_resource_actions: Vec::new(),
+            global_resources: initial.global_resources,
+            mod_actions: Vec::new(),
+            mods: initial.mods,
+            shader_options: Default::default(),
+            minecraft_import: std::sync::Arc::new(minecraft_import),
+            minecraft_import_requests: Vec::new(),
+            settings: initial.settings,
+            settings_input: focus::SettingsInput::default(),
+            settings_options: std::sync::Arc::new(settings_options),
+            storage: initial.storage,
+            settings_dirty: false,
+            settings_writer: None,
+            settings_retry_at: None,
+            settings_apply: true,
+            session_overrides: Vec::new(),
+            transient_toggles: false,
+            language_choices,
+            language_pending,
+            language_asset_path,
+            input_mode: input::MenuInputMode::default(),
+            local_world_joined: false,
+            local_world_active: false,
+            feeds: initial.feeds,
+            invite: Default::default(),
+            realm_membership: Default::default(),
+            join_requests: Default::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, launcher::menu::view::MenuView};
+
+    #[test]
+    fn import_detection_is_supplied_explicitly_to_menu_construction() {
+        use launcher::minecraft_import::{Action, Phase, Snapshot};
+        let layout = launcher::test_support::scratch("menu-import-detection");
+        let skin = crate::player_skin::LocalPlayerSkin::generated_default("Fixture");
+        let synthetic = MenuRuntime::new_with_layout(
+            true,
+            Some(2),
+            "Fixture".into(),
+            layout.clone(),
+            skin.clone(),
+        )
+        .view();
+        assert_eq!(synthetic.minecraft_import.phase, Phase::Idle);
+        assert_eq!(synthetic.dialog, None);
+        for visible in [false, true] {
+            let offered = MenuRuntime::new_with_import_snapshot(
+                visible,
+                Some(2),
+                "Fixture".into(),
+                layout.clone(),
+                skin.clone(),
+                Snapshot {
+                    phase: Phase::Offered,
+                    ..Default::default()
+                },
+            )
+            .view();
+            assert_eq!(offered.minecraft_import.phase, Phase::Offered);
+            assert_eq!(
+                offered.dialog,
+                visible.then_some(launcher::menu::MenuDialog::MinecraftImport)
+            );
+            if visible {
+                assert_eq!(
+                    offered.focused_action,
+                    Some(launcher::menu::MenuAction::MinecraftImport(Action::Begin))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_initial_view_matches_the_host_before_services_are_loaded() {
+        let layout = launcher::test_support::scratch("initial-menu-view");
+        let display_name = "Initial view".to_owned();
+        for visible in [false, true] {
+            let initial = MenuView::new(visible, display_name.clone());
+            let actual = MenuRuntime::new_with_layout(
+                visible,
+                Some(2),
+                display_name.clone(),
+                layout.clone(),
+                crate::player_skin::LocalPlayerSkin::generated_default(&display_name),
+            )
+            .view();
+            assert_eq!(actual.visible, initial.visible);
+            assert_eq!(actual.over_world, initial.over_world);
+            assert_eq!(actual.screen, initial.screen);
+            assert_eq!(actual.profile_tab, initial.profile_tab);
+            assert_eq!(actual.focused_action, initial.focused_action);
+            assert_eq!(actual.caret, initial.caret);
+            assert_eq!(actual.name, initial.name);
+            assert_eq!(actual.address, initial.address);
+            assert_eq!(actual.port, initial.port);
+            assert_eq!(actual.local, initial.local);
+            assert_eq!(actual.auth_state, initial.auth_state);
+            assert_eq!(actual.catalog_loading, initial.catalog_loading);
+        }
+    }
+
+    /// Parallel test processes must not see each other's saved settings.
+    #[test]
+    fn test_menus_never_share_saved_settings() {
+        let mut first = MenuRuntime::new(true, 2, "Steve".to_owned());
+        let default = first.settings_options.value(SettingId::FieldOfView);
+        first.set_named_option(SettingId::FieldOfView, default + 1);
+        first.sync_user_settings(None);
+        assert!(!first.settings_dirty, "{:?}", first.message);
+
+        let second = MenuRuntime::new(true, 2, "Steve".to_owned());
+        assert_eq!(
+            second.settings_options.value(SettingId::FieldOfView),
+            default
+        );
+    }
+}

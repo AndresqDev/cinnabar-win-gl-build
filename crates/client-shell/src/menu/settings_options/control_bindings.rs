@@ -1,0 +1,209 @@
+//! Bevy device adapters for the launcher's persisted physical bindings.
+use launcher::menu::settings_options::BindingId;
+use semantic_input::PhysicalControl;
+
+/// Resolves every inventory hotbar shortcut in action registration order.
+pub fn hotbar_control_slots(
+    menu: Option<&crate::menu::MenuRuntime>,
+    control: PhysicalControl,
+) -> impl Iterator<Item = u8> + '_ {
+    semantic_input::HOTBAR_DIGIT_ACTIONS
+        .iter()
+        .enumerate()
+        .filter_map(move |(slot, action)| {
+            let name = BindingId::from_action(*action)?;
+            (named_control(menu, name) == Some(control)).then_some(slot as u8)
+        })
+}
+
+/// Resolves a gameplay UI control from the menu's persisted settings or startup defaults.
+pub fn named_control(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+) -> Option<PhysicalControl> {
+    menu.map_or_else(
+        || launcher::menu::settings_options::SettingsOptions::default().named_key_control(name),
+        |menu| menu.settings_options.named_key_control(name),
+    )
+}
+
+/// Matches a keyboard event without changing the physical key used for text entry.
+pub fn binding_key(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    key: bevy::prelude::KeyCode,
+) -> bool {
+    binding_keyboard_key(menu, name, crate::physical_input::keyboard_key(key))
+}
+
+/// Matches a semantic key against the control named `name` and its secondary binding.
+pub fn binding_keyboard_key(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    key: semantic_input::KeyboardKey,
+) -> bool {
+    key.usage().is_some_and(|code| {
+        let control = PhysicalControl::KeyboardUsage(code);
+        named_control(menu, name) == Some(control)
+            || menu.map_or_else(
+                || {
+                    launcher::menu::settings_options::SettingsOptions::default()
+                        .secondary_key_control(name)
+                },
+                |menu| menu.settings_options.secondary_key_control(name),
+            ) == Some(control)
+    })
+}
+
+/// Tests one configured keyboard or mouse action in the production device frame.
+pub fn binding_pressed(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    keys: &bevy::prelude::ButtonInput<bevy::prelude::KeyCode>,
+    mouse: &bevy::prelude::ButtonInput<bevy::prelude::MouseButton>,
+) -> bool {
+    if keys
+        .get_just_pressed()
+        .any(|key| binding_key(menu, name, *key))
+    {
+        return true;
+    }
+    match named_control(menu, name) {
+        Some(PhysicalControl::MouseButton(code)) => mouse
+            .get_just_pressed()
+            .any(|button| crate::physical_input::mouse_button_code(*button) == Some(code)),
+        _ => false,
+    }
+}
+
+/// Matches mouse-only UI actions before keyboard events are processed.
+pub fn binding_mouse(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    mouse: &bevy::prelude::ButtonInput<bevy::prelude::MouseButton>,
+) -> bool {
+    mouse
+        .get_just_pressed()
+        .any(|button| binding_mouse_button(menu, name, *button))
+}
+
+/// The command a physical press runs when the configured macro modifier is held.
+pub fn binding_macro_command(
+    menu: Option<&crate::menu::MenuRuntime>,
+    control: PhysicalControl,
+    modifiers: semantic_input::ModifierChord,
+) -> Option<String> {
+    let settings = &menu?.settings_options;
+    if !settings.macro_modifier().is_held(modifiers) {
+        return None;
+    }
+    let slot = settings.match_macro(control)?;
+    settings.macro_send_text(slot)
+}
+
+/// Whether the control named `name` is bound to `button`.
+pub fn binding_mouse_button(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    button: bevy::prelude::MouseButton,
+) -> bool {
+    matches!(named_control(menu, name), Some(PhysicalControl::MouseButton(code))
+        if crate::physical_input::mouse_button_code(button) == Some(code))
+}
+
+/// Whether `control` is the player's Menu Cancel (`key.menuCancel`) binding. Screens cancel on it
+/// as on their fixed Escape and platform Back keys.
+pub fn is_menu_cancel(menu: Option<&crate::menu::MenuRuntime>, control: PhysicalControl) -> bool {
+    named_control(menu, BindingId::MenuCancel) == Some(control)
+}
+
+/// Whether a mouse press cancels a screen: the platform Back key's press, or the button bound to
+/// Menu Cancel.
+pub fn menu_cancel_button(
+    menu: Option<&crate::menu::MenuRuntime>,
+    button: bevy::prelude::MouseButton,
+) -> bool {
+    button == crate::physical_input::PLATFORM_BACK
+        || crate::physical_input::mouse_button_code(button)
+            .is_some_and(|code| is_menu_cancel(menu, PhysicalControl::MouseButton(code)))
+}
+
+/// Whether a key is bound to Menu Cancel. Callers skip it while a text box takes typed keys.
+pub fn menu_cancel_key(
+    menu: Option<&crate::menu::MenuRuntime>,
+    key: bevy::prelude::KeyCode,
+) -> bool {
+    crate::physical_input::keyboard_usage(key)
+        .is_some_and(|code| is_menu_cancel(menu, PhysicalControl::KeyboardUsage(code)))
+}
+
+/// The mouse button newly pressed this frame that cancels screens, which a screen that acts on it
+/// clears so later owners do not see it.
+pub fn menu_cancel_mouse(
+    menu: Option<&crate::menu::MenuRuntime>,
+    mouse: &bevy::prelude::ButtonInput<bevy::prelude::MouseButton>,
+) -> Option<bevy::prelude::MouseButton> {
+    mouse
+        .get_just_pressed()
+        .copied()
+        .find(|button| menu_cancel_button(menu, *button))
+}
+
+/// Whether this frame pressed Menu Cancel: a cancelling mouse button, or the bound key unless
+/// `typing` says a text box takes typed keys. Escape stays with each screen's own key handling.
+pub fn menu_cancel_pressed(
+    menu: Option<&crate::menu::MenuRuntime>,
+    keys: &bevy::prelude::ButtonInput<bevy::prelude::KeyCode>,
+    mouse: &bevy::prelude::ButtonInput<bevy::prelude::MouseButton>,
+    typing: bool,
+) -> bool {
+    menu_cancel_mouse(menu, mouse).is_some()
+        || (!typing
+            && keys
+                .get_just_pressed()
+                .any(|key| menu_cancel_key(menu, *key)))
+}
+
+/// Reads a gamepad UI action from the same persisted layout as the settings grid.
+pub fn binding_gamepad(
+    menu: Option<&crate::menu::MenuRuntime>,
+    name: BindingId,
+    pads: &bevy::prelude::Query<&bevy::input::gamepad::Gamepad>,
+) -> bool {
+    let Some(row) = name.row(true) else {
+        return false;
+    };
+    let control = menu.map_or_else(
+        || launcher::menu::settings_options::SettingsOptions::default().key_control(row),
+        |menu| menu.settings_options.key_control(row),
+    );
+    pads.iter().any(|pad| match control {
+        Some(PhysicalControl::GamepadButton(code)) => {
+            crate::physical_input::TRANSLATED_GAMEPAD_BUTTONS
+                .iter()
+                .any(|(button_code, button)| *button_code == code && pad.just_pressed(*button))
+        }
+        Some(PhysicalControl::GamepadAxis { axis, .. }) => pad.just_pressed(if axis == 4 {
+            bevy::input::gamepad::GamepadButton::LeftTrigger2
+        } else {
+            bevy::input::gamepad::GamepadButton::RightTrigger2
+        }),
+        _ => false,
+    })
+}
+
+/// Uses the same swap mapping for menu confirmation as for gameplay.
+pub fn gamepad_button(
+    settings: &launcher::menu::settings_options::SettingsOptions,
+    button: bevy::input::gamepad::GamepadButton,
+) -> bevy::input::gamepad::GamepadButton {
+    let table = crate::physical_input::TRANSLATED_GAMEPAD_BUTTONS;
+    let Some((code, _)) = table.iter().find(|(_, candidate)| *candidate == button) else {
+        return button;
+    };
+    let swapped = settings.swap_gamepad_control(PhysicalControl::GamepadButton(*code));
+    table
+        .iter()
+        .find(|(code, _)| swapped == PhysicalControl::GamepadButton(*code))
+        .map_or(button, |(_, button)| *button)
+}

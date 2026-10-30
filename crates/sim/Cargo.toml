@@ -1,0 +1,41 @@
+[package]
+name = "sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+reads = [
+    "assets/block-projection-v2225.json",
+    "crates/assets/data/block-physics-v2225.bin",
+    "tools/bedsimtrace-controls/*",
+    "tools/bedsimtrace-v0.1.4/*",
+    "tools/bedsimtrace-v0.1.5/*",
+    "tools/bedsimtrace/*",
+]
+
+[dependencies]
+simulation-clock = { path = "../simulation-clock" }
+assets = { path = "../assets" }
+block-transform = { path = "../block-transform" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2.workspace = true
+thiserror.workspace = true
+world = { path = "../world" }
+
+[dev-dependencies]
+criterion.workspace = true
+test-alloc = { path = "../test-alloc" }
+
+[[bench]]
+name = "terrain_region"
+harness = false
+
+[[bench]]
+name = "actor_fluids"
+harness = false
+
+[lints]
+workspace = true

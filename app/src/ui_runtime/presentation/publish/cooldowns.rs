@@ -1,0 +1,42 @@
+//! Category cooldown values for the published hotbar.
+
+use chunk_pipeline::WorldStream;
+use client_state::PlayerRuntime;
+use client_ui::ui_runtime::UiRuntime;
+use gameplay::{item_use::ItemUseRuntime, melee::MeleeRuntime};
+
+/// Resolves each displayed hotbar stack's remaining category cooldown.
+pub(super) fn hotbar_cooldowns(
+    player_runtime: &PlayerRuntime,
+    runtime: &UiRuntime,
+    stream: Option<&WorldStream>,
+    item_use: &ItemUseRuntime,
+    melee: &MeleeRuntime,
+    tick: u64,
+) -> [f32; protocol::HOTBAR_SLOT_COUNT as usize] {
+    std::array::from_fn(|slot| {
+        let Some(stream) = stream else {
+            return 0.0;
+        };
+        let Some(stack) = runtime
+            .inventory_ledger(player_runtime)
+            .displayed_stack(slot as u8)
+        else {
+            return 0.0;
+        };
+        let authority = stream.authority();
+        let use_progress = authority
+            .item_use_profile(stack.network_id)
+            .cooldown
+            .map_or(0.0, |cooldown| item_use.cooldown_progress(cooldown, tick));
+        let attack_progress = authority
+            .item_identifier(stack.network_id)
+            .and_then(|identifier| authority.item_attack_timing(&identifier))
+            .and_then(|timing| timing.attack_cooldown.as_ref())
+            .map_or(0.0, |cooldown| melee.cooldown_progress(cooldown, tick));
+        use_progress.max(attack_progress)
+    })
+}
+
+#[cfg(test)]
+mod tests;

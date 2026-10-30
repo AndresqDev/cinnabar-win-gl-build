@@ -1,0 +1,933 @@
+use super::*;
+use crate::{ModGrants, PlayerStateEffect, PlayerStateSlot};
+use cinnabar::extension::player_state::Host as _;
+
+/// Effect clocks neither change equipment tokens nor reallocate the retained equipment.
+#[test]
+fn split_observations_isolate_timers_and_fence_disconnects() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let mut input = snapshot();
+    state
+        .player_state
+        .set_snapshot(Some(input.clone()))
+        .unwrap();
+    let first = state.read_revisions().unwrap().unwrap().unwrap();
+    assert_eq!(
+        state.read_equipment().unwrap().unwrap().unwrap().inventory,
+        input.inventory
+    );
+    let inventory = state
+        .player_state
+        .split
+        .equipment
+        .as_ref()
+        .unwrap()
+        .inventory
+        .as_ptr();
+    input.effects[0].remaining_ticks = Some(119);
+    state.player_state.begin_frame();
+    state
+        .player_state
+        .set_snapshot(Some(input.clone()))
+        .unwrap();
+    let second = state.read_revisions().unwrap().unwrap().unwrap();
+    assert_eq!(first.equipment, second.equipment);
+    assert_ne!(first.effects, second.effects);
+    assert_eq!(
+        state
+            .player_state
+            .split
+            .equipment
+            .as_ref()
+            .unwrap()
+            .inventory
+            .as_ptr(),
+        inventory
+    );
+    assert_eq!(
+        state.read_effects().unwrap().unwrap().unwrap().effects,
+        input.effects
+    );
+    input.selected_slot = Some(3);
+    state.player_state.set_snapshot(Some(input)).unwrap();
+    let third = state.read_revisions().unwrap().unwrap().unwrap();
+    assert_ne!(second.equipment, third.equipment);
+    assert_eq!(second.effects, third.effects);
+    state.player_state.begin_frame();
+    assert!(state.read_revisions().unwrap().unwrap().is_none());
+    assert!(state.read_equipment().unwrap().unwrap().is_none());
+    assert!(state.read_effects().unwrap().unwrap().is_none());
+    state.player_state.set_snapshot(Some(snapshot())).unwrap();
+    let rejoined = state.read_revisions().unwrap().unwrap().unwrap();
+    assert!(rejoined.equipment > third.equipment && rejoined.effects > third.effects);
+    state.grants.player_state = false;
+    assert!(state.read_revisions().unwrap().is_err());
+    assert!(state.read_equipment().unwrap().is_err());
+    assert!(state.read_effects().unwrap().is_err());
+}
+
+fn snapshot() -> PlayerStateSnapshot {
+    PlayerStateSnapshot {
+        session: 7,
+        dimension: 0,
+        selected_slot: Some(2),
+        inventory: vec![
+            PlayerStateSlot {
+                known: false,
+                item: None,
+            };
+            PLAYER_STATE_INVENTORY_SLOTS
+        ],
+        armor: vec![
+            PlayerStateSlot {
+                known: false,
+                item: None
+            };
+            PLAYER_STATE_ARMOR_SLOTS
+        ],
+        offhand: PlayerStateSlot {
+            known: false,
+            item: None,
+        },
+        effects: vec![PlayerStateEffect {
+            effect_id: 1,
+            amplifier: 1,
+            remaining_ticks: Some(120),
+            ambient: false,
+            particles: true,
+        }],
+    }
+}
+
+#[test]
+fn local_facts_require_their_own_grant_and_expire_after_the_callback() {
+    let mut state = State::new(ModGrants::default(), String::new(), Default::default());
+    state.player_state.set_snapshot(Some(snapshot())).unwrap();
+    assert!(state.read_snapshot().unwrap().is_err());
+    assert!(state.read_revision().unwrap().is_err());
+    state.grants.player_state = true;
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(snapshot()));
+    assert!(state.read_revision().unwrap().unwrap().is_some());
+    state.player_state.begin_frame();
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), None);
+    assert_eq!(state.read_revision().unwrap().unwrap(), None);
+    assert!(
+        state.snapshot.is_none(),
+        "no camera/gameplay input is granted"
+    );
+}
+
+#[test]
+fn read_budget_is_bounded_and_renews_with_the_callback() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    for index in 0..MAX_IMPORT_WRITES {
+        if index % 2 == 0 {
+            assert!(state.read_snapshot().unwrap().is_ok());
+        } else {
+            assert!(state.read_revision().unwrap().is_ok());
+        }
+    }
+    assert!(state.read_revision().is_err());
+    state.player_state.begin_frame();
+    assert!(state.read_snapshot().unwrap().is_ok());
+    assert!(state.read_revision().unwrap().is_ok());
+}
+
+/// Creates a valid item observation so identifier and scalar changes are exercised together.
+fn observed_snapshot() -> PlayerStateSnapshot {
+    let mut snapshot = snapshot();
+    snapshot.inventory[0] = PlayerStateSlot {
+        known: true,
+        item: Some(PlayerStateItem {
+            identifier: Some("minecraft:arrow".into()),
+            network_id: 6,
+            metadata: 0,
+            count: 8,
+            block: false,
+            damage: Some(2),
+            max_durability: Some(20),
+        }),
+    };
+    snapshot
+}
+
+#[test]
+fn unimported_transient_facts_do_not_invalidate_the_last_full_snapshot_token() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let facts = observed_snapshot();
+    state
+        .player_state
+        .set_snapshot(Some(facts.clone()))
+        .unwrap();
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(facts.clone()));
+    let revision = state.read_revision().unwrap().unwrap().unwrap();
+    state.player_state.begin_frame();
+    assert_eq!(state.read_revision().unwrap().unwrap(), None);
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), None);
+
+    let mut transient = facts.clone();
+    transient.inventory[0].item.as_mut().unwrap().count += 1;
+    state
+        .player_state
+        .set_snapshot(Some(transient.clone()))
+        .unwrap();
+    let transient_revision = state.read_revision().unwrap().unwrap().unwrap();
+    assert_ne!(revision, transient_revision);
+    assert_eq!(
+        state.read_revision().unwrap().unwrap(),
+        Some(transient_revision),
+        "the token remains stable throughout its current callback"
+    );
+
+    state.player_state.begin_frame();
+    state
+        .player_state
+        .set_snapshot(Some(facts.clone()))
+        .unwrap();
+    assert_eq!(state.read_revision().unwrap().unwrap(), Some(revision));
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(facts.clone()));
+
+    state.player_state.begin_frame();
+    state
+        .player_state
+        .set_snapshot(Some(transient.clone()))
+        .unwrap();
+    let imported_revision = state.read_revision().unwrap().unwrap().unwrap();
+    assert_ne!(imported_revision, revision);
+    assert_eq!(
+        state.read_snapshot().unwrap().unwrap(),
+        Some(transient.clone())
+    );
+    state.player_state.begin_frame();
+    state.player_state.set_snapshot(Some(transient)).unwrap();
+    assert_eq!(
+        state.read_revision().unwrap().unwrap(),
+        Some(imported_revision)
+    );
+    state.player_state.begin_frame();
+    state.player_state.set_snapshot(Some(facts)).unwrap();
+    assert_ne!(state.read_revision().unwrap().unwrap().unwrap(), revision);
+}
+
+#[test]
+fn revision_changes_for_exact_identifiers_scalars_ticks_and_session_owners() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let changes: &[fn(&mut PlayerStateSnapshot)] = &[
+        |facts| facts.session += 1,
+        |facts| facts.dimension += 1,
+        |facts| facts.selected_slot = Some(3),
+        |facts| facts.inventory[1].known = true,
+        |facts| facts.inventory[0].item = None,
+        |facts| facts.inventory[0].item.as_mut().unwrap().identifier = None,
+        |facts| {
+            facts.inventory[0].item.as_mut().unwrap().identifier =
+                Some("minecraft:ender_pearl".into())
+        },
+        |facts| facts.inventory[0].item.as_mut().unwrap().network_id += 1,
+        |facts| facts.inventory[0].item.as_mut().unwrap().metadata += 1,
+        |facts| facts.inventory[0].item.as_mut().unwrap().count += 1,
+        |facts| facts.inventory[0].item.as_mut().unwrap().block = true,
+        |facts| facts.inventory[0].item.as_mut().unwrap().damage = None,
+        |facts| facts.inventory[0].item.as_mut().unwrap().damage = Some(3),
+        |facts| facts.inventory[0].item.as_mut().unwrap().max_durability = Some(21),
+        |facts| facts.armor[0].known = true,
+        |facts| facts.offhand.known = true,
+        |facts| facts.effects[0].effect_id += 1,
+        |facts| facts.effects[0].amplifier += 1,
+        |facts| facts.effects[0].remaining_ticks = Some(119),
+        |facts| facts.effects[0].remaining_ticks = None,
+        |facts| facts.effects[0].ambient = true,
+        |facts| facts.effects[0].particles = false,
+        |facts| facts.effects.clear(),
+    ];
+    for change in changes {
+        state.player_state.begin_frame();
+        let mut facts = observed_snapshot();
+        state
+            .player_state
+            .set_snapshot(Some(facts.clone()))
+            .unwrap();
+        assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(facts.clone()));
+        let before = state.read_revision().unwrap().unwrap().unwrap();
+        change(&mut facts);
+        assert!(validate(Some(&facts)).is_ok());
+        state
+            .player_state
+            .set_snapshot(Some(facts.clone()))
+            .unwrap();
+        let after = state.read_revision().unwrap().unwrap().unwrap();
+        assert_ne!(before, after);
+        assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(facts));
+    }
+}
+
+#[test]
+fn unavailable_facts_hide_reads_and_equal_contents_keep_the_token_until_revocation() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    state.player_state.set_snapshot(Some(snapshot())).unwrap();
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(snapshot()));
+    let first = state.read_revision().unwrap().unwrap().unwrap();
+    for _ in 0..2 {
+        state.player_state.begin_frame();
+        state.player_state.set_snapshot(None).unwrap();
+        assert_eq!(state.read_revision().unwrap().unwrap(), None);
+        assert_eq!(state.read_snapshot().unwrap().unwrap(), None);
+    }
+    state.player_state.begin_frame();
+    state.player_state.set_snapshot(Some(snapshot())).unwrap();
+    let reappeared = state.read_revision().unwrap().unwrap().unwrap();
+    assert_eq!(first, reappeared);
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(snapshot()));
+
+    state.player_state.begin_frame();
+    state.player_state.set_snapshot(None).unwrap();
+    assert_eq!(state.read_revision().unwrap().unwrap(), None);
+    let mut changed = snapshot();
+    changed.session += 1;
+    state
+        .player_state
+        .set_snapshot(Some(changed.clone()))
+        .unwrap();
+    let changed_revision = state.read_revision().unwrap().unwrap().unwrap();
+    assert_ne!(first, changed_revision);
+    assert_eq!(
+        state.read_snapshot().unwrap().unwrap(),
+        Some(changed.clone())
+    );
+
+    state.player_state.revoke();
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), None);
+    assert_eq!(state.read_revision().unwrap().unwrap(), None);
+    assert!(state.player_state.comparison_snapshot.is_none());
+    state.player_state.set_snapshot(Some(changed)).unwrap();
+    assert_ne!(
+        state.read_revision().unwrap().unwrap().unwrap(),
+        changed_revision
+    );
+}
+
+#[test]
+fn revision_exhaustion_releases_facts_instead_of_reusing_an_old_token() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    state.player_state.set_snapshot(Some(snapshot())).unwrap();
+    assert_eq!(state.read_snapshot().unwrap().unwrap(), Some(snapshot()));
+    state.player_state.revision = u64::MAX;
+    let mut changed = snapshot();
+    changed.session += 1;
+    assert!(state.player_state.set_snapshot(Some(changed)).is_err());
+    assert!(state.player_state.snapshot.is_none());
+    assert!(state.player_state.current_revision.is_none());
+    assert!(state.player_state.comparison_snapshot.is_none());
+}
+
+#[test]
+fn malformed_snapshots_cannot_expose_items_or_expired_effects() {
+    assert!(validate(Some(&snapshot())).is_ok());
+    let mut bad = snapshot();
+    bad.inventory.pop();
+    assert!(validate(Some(&bad)).is_err());
+    bad = snapshot();
+    bad.selected_slot = Some(9);
+    assert!(validate(Some(&bad)).is_err());
+    bad = snapshot();
+    bad.effects[0].remaining_ticks = Some(0);
+    assert!(validate(Some(&bad)).is_err());
+    bad = snapshot();
+    bad.effects.push(bad.effects[0]);
+    assert!(validate(Some(&bad)).is_err());
+    bad = snapshot();
+    bad.inventory[0].item = Some(PlayerStateItem {
+        identifier: Some("minecraft:arrow".into()),
+        network_id: 6,
+        metadata: 0,
+        count: 8,
+        block: false,
+        damage: None,
+        max_durability: None,
+    });
+    assert!(
+        validate(Some(&bad)).is_err(),
+        "unknown cells cannot hold a presented item"
+    );
+    bad.inventory[0].known = true;
+    assert!(validate(Some(&bad)).is_ok());
+    bad.inventory[0].item.as_mut().unwrap().count = 0;
+    assert!(validate(Some(&bad)).is_err());
+}
+
+#[test]
+fn presentation_reads_share_grants_budget_and_revocation() {
+    let mut state = State::new(ModGrants::default(), String::new(), Default::default());
+    state.player_state.fps = Some(144.0);
+    state.player_state.world = Some(crate::WorldObservation {
+        session: 7,
+        world: "remote:example:19132".into(),
+        dimension: 0,
+        position: (1., 2., 3.),
+        alive: true,
+        runtime_id: 1,
+    });
+    assert!(state.read_fps().unwrap().is_err());
+    assert!(state.read_world().unwrap().is_err());
+    assert!(state.read_sidebar().unwrap().is_err());
+    state.grants.player_state = true;
+    assert_eq!(state.read_fps().unwrap().unwrap(), Some(144.));
+    assert_eq!(
+        state.read_world().unwrap().unwrap().unwrap().position,
+        (1., 2., 3.)
+    );
+    state.player_state.revoke();
+    assert_eq!(state.read_fps().unwrap().unwrap(), None);
+    assert_eq!(state.read_world().unwrap().unwrap(), None);
+}
+
+#[test]
+fn chat_import_is_incremental_bounded_and_fifo() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    state.player_state.chat = (10..16)
+        .map(|sequence| crate::ObservedChatMessage {
+            sequence,
+            text: format!("Message {sequence}"),
+        })
+        .collect();
+    assert!(state.read_chat(0, 0).unwrap().is_err());
+    assert!(
+        state
+            .read_chat(0, (ui::mod_hud::MAX_CHAT_READ_MESSAGES + 1) as u32)
+            .unwrap()
+            .is_err()
+    );
+    let result = state.read_chat(11, 2).unwrap().unwrap();
+    assert_eq!(
+        result.iter().map(|m| m.sequence).collect::<Vec<_>>(),
+        vec![12, 13]
+    );
+    assert!(state.read_chat(15, 4).unwrap().unwrap().is_empty());
+}
+
+#[test]
+fn supplemental_facts_require_independent_grants_and_expire() {
+    let mut state = State::new(ModGrants::default(), String::new(), Default::default());
+    state.player_state.observations.ping_ms = Some(42);
+    assert!(state.read_ping().unwrap().is_err());
+    assert!(state.read_actors().unwrap().is_err());
+    state.grants.player_state = true;
+    assert_eq!(state.read_ping().unwrap().unwrap(), Some(42));
+    assert!(
+        state
+            .read_combat(0, (mod_api::MAX_COMBAT_READ_EVENTS + 1) as u32)
+            .unwrap()
+            .is_err()
+    );
+    state.player_state.clear_presentation();
+    assert_eq!(state.read_ping().unwrap().unwrap(), None);
+}
+
+#[test]
+fn remote_combat_statuses_obey_actor_grants_while_local_intent_remains_player_owned() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let event =
+        |sequence, player, local, kind| crate::module_observations::RecordedCombatObservation {
+            life: Some(sequence + 100),
+            event: crate::CombatObservation {
+                sequence,
+                session: 7,
+                dimension: 0,
+                player,
+                local,
+                kind,
+                runtime_id: sequence,
+                distance: None,
+                position: (0., 0., 0.),
+            },
+        };
+    state.player_state.observations.combat = vec![
+        event(1, true, false, crate::CombatKind::Hurt),
+        event(2, false, false, crate::CombatKind::Hurt),
+        event(3, true, true, crate::CombatKind::Hurt),
+        event(4, true, false, crate::CombatKind::AttackAdmitted),
+    ];
+    assert_eq!(
+        state
+            .read_combat(0, 4)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    state.grants.players = true;
+    assert_eq!(
+        state
+            .read_combat(0, 4)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+    state.grants.entities = true;
+    assert_eq!(state.read_combat(0, 4).unwrap().unwrap().len(), 4);
+}
+
+/// A bounded prefix preserves authority filtering and rejects invalid read limits.
+#[test]
+fn limited_actor_reads_keep_permission_filtering_and_validate_limits() {
+    let mut state = State::new(
+        ModGrants {
+            players: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    assert!(state.read_actors_limited(0).unwrap().is_err());
+    assert!(
+        state
+            .read_actors_limited(mod_api::MAX_OBSERVED_ACTORS as u32 + 1)
+            .unwrap()
+            .is_err()
+    );
+    assert!(state.read_actors_limited(1).unwrap().unwrap().is_empty());
+    state.grants.players = false;
+    assert!(state.read_actors_limited(1).unwrap().is_err());
+}
+
+/// Supplies one complete actor row with a separately carried replicated maximum.
+fn observed_actor(runtime_id: u64, player: bool) -> crate::ObservedActor {
+    crate::ObservedActor {
+        actor: crate::ActorObservation {
+            session: 7,
+            dimension: 0,
+            runtime_id,
+            player,
+            position: (0., 0., 0.),
+            boxes: vec![],
+            name: String::new(),
+            identifier: "fixture:actor".into(),
+            yaw: 0.,
+            pitch: 0.,
+            pickable: true,
+            hittable: None,
+            look_origin: None,
+            look_direction: None,
+            invisible: false,
+            sneaking: false,
+            hurt: false,
+            health: Some(10.),
+        },
+        max_health: Some(40.),
+    }
+}
+
+#[test]
+fn bounded_actor_reads_preserve_legacy_rows_and_filter_before_limiting() {
+    let mut state = State::new(
+        ModGrants {
+            players: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    state.player_state.observations.actors = vec![
+        observed_actor(1, false),
+        observed_actor(2, true),
+        observed_actor(3, true),
+    ];
+    let limited = state.read_actors_limited(1).unwrap().unwrap();
+    assert_eq!(limited.len(), 1);
+    assert_eq!(limited[0].actor.runtime_id, 2);
+    assert_eq!(limited[0].max_health, Some(40.));
+    let legacy = state.read_actors().unwrap().unwrap();
+    assert_eq!(
+        legacy,
+        state.player_state.observations.actors[1..]
+            .iter()
+            .map(|observed| observed.actor.clone())
+            .collect::<Vec<_>>()
+    );
+    state.grants.players = false;
+    state.grants.entities = true;
+    let limited = state.read_actors_limited(1).unwrap().unwrap();
+    assert_eq!(limited[0].actor.runtime_id, 1);
+}
+
+#[test]
+fn legacy_and_bounded_actor_reads_share_one_callback_allowance() {
+    let mut state = State::new(
+        ModGrants {
+            players: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    for index in 0..MAX_IMPORT_WRITES {
+        if index % 2 == 0 {
+            assert!(state.read_actors().unwrap().is_ok());
+        } else {
+            assert!(state.read_actors_limited(1).unwrap().is_ok());
+        }
+    }
+    assert!(state.read_actors_limited(1).is_err());
+    state.player_state.begin_frame();
+    assert!(state.read_actors().unwrap().is_ok());
+}
+
+/// Publishes lives for runtime IDs `1..=count`: odd IDs are players, and each life is its ID.
+fn published_lives(
+    count: u64,
+) -> std::sync::Arc<Vec<crate::module_observations::ActorLifeObservation>> {
+    std::sync::Arc::new(
+        (1..=count)
+            .map(
+                |runtime_id| crate::module_observations::ActorLifeObservation {
+                    runtime_id,
+                    player: runtime_id % 2 == 1,
+                    life: crate::ActorLife {
+                        life: runtime_id * 10,
+                        dead: runtime_id == 4,
+                    },
+                },
+            )
+            .collect(),
+    )
+}
+
+/// The life the fixture publishes for `runtime_id`.
+fn published_life(runtime_id: u64) -> Option<crate::ActorLife> {
+    Some(crate::ActorLife {
+        life: runtime_id * 10,
+        dead: runtime_id == 4,
+    })
+}
+
+/// Each requested ID gets one answer in order; player rows need players, others entities, and
+/// unknown IDs or a missing grant read as none.
+#[test]
+fn actor_lives_answer_each_id_under_its_kind_grant() {
+    let mut state = State::new(ModGrants::default(), String::new(), Default::default());
+    state.player_state.observations.actor_lives = published_lives(8);
+    assert!(state.read_actor_lives(vec![1]).unwrap().is_err());
+    let request = vec![3, 4, 99, 3, 0];
+    state.grants.players = true;
+    assert_eq!(
+        state.read_actor_lives(request.clone()).unwrap().unwrap(),
+        [published_life(3), None, None, published_life(3), None]
+    );
+    state.grants.players = false;
+    state.grants.entities = true;
+    assert_eq!(
+        state.read_actor_lives(request.clone()).unwrap().unwrap(),
+        [None, published_life(4), None, None, None]
+    );
+    state.grants.players = true;
+    assert_eq!(
+        state.read_actor_lives(request).unwrap().unwrap(),
+        [
+            published_life(3),
+            published_life(4),
+            None,
+            published_life(3),
+            None
+        ]
+    );
+    assert_eq!(state.read_actor_lives(Vec::new()).unwrap().unwrap(), []);
+}
+
+/// Requests are bounded without trapping, reach every published actor beyond the actor reads'
+/// limit, share their callback allowance and expire with the callback.
+#[test]
+fn actor_lives_are_bounded_unlimited_by_actor_reads_and_callback_scoped() {
+    let mut state = State::new(
+        ModGrants {
+            players: true,
+            entities: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let published = 4 * mod_api::MAX_ACTOR_LIFE_READS as u64;
+    assert!(published as usize > mod_api::MAX_OBSERVED_ACTORS);
+    state.player_state.observations.actor_lives = published_lives(published);
+    state.player_state.observations.actors = vec![observed_actor(1, true)];
+    assert!(
+        state
+            .read_actor_lives(vec![1; mod_api::MAX_ACTOR_LIFE_READS + 1])
+            .unwrap()
+            .is_err()
+    );
+    let farthest: Vec<u64> =
+        (published - mod_api::MAX_ACTOR_LIFE_READS as u64 + 1..=published).collect();
+    assert_eq!(
+        state.read_actor_lives(farthest.clone()).unwrap().unwrap(),
+        farthest
+            .iter()
+            .map(|runtime_id| published_life(*runtime_id))
+            .collect::<Vec<_>>()
+    );
+    for _ in 2..MAX_IMPORT_WRITES {
+        assert!(state.read_actors().unwrap().is_ok());
+    }
+    assert!(state.read_actor_lives(vec![1]).is_err(), "budget is shared");
+    state.player_state.begin_frame();
+    state.player_state.clear_presentation();
+    assert_eq!(state.read_actor_lives(vec![1]).unwrap().unwrap(), [None]);
+}
+
+/// Both combat reads use identical kind grants, preserve request order and share one allowance.
+#[test]
+fn combat_lives_follow_event_grants_bounds_order_and_callback_lifetime() {
+    use crate::module_observations::RecordedCombatObservation;
+    let mut state = State::new(ModGrants::default(), String::new(), Default::default());
+    state.player_state.observations.combat = (1..=4)
+        .map(|sequence| RecordedCombatObservation {
+            event: crate::CombatObservation {
+                sequence,
+                session: 7,
+                dimension: 0,
+                runtime_id: sequence,
+                kind: if sequence == 4 {
+                    crate::CombatKind::AttackAdmitted
+                } else {
+                    crate::CombatKind::Totem
+                },
+                local: sequence == 3,
+                player: sequence != 2,
+                distance: None,
+                position: (0., 0., 0.),
+            },
+            life: Some(sequence + 100),
+        })
+        .collect();
+    assert!(state.read_combat_lives(vec![1]).unwrap().is_err());
+    state.grants.player_state = true;
+    for (players, entities, expected) in [
+        (false, false, vec![None, None, Some(103), Some(104)]),
+        (true, false, vec![Some(101), None, Some(103), Some(104)]),
+        (false, true, vec![None, Some(102), Some(103), Some(104)]),
+        (true, true, vec![Some(101), Some(102), Some(103), Some(104)]),
+    ] {
+        state.player_state.begin_frame();
+        state.grants.players = players;
+        state.grants.entities = entities;
+        assert_eq!(
+            state.read_combat_lives(vec![1, 2, 3, 4]).unwrap().unwrap(),
+            expected
+        );
+        let visible = state.read_combat(0, 4).unwrap().unwrap();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .enumerate()
+                .filter_map(|(index, life)| life.map(|_| index as u64 + 1))
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        state
+            .read_combat_lives(vec![4, 1, 4, 0, 5])
+            .unwrap()
+            .unwrap(),
+        [Some(104), Some(101), Some(104), None, None]
+    );
+    assert!(
+        state
+            .read_combat_lives(vec![1; mod_api::MAX_COMBAT_LIFE_READS + 1])
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .read_combat_lives(vec![1; mod_api::MAX_COMBAT_LIFE_READS])
+            .unwrap()
+            .unwrap(),
+        vec![Some(101); mod_api::MAX_COMBAT_LIFE_READS]
+    );
+    assert_eq!(state.read_combat_lives(vec![]).unwrap().unwrap(), []);
+    state.player_state.begin_frame();
+    for _ in 0..MAX_IMPORT_WRITES {
+        state.read_combat(0, 4).unwrap().unwrap();
+    }
+    assert!(state.read_combat_lives(vec![1]).is_err());
+    state.player_state.begin_frame();
+    for _ in 0..MAX_IMPORT_WRITES {
+        state.read_combat_lives(vec![1]).unwrap().unwrap();
+    }
+    assert!(state.read_combat(0, 4).is_err());
+    state.player_state.begin_frame();
+    state.player_state.observations.combat.remove(0);
+    assert_eq!(
+        state.read_combat_lives(vec![1, 2]).unwrap().unwrap(),
+        [None, Some(102)]
+    );
+    state.player_state.clear_presentation();
+    assert_eq!(state.read_combat_lives(vec![2]).unwrap().unwrap(), [None]);
+}
+
+/// Identifier queries omit unknown cells and preserve unknown offhand identity separately.
+#[test]
+fn compact_equipment_queries_are_exact_granted_and_session_bound() {
+    let mut state = State::new(
+        ModGrants {
+            player_state: true,
+            ..Default::default()
+        },
+        String::new(),
+        Default::default(),
+    );
+    let mut input = snapshot();
+    let item = crate::PlayerStateItem {
+        identifier: Some("test:match".into()),
+        network_id: 6,
+        metadata: 0,
+        count: 1,
+        block: false,
+        damage: None,
+        max_durability: None,
+    };
+    input.inventory[35] = PlayerStateSlot {
+        known: true,
+        item: Some(item.clone()),
+    };
+    input.offhand = PlayerStateSlot {
+        known: false,
+        item: None,
+    };
+    state
+        .player_state
+        .set_snapshot(Some(input.clone()))
+        .unwrap();
+    let answer = state
+        .read_equipment_matches("test:match".into())
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.inventory, [35]);
+    assert_eq!(answer.offhand, None);
+    assert_eq!(answer.revisions.session, input.session);
+    input.offhand = PlayerStateSlot {
+        known: true,
+        item: Some(item),
+    };
+    state.player_state.begin_frame();
+    state
+        .player_state
+        .set_snapshot(Some(input.clone()))
+        .unwrap();
+    assert_eq!(
+        state
+            .read_equipment_matches("test:match".into())
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .offhand,
+        Some(true)
+    );
+    assert!(
+        state
+            .read_equipment_matches("test:mat".into())
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .inventory
+            .is_empty()
+    );
+    input.offhand.item.as_mut().unwrap().identifier = None;
+    state.player_state.begin_frame();
+    state.player_state.set_snapshot(Some(input)).unwrap();
+    assert_eq!(
+        state
+            .read_equipment_matches("test:match".into())
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .offhand,
+        None
+    );
+    state.player_state.begin_frame();
+    assert!(
+        state
+            .read_equipment_matches("test:match".into())
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        state
+            .read_equipment_matches(String::new())
+            .unwrap()
+            .is_err()
+    );
+    state.grants.player_state = false;
+    assert!(
+        state
+            .read_equipment_matches("test:match".into())
+            .unwrap()
+            .is_err()
+    );
+}

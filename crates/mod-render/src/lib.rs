@@ -1,0 +1,213 @@
+//! Validated render output of a personal mod: sandboxed post passes and world primitives.
+
+pub mod block_highlights;
+mod budget;
+pub mod geometry;
+mod primitive_ranges;
+pub use budget::{GpuAllocation, GpuLedger, GpuReservation};
+pub use primitive_ranges::PrimitiveRanges;
+mod merge;
+pub use merge::RenderMerge;
+mod identity;
+pub use identity::next_owner;
+pub mod masks;
+pub mod material;
+pub mod retained;
+pub mod shader;
+
+use mod_api::{
+    MAX_PASS_PARAMS, MAX_PRIMITIVE_COORDINATE, MAX_PRIMITIVE_EXTENT_BLOCKS, MAX_RENDER_BEAMS,
+    MAX_RENDER_BILLBOARDS, MAX_RENDER_DECALS, MAX_RENDER_RIBBONS, MAX_RIBBON_POINTS,
+};
+use std::sync::Arc;
+
+pub type Vec3 = [f32; 3];
+/// Linear colour; alpha scales coverage.
+pub type Rgba = [f32; 4];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DecalStyle {
+    Telegraph,
+    Disc,
+    Crater,
+    Shockwave,
+    Dust,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum BillboardPattern {
+    Solid,
+    SoftDisc,
+    Ring,
+    Spark,
+    Silhouette,
+    Sphere,
+    Aura,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Decal {
+    pub center: Vec3,
+    pub radius: f32,
+    pub color: Rgba,
+    pub progress: f32,
+    pub style: DecalStyle,
+}
+
+/// Procedural constant-width line pattern; trailing ribbons retain their existing style.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LinePattern {
+    #[default]
+    Solid,
+    Dashed,
+    Dotted,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Ribbon {
+    pub pattern: LinePattern,
+    /// False preserves constant width; true keeps the existing trailing taper.
+    pub taper: bool,
+    pub points: Vec<Vec3>,
+    pub width: f32,
+    pub color: Rgba,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Beam {
+    pub start: Vec3,
+    pub end: Vec3,
+    pub width: f32,
+    pub color: Rgba,
+    pub intensity: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Billboard {
+    pub position: Vec3,
+    pub width: f32,
+    pub height: f32,
+    pub color: Rgba,
+    pub pattern: BillboardPattern,
+    pub upright: bool,
+}
+
+/// One callback's world-space primitives, bounded by the `mod_api` budgets.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Primitives {
+    pub decals: Vec<Decal>,
+    pub ribbons: Vec<Ribbon>,
+    pub beams: Vec<Beam>,
+    pub billboards: Vec<Billboard>,
+}
+
+impl Primitives {
+    /// Counts the immediate placements charged against a producer's draw allowance.
+    pub fn draw_count(&self) -> usize {
+        self.decals.len() + self.ribbons.len() + self.beams.len() + self.billboards.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.decals.is_empty()
+            && self.ribbons.is_empty()
+            && self.beams.is_empty()
+            && self.billboards.is_empty()
+    }
+
+    /// Appends `other` whole, or rejects it whole when any value or budget is invalid.
+    pub fn append_checked(&mut self, other: Primitives) -> Result<(), String> {
+        if self.decals.len() + other.decals.len() > MAX_RENDER_DECALS
+            || self.ribbons.len() + other.ribbons.len() > MAX_RENDER_RIBBONS
+            || self.beams.len() + other.beams.len() > MAX_RENDER_BEAMS
+            || self.billboards.len() + other.billboards.len() > MAX_RENDER_BILLBOARDS
+        {
+            return Err("render primitive budget exceeded".into());
+        }
+        let valid = other.decals.iter().all(|decal| {
+            point(decal.center)
+                && extent(decal.radius)
+                && color(decal.color)
+                && decal.progress.is_finite()
+        }) && other.ribbons.iter().all(|ribbon| {
+            (2..=MAX_RIBBON_POINTS).contains(&ribbon.points.len())
+                && ribbon.points.iter().all(|&p| point(p))
+                && extent(ribbon.width)
+                && color(ribbon.color)
+        }) && other.beams.iter().all(|beam| {
+            point(beam.start)
+                && point(beam.end)
+                && extent(beam.width)
+                && color(beam.color)
+                && (0.0..=16.0).contains(&beam.intensity)
+        }) && other.billboards.iter().all(|billboard| {
+            point(billboard.position)
+                && extent(billboard.width)
+                && extent(billboard.height)
+                && color(billboard.color)
+        });
+        if !valid {
+            return Err(
+                "render primitives need finite, bounded positions, sizes and colours".into(),
+            );
+        }
+        self.decals.extend(other.decals);
+        self.ribbons.extend(other.ribbons);
+        self.beams.extend(other.beams);
+        self.billboards.extend(other.billboards);
+        Ok(())
+    }
+}
+
+fn point(p: Vec3) -> bool {
+    p.iter()
+        .all(|v| v.is_finite() && v.abs() <= MAX_PRIMITIVE_COORDINATE)
+}
+
+fn extent(value: f32) -> bool {
+    value.is_finite() && value > 0.0 && value <= MAX_PRIMITIVE_EXTENT_BLOCKS
+}
+
+fn color(rgba: Rgba) -> bool {
+    rgba.iter()
+        .all(|c| c.is_finite() && (0.0..=16.0).contains(c))
+        && rgba[3] <= 1.0
+}
+
+/// A validated post pass; `shader` is the complete host-composed WGSL module.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pass {
+    pub name: String,
+    pub order: i32,
+    pub depth: bool,
+    /// Only validated owner-scoped selections, bound by declaration order.
+    pub masks: Vec<mod_api::drawing::DrawingHandle>,
+    /// The guest's own source, compared to skip recompiling an unchanged registration.
+    pub source: Arc<str>,
+    pub shader: Arc<str>,
+    /// Unique per accepted source, so renderers can key compiled pipelines by it.
+    pub revision: u64,
+    pub enabled: bool,
+    pub params: [f32; MAX_PASS_PARAMS],
+}
+
+/// Everything a mod currently renders; passes are sorted in execution order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RenderOutput {
+    pub passes: Vec<Pass>,
+    pub primitives: Arc<Primitives>,
+    pub masks: Arc<[masks::Mask]>,
+    pub retained: Vec<Arc<retained::Resources>>,
+    pub gpu_reservations: Vec<GpuReservation>,
+}
+
+/// Valid pass names are short lowercase identifiers.
+pub fn pass_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= mod_api::MAX_PASS_NAME_BYTES
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+#[cfg(test)]
+mod tests;

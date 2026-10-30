@@ -1,0 +1,41 @@
+[package]
+name = "client-interaction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+developer-control = ["client-presentation/developer-control"]
+test-support = []
+
+[dependencies]
+protocol-ids = { path = "../protocol-ids" }
+simulation-clock = { path = "../simulation-clock" }
+bevy.workspace = true
+tokio.workspace = true
+assets = { path = "../assets" }
+chunk-pipeline = { path = "../chunk-pipeline" }
+client-audio = { path = "../client-audio" }
+client-presentation = { path = "../client-presentation" }
+client-state = { path = "../client-state" }
+client-ui = { path = "../client-ui" }
+client-world = { path = "../client-world" }
+actor-animation = { path = "../actor-animation" }
+diagnostics = { path = "../diagnostics" }
+gameplay = { path = "../gameplay" }
+inventory = { path = "../inventory" }
+protocol = { path = "../protocol" }
+semantic-input = { path = "../input" }
+sim = { path = "../sim" }
+world = { path = "../world" }
+
+[dev-dependencies]
+gameplay = { path = "../gameplay", features = ["test-support"] }
+player-state = { path = "../player-state" }
+protocol = { path = "../protocol", features = ["test-support"] }
+sha2.workspace = true
+ui = { path = "../ui" }
+
+[lints]
+workspace = true

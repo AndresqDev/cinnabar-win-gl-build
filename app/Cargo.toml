@@ -1,0 +1,218 @@
+[package]
+name = "cinnabar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+platform-specific = ["macos", "windows"]
+reads = [
+    "crates/mod-api/native-render-v1.json",
+    "assets/cinnangles-sans-source.json",
+    "assets/vanilla-source.json",
+    "crates/assets/data/*",
+    "crates/mod-api/wit/extension.wit",
+    "crates/mod-host/src/tests/gameplay.wat",
+    "crates/mod-host/src/tests/guest.wat",
+    "crates/mod-host/src/packet_mod/tests/guest.wat",
+    "crates/mod-host/src/tests/render.wat",
+    "crates/protocol/fixtures/crafting_data_manual_named_1x1.bin",
+    "crates/protocol/fixtures/start_game.bin",
+    "crates/render/src/atmosphere.wesl",
+    "crates/render/src/cloud.wesl",
+    "examples/mods/screen-probe",
+]
+
+# No doctests here; skipping rustdoc's pass over the crate saves a full re-parse.
+[lib]
+doctest = false
+
+# main.rs only dispatches into the library; its tests live there.
+[[bin]]
+name = "cinnabar"
+path = "src/main.rs"
+test = false
+
+[features]
+# Counts allocation requests and labelled GPU writes for diagnostic runs.
+alloc-stats = ["dep:test-alloc", "test-alloc/global-stats", "render/alloc-stats", "render-scene/alloc-stats"]
+# Developer runs and client MCP keep acceptance; packaging opts out with --no-default-features.
+default = ["acceptance"]
+acceptance = ["dep:acceptance", "bridge/join-profile", "client-interaction/developer-control"]
+enhanced = ["render/enhanced"]
+enhanced-diagnostics = ["enhanced", "developer-control", "acceptance", "render/enhanced-diagnostics"]
+# Loopback control endpoint for scripted driving and recording; never in release builds.
+developer-control = ["dep:developer-control", "dep:sadness-generator", "client-shell/developer-control", "client-interaction/developer-control"]
+# Records Bevy schedules, systems, render graph, submission and presentation spans as a
+# Chrome trace through the app's own subscriber layer.
+frame-trace = ["bevy/trace", "bevy/debug", "dep:tracing-chrome"]
+# Live CPU attribution through Bevy, wgpu's encoding and submission scopes, and the owned
+# streaming/render hot paths.
+tracy = ["bevy/trace", "bevy/debug", "dep:tracing-tracy", "dep:profiling", "chunk-pipeline/tracy", "render/tracy", "client-ui/tracy", "protocol/tracy"]
+# Compiles the offline pack reports and benchmarks into the test build.
+reports = []
+# Opt-in allocator for release-profile measurements.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+tokio.workspace = true
+image.workspace = true
+server-experience = { path = "../crates/server-experience", default-features = false, features = ["data"] }
+sha2.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+glam.workspace = true
+bevy.workspace = true
+simulation-clock = { path = "../crates/simulation-clock" }
+render-scene = { path = "../crates/render-scene" }
+bridge = { path = "../crates/bridge" }
+client-session = { path = "../crates/client-session" }
+assets = { path = "../crates/assets" }
+chunk-pipeline = { path = "../crates/chunk-pipeline" }
+client-world = { path = "../crates/client-world" }
+protocol = { path = "../crates/protocol" }
+render = { path = "../crates/render" }
+render-api = { path = "../crates/render-api" }
+render-model = { path = "../crates/render-model" }
+semantic-input = { path = "../crates/input" }
+world = { path = "../crates/world" }
+
+web-time.workspace = true
+cosmetics = { path = "../crates/cosmetics" }
+protocol-ids = { path = "../crates/protocol-ids" }
+pack-json = { path = "../crates/pack-json" }
+env-compat = { path = "../crates/env-compat" }
+client-shell = { path = "../crates/client-shell" }
+client-interaction = { path = "../crates/client-interaction" }
+client-runtime = { path = "../crates/client-runtime" }
+client-state = { path = "../crates/client-state" }
+client-audio = { path = "../crates/client-audio" }
+pack-runtime = { path = "../crates/pack-runtime" }
+block-transform = { path = "../crates/block-transform" }
+diagnostics = { path = "../crates/diagnostics" }
+client-presentation = { path = "../crates/client-presentation" }
+gameplay = { path = "../crates/gameplay" }
+client-ui = { path = "../crates/client-ui" }
+launcher = { path = "../crates/launcher" }
+player-state = { path = "../crates/player-state" }
+inventory = { path = "../crates/inventory" }
+pack-compile-input = { path = "../crates/pack-compiler/input" }
+pack-compiler = { path = "../crates/pack-compiler" }
+pack-entity-compiler = { path = "../crates/pack-compiler/entity" }
+crossbeam-channel = "0.5"
+fontdue = { version = "0.9.3", default-features = false, features = ["std"] }
+far-terrain = { path = "../crates/far-terrain" }
+actor-animation = { path = "../crates/actor-animation" }
+json-ui = { path = "../crates/json-ui" }
+meshing = { path = "../crates/meshing" }
+oreui = { path = "../crates/oreui" }
+mod-ui = { path = "../crates/mod-ui" }
+mod-api = { path = "../crates/mod-api" }
+particles = { path = "../crates/particles" }
+resource-pack = { path = "../crates/resource-pack" }
+sim = { path = "../crates/sim" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+ui = { path = "../crates/ui" }
+ui-engine = { path = "../crates/ui-engine" }
+ui-screens = { path = "../crates/ui-screens" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+test-alloc = { path = "../crates/test-alloc", optional = true }
+mimalloc = { workspace = true, optional = true }
+client-extensions = { path = "../crates/client-extensions" }
+bootstrap-ui = { path = "../crates/bootstrap-ui" }
+first-run = { path = "../crates/first-run" }
+launcher-host = { path = "../crates/launcher-host" }
+experience-sdk = { path = "../crates/experience-sdk", default-features = false, features = ["declarations"] }
+mod-render = { path = "../crates/mod-render" }
+tracing-tracy = { version = "=0.12.0", default-features = false, features = ["enable", "only-localhost", "ondemand"], optional = true }
+tracing-chrome = { version = "=0.7.2", optional = true }
+profiling = { version = "=1.0.18", default-features = false, features = ["profile-with-tracing"], optional = true }
+acceptance = { path = "../crates/acceptance", optional = true }
+crash-report = { path = "../crates/crash-report" }
+developer-control = { path = "../crates/developer-control", optional = true }
+sadness-generator = { version = "0.7", optional = true }
+tempfile = "3"
+update-manifest = { path = "../crates/update-manifest" }
+rich-presence = { path = "../crates/rich-presence" }
+mod-host = { path = "../crates/mod-host" }
+server-experience = { path = "../crates/server-experience" }
+shaderpack = { path = "../crates/shaderpack" }
+rayon.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+wgpu.workspace = true
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+# The out-of-process crash monitor; iOS cannot start a second process.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "ios")))'.dependencies]
+crash-monitor = { path = "../crates/crash-monitor" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { workspace = true, features = ["webgpu"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wgpu = { workspace = true, features = ["gles"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-quartz-core"] }
+
+# The display link that requests full ProMotion and window refresh rates.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSRunLoop", "NSString"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CADisplayLink", "CAFrameRateRange", "CALayer", "CAMetalLayer", "objc2-metal"] }
+
+[target.'cfg(windows)'.dependencies]
+# WGL backend for the explicit OpenGL fallback (DX12 and Vulkan remain the defaults).
+wgpu = { workspace = true, features = ["gles"] }
+raw-window-handle = "0.6.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+resource-pack = { path = "../crates/resource-pack", features = ["test-support"] }
+mimalloc.workspace = true
+render-model = { path = "../crates/render-model", features = ["test-support"] }
+wat = "1"
+
+actor-animation = { path = "../crates/actor-animation", features = ["test-support"] }
+test-alloc = { path = "../crates/test-alloc" }
+client-shell = { path = "../crates/client-shell", features = ["test-support"] }
+client-interaction = { path = "../crates/client-interaction", features = ["test-support"] }
+assets = { path = "../crates/assets", features = ["test-support"] }
+client-runtime = { path = "../crates/client-runtime", features = ["test-support"] }
+client-audio = { path = "../crates/client-audio", features = ["test-support"] }
+pack-runtime = { path = "../crates/pack-runtime", features = ["test-support"] }
+launcher-host = { path = "../crates/launcher-host", features = ["test-support"] }
+launcher = { path = "../crates/launcher", features = ["test-support"] }
+test-time = { path = "../crates/test-time" }
+wit-component.workspace = true
+rodio = { version = "=0.20.1", default-features = false }
+acceptance = { path = "../crates/acceptance", features = ["test-support"] }
+client-presentation = { path = "../crates/client-presentation", features = ["test-support"] }
+gameplay = { path = "../crates/gameplay", features = ["test-support"] }
+client-session = { path = "../crates/client-session", features = ["test-support"] }
+client-ui = { path = "../crates/client-ui", features = ["test-support"] }
+ui-engine = { path = "../crates/ui-engine", features = ["test-support"] }
+protocol = { path = "../crates/protocol", features = ["test-support"] }
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+pack-compile-input = { path = "../crates/pack-compiler/input" }
+pack-compiler = { path = "../crates/pack-compiler" }
+pack-entity-compiler = { path = "../crates/pack-compiler/entity" }
+chunk-pipeline = { path = "../crates/chunk-pipeline", features = ["publication-test-support"] }
+render = { path = "../crates/render", features = ["publication-test-support"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

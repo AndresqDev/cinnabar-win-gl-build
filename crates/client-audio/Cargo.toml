@@ -1,0 +1,56 @@
+[package]
+name = "client-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+platform-specific = ["macos", "windows"]
+
+[features]
+test-support = ["dep:test-time"]
+
+[dependencies]
+pack-json = { path = "../pack-json" }
+simulation-clock = { path = "../simulation-clock" }
+anyhow.workspace = true
+assets = { path = "../assets" }
+bevy.workspace = true
+chunk-pipeline = { path = "../chunk-pipeline" }
+client-ui = { path = "../client-ui" }
+client-world = { path = "../client-world" }
+actor-animation = { path = "../actor-animation" }
+crossbeam-queue = "=0.3.13"
+inventory = { path = "../inventory" }
+particles = { path = "../particles" }
+player-state = { path = "../player-state" }
+protocol = { path = "../protocol" }
+protocol-ids = { path = "../protocol-ids" }
+resource-pack = { path = "../resource-pack" }
+rodio = { version = "=0.20.1", default-features = false }
+serde_json = "1"
+tokio.workspace = true
+sha2.workspace = true
+sim = { path = "../sim" }
+test-time = { path = "../test-time", optional = true }
+world = { path = "../world" }
+web-time.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+server-experience = { path = "../server-experience" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rodio = { version = "=0.20.1", default-features = false, features = ["wasm-bindgen"] }
+web-sys = { version = "0.3.104", features = ["AudioContext", "AudioContextState"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+test-time = { path = "../test-time" }
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[lints]
+workspace = true

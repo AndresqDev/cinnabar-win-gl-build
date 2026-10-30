@@ -1,0 +1,629 @@
+use super::*;
+use render_model::{ActorGpuInstance, ActorRigGeometrySpan};
+use std::collections::hash_map::Entry;
+
+pub(super) struct ActorPipelineSpecializer;
+
+#[derive(Resource)]
+pub(crate) struct ActorPipeline {
+    pub(super) compact: bool,
+    pub(super) motion_supported: bool,
+    pub(super) variants: Variants<RenderPipeline, ActorPipelineSpecializer>,
+    pub(super) bind_group_layout: BindGroupLayoutDescriptor,
+    draw_variants: std::collections::HashMap<
+        ActorPipelineContract,
+        bevy::render::render_resource::CachedRenderPipelineId,
+    >,
+    motion_variants: Variants<RenderPipeline, super::motion::MotionSpecializer>,
+    motion_ids: std::collections::HashMap<ActorPipelineContract, CachedRenderPipelineId>,
+    /// Unique draw and motion pipelines for each view, retained for readiness and shader reloads.
+    prewarmed: std::collections::HashMap<(Msaa, bool, bool), Vec<CachedRenderPipelineId>>,
+}
+
+impl FromWorld for ActorPipeline {
+    fn from_world(world: &mut World) -> Self {
+        let limit = world
+            .get_resource::<RenderDevice>()
+            .map_or(u32::MAX, |device| {
+                device.limits().max_storage_buffers_per_shader_stage
+            });
+        let compact =
+            limit < crate::device_settings::vertex_storage_buffers(&actor_bind_group_layout());
+        let mut bind_group_layout = actor_bind_group_layout();
+        if compact {
+            bind_group_layout.entries.retain(|entry| entry.binding != 5);
+        }
+        let descriptor = actor_pipeline_descriptor(bind_group_layout.clone());
+        let mut motion_descriptor = descriptor.clone();
+        motion_descriptor.layout.push(super::motion::layout());
+        Self {
+            compact,
+            motion_supported: limit
+                >= crate::device_settings::vertex_storage_buffers(&actor_bind_group_layout())
+                    + crate::device_settings::vertex_storage_buffers(&super::motion::layout()),
+            motion_variants: Variants::new(super::motion::MotionSpecializer, motion_descriptor),
+            motion_ids: Default::default(),
+            prewarmed: Default::default(),
+            variants: Variants::new(ActorPipelineSpecializer, descriptor),
+            bind_group_layout,
+            draw_variants: Default::default(),
+        }
+    }
+}
+
+impl ActorPipeline {
+    /// Removes the separate current endpoint binding when both endpoints share one allocation.
+    pub(super) fn entries<'a, 'b>(
+        &self,
+        entries: &'b [BindGroupEntry<'a>],
+    ) -> std::borrow::Cow<'b, [BindGroupEntry<'a>]> {
+        if self.compact {
+            std::borrow::Cow::Owned(
+                entries
+                    .iter()
+                    .filter(|entry| entry.binding != 5)
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(entries)
+        }
+    }
+
+    /// Queues draw and eligible motion contracts before actors enter a view.
+    pub(super) fn prewarm(
+        &mut self,
+        cache: &PipelineCache,
+        msaa: Msaa,
+        hdr: bool,
+        enhanced: bool,
+    ) -> Option<bevy::render::render_resource::CachedRenderPipelineId> {
+        let view = (msaa, hdr, enhanced);
+        if !self.prewarmed.contains_key(&view) {
+            let mut ids = Vec::new();
+            for material in prewarm_materials() {
+                let key = ActorPipelineKey {
+                    msaa,
+                    hdr,
+                    enhanced,
+                    material,
+                };
+                let contract = key.contract();
+                let id = match self.draw_variants.entry(contract) {
+                    Entry::Occupied(entry) => *entry.get(),
+                    Entry::Vacant(entry) => {
+                        *entry.insert(self.variants.specialize(cache, key).ok()?)
+                    }
+                };
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                if self.motion_supported && super::motion::eligible(material) {
+                    let id = match self.motion_ids.entry(contract) {
+                        Entry::Occupied(entry) => *entry.get(),
+                        Entry::Vacant(entry) => {
+                            *entry.insert(self.motion_variants.specialize(cache, key).ok()?)
+                        }
+                    };
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+            }
+            // A failed specialization returned above, so it retries next frame as before.
+            self.prewarmed.insert(view, ids);
+        }
+        self.draw_variant(
+            msaa,
+            hdr,
+            enhanced,
+            assets::EntityRenderMaterial::Default as u32,
+        )
+    }
+
+    pub(super) fn draw_variant(
+        &self,
+        msaa: Msaa,
+        hdr: bool,
+        enhanced: bool,
+        material: u32,
+    ) -> Option<bevy::render::render_resource::CachedRenderPipelineId> {
+        self.draw_variants
+            .get(
+                &ActorPipelineKey {
+                    msaa,
+                    hdr,
+                    enhanced,
+                    material,
+                }
+                .contract(),
+            )
+            .copied()
+    }
+
+    /// Looks up a motion contract already requested by the loading path.
+    pub(super) fn motion_variant(&self, key: ActorPipelineKey) -> Option<CachedRenderPipelineId> {
+        self.motion_ids.get(&key.contract()).copied()
+    }
+
+    /// Loading completes only when both color and eligible motion pipelines are compiled.
+    pub(super) fn ready(
+        &self,
+        cache: &PipelineCache,
+        msaa: Msaa,
+        hdr: bool,
+        enhanced: bool,
+    ) -> bool {
+        self.ready_with((msaa, hdr, enhanced), |id| {
+            cache.get_render_pipeline(id).is_some()
+        })
+    }
+
+    /// Polls each distinct pipeline once, including pipelines invalidated by a shader reload.
+    fn ready_with(
+        &self,
+        view: (Msaa, bool, bool),
+        mut compiled: impl FnMut(CachedRenderPipelineId) -> bool,
+    ) -> bool {
+        self.prewarmed
+            .get(&view)
+            .is_some_and(|ids| ids.iter().copied().all(&mut compiled))
+    }
+}
+
+#[cfg(test)]
+#[path = "pipeline_readiness_tests.rs"]
+mod readiness_tests;
+
+/// Requests every distinct raster contract before the first actor reaches a view.
+fn prewarm_materials() -> impl Iterator<Item = u32> {
+    let kinds = [
+        assets::EntityRenderMaterial::Default,
+        assets::EntityRenderMaterial::DissolveDepth,
+        assets::EntityRenderMaterial::DissolveColor,
+    ];
+    let ordinary = kinds.into_iter().flat_map(|kind| {
+        [false, true].into_iter().flat_map(move |cull| {
+            [false, true].into_iter().flat_map(move |blend| {
+                [false, true].into_iter().flat_map(move |depth_write| {
+                    [false, true].into_iter().map(move |alpha_test| {
+                        kind.word(Some(assets::EntityRenderMaterialState {
+                            alpha_test,
+                            cull,
+                            blend,
+                            depth_write,
+                            ..Default::default()
+                        }))
+                    })
+                })
+            })
+        })
+    });
+    let additive = kinds.into_iter().flat_map(|kind| {
+        [false, true].into_iter().flat_map(move |cull| {
+            [false, true].into_iter().flat_map(move |depth_write| {
+                [false, true].into_iter().map(move |additive_alpha| {
+                    kind.word(Some(assets::EntityRenderMaterialState {
+                        cull,
+                        depth_write,
+                        blend: true,
+                        additive: true,
+                        additive_alpha,
+                        ..Default::default()
+                    }))
+                })
+            })
+        })
+    });
+    ordinary
+        .chain(additive)
+        .chain(
+            assets::facts::pack::rules()
+                .material_states()
+                .map(|(name, state)| assets::facts::pack::rules().raster(name).word(Some(state))),
+        )
+        .flat_map(|material| {
+            [
+                material,
+                material
+                    | render_model::LEGACY_COMBAT_MATERIAL_FLAG
+                    | render_model::ACTOR_COLOR_MASK_MATERIAL_FLAG,
+            ]
+        })
+        .flat_map(|material| {
+            [
+                Some(material),
+                Some(material | assets::EntityRenderMaterialState::DEPTH_EQUAL),
+                Some(material | assets::EntityRenderMaterialState::DEPTH_ALWAYS),
+                (material & assets::EntityRenderMaterialState::KIND_MASK
+                    == assets::EntityRenderMaterial::DissolveColor as u32)
+                    .then_some(material | crate::actor::material::LATE_DISSOLVE_COLOR),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .flat_map(|material| {
+            [
+                0,
+                assets::EntityRenderMaterialState::DISABLE_ALPHA_WRITE,
+                assets::EntityRenderMaterialState::DISABLE_COLOR_WRITE,
+            ]
+            .map(|writes| material | writes)
+        })
+}
+
+pub(super) fn prepare_actor_pipelines(
+    cache: Res<PipelineCache>,
+    mut pipeline: ResMut<ActorPipeline>,
+    readiness: Res<render_scene::ActorPipelineReadiness>,
+    views: Query<(
+        &bevy::render::camera::ExtractedCamera,
+        &Msaa,
+        Option<&render_scene::EnhancedRendering>,
+    )>,
+) {
+    let mut has_view = false;
+    let mut ready = true;
+    for (camera, msaa, enhanced) in &views {
+        has_view = true;
+        for msaa in crate::pipeline_warmup::sample_modes(*msaa) {
+            ready &= pipeline
+                .prewarm(&cache, msaa, camera.hdr, enhanced.is_some())
+                .is_some()
+                && pipeline.ready(&cache, msaa, camera.hdr, enhanced.is_some());
+        }
+    }
+    readiness.publish(has_view && ready);
+}
+
+pub(super) fn actor_bind_group_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "instanced actor bind group layout",
+        &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                // The fragment stage reads the camera position for distance fog.
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: Some(ViewUniform::min_size()),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<ActorGpuInstance>() as u64),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<ActorRigVertex>() as u64),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<ActorRigGeometrySpan>() as u64),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<[[f32; 4]; 3]>() as u64),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<[[f32; 4]; 3]>() as u64),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(16),
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 12,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 13,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 14,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            // Player skin arrays of the 64, 128 and 256 texel classes.
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 10,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 11,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    )
+}
+
+pub(super) fn actor_pipeline_descriptor(
+    bind_group_layout: BindGroupLayoutDescriptor,
+) -> RenderPipelineDescriptor {
+    let compact = !bind_group_layout
+        .entries
+        .iter()
+        .any(|entry| entry.binding == 5);
+    let mut descriptor = RenderPipelineDescriptor {
+        label: Some("bounded shared actor pipeline".into()),
+        layout: vec![bind_group_layout, crate::lighting::layout()],
+        vertex: VertexState {
+            shader: ACTOR_SHADER_HANDLE,
+            entry_point: Some("actor_vertex".into()),
+            buffers: vec![],
+            ..default()
+        },
+        fragment: Some(FragmentState {
+            shader: ACTOR_SHADER_HANDLE,
+            entry_point: Some("actor_fragment".into()),
+            targets: vec![Some(ColorTargetState {
+                format: render_scene::SCENE_COLOR_FORMAT,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+            ..default()
+        }),
+        depth_stencil: Some(DepthStencilState {
+            format: CORE_3D_DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::GreaterEqual),
+            stencil: default(),
+            bias: default(),
+        }),
+        ..default()
+    };
+    if compact {
+        descriptor.vertex.shader_defs.push("COMPACT_BONES".into());
+        descriptor
+            .fragment
+            .as_mut()
+            .unwrap()
+            .shader_defs
+            .push("COMPACT_BONES".into());
+    }
+    descriptor
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ActorPipelineKey {
+    pub(super) msaa: Msaa,
+    pub(super) hdr: bool,
+    pub(super) enhanced: bool,
+    pub(super) material: u32,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct ActorPipelineContract {
+    msaa: Msaa,
+    format: TextureFormat,
+    kind: assets::EntityRenderMaterial,
+    cull: bool,
+    blend: bool,
+    depth_write: bool,
+    depth_always: bool,
+    depth_equal: bool,
+    write_color: bool,
+    additive: bool,
+    additive_alpha: bool,
+    alpha_to_coverage: bool,
+    write_alpha: bool,
+}
+
+impl ActorPipelineKey {
+    /// Coalesces shader-only material flags while retaining distinct coverage and depth states.
+    pub(super) fn contract(self) -> ActorPipelineContract {
+        let state = crate::actor::material::state(self.material).unwrap_or(
+            assets::EntityRenderMaterialState {
+                alpha_test: false,
+                cull: false,
+                blend: false,
+                depth_write: true,
+                ..Default::default()
+            },
+        );
+        let kind = match self.material & assets::EntityRenderMaterialState::KIND_MASK {
+            value if value == assets::EntityRenderMaterial::DissolveDepth as u32 => {
+                assets::EntityRenderMaterial::DissolveDepth
+            }
+            value if value == assets::EntityRenderMaterial::DissolveColor as u32 => {
+                assets::EntityRenderMaterial::DissolveColor
+            }
+            _ => assets::EntityRenderMaterial::Default,
+        };
+        let format = if self.hdr {
+            render_scene::SCENE_HDR_FORMAT
+        } else if super::phase::sorted(self.material)
+            && crate::chunk::transparent::gamma_pass::admitted(self.hdr, self.msaa, self.enhanced)
+        {
+            render_scene::SCENE_COLOR_FORMAT.remove_srgb_suffix()
+        } else {
+            render_scene::SCENE_COLOR_FORMAT
+        };
+        ActorPipelineContract {
+            msaa: self.msaa,
+            format,
+            kind,
+            cull: state.cull,
+            blend: state.blend,
+            depth_write: state.depth_write,
+            depth_always: state.depth_always,
+            depth_equal: (state.depth_equal || kind == assets::EntityRenderMaterial::DissolveColor)
+                && !state.depth_always,
+            write_color: !state.disable_color_write,
+            additive: state.blend && state.additive,
+            additive_alpha: state.blend && state.additive && state.additive_alpha,
+            write_alpha: !state.disable_color_write
+                && !state.disable_alpha_write
+                && self.material
+                    & (render_model::LEGACY_COMBAT_MATERIAL_FLAG
+                        | render_model::ACTOR_COLOR_MASK_MATERIAL_FLAG)
+                    != (render_model::LEGACY_COMBAT_MATERIAL_FLAG
+                        | render_model::ACTOR_COLOR_MASK_MATERIAL_FLAG),
+            alpha_to_coverage: self.msaa.samples() > 1
+                && state.alpha_test
+                && !state.blend
+                && !state.emissive
+                && self.material & render_model::ACTOR_COLOR_MASK_MATERIAL_FLAG == 0
+                && self.material & assets::EntityRenderMaterialState::KIND_MASK
+                    != assets::EntityRenderMaterial::Dragon as u32
+                && kind == assets::EntityRenderMaterial::Default,
+        }
+    }
+}
+
+impl SpecializerKey for ActorPipelineKey {
+    const IS_CANONICAL: bool = false;
+    type Canonical = ActorPipelineContract;
+}
+
+impl Specializer<RenderPipeline> for ActorPipelineSpecializer {
+    type Key = ActorPipelineKey;
+
+    fn specialize(
+        &self,
+        key: Self::Key,
+        descriptor: &mut RenderPipelineDescriptor,
+    ) -> Result<Canonical<Self::Key>, BevyError> {
+        let contract = key.contract();
+        descriptor.multisample.count = contract.msaa.samples();
+        crate::alpha_coverage::apply(descriptor, contract.alpha_to_coverage);
+        let state = crate::actor::material::state(key.material);
+        if let Some(state) = state {
+            descriptor.primitive.cull_mode = state
+                .cull
+                .then_some(bevy::render::render_resource::Face::Back);
+            descriptor
+                .depth_stencil
+                .as_mut()
+                .unwrap()
+                .depth_write_enabled = Some(state.depth_write);
+            descriptor.fragment.as_mut().unwrap().targets[0]
+                .as_mut()
+                .unwrap()
+                .blend = crate::actor::material::blend_state(state);
+        }
+        let kind = key.material & assets::EntityRenderMaterialState::KIND_MASK;
+        if !contract.write_alpha {
+            descriptor.fragment.as_mut().unwrap().targets[0]
+                .as_mut()
+                .unwrap()
+                .write_mask = ColorWrites::COLOR;
+        }
+        if !contract.write_color || kind == assets::EntityRenderMaterial::DissolveDepth as u32 {
+            descriptor.fragment.as_mut().unwrap().targets[0]
+                .as_mut()
+                .unwrap()
+                .write_mask = ColorWrites::empty();
+        }
+        if contract.depth_equal || kind == assets::EntityRenderMaterial::DissolveColor as u32 {
+            descriptor.depth_stencil.as_mut().unwrap().depth_compare = Some(CompareFunction::Equal);
+        }
+        if state.is_some_and(|state| state.depth_always) {
+            descriptor.depth_stencil.as_mut().unwrap().depth_compare =
+                Some(CompareFunction::Always);
+        }
+        let fragment = descriptor.fragment.as_mut().unwrap();
+        fragment.targets[0].as_mut().unwrap().format = contract.format;
+        // Sorted-pass spans share the transparent pass's gamma-encoded target.
+        if super::phase::sorted(key.material)
+            && crate::chunk::transparent::gamma_pass::admitted(key.hdr, key.msaa, key.enhanced)
+        {
+            fragment.shader_defs.push(bevy::shader::ShaderDefVal::Bool(
+                "ACTOR_GAMMA_BLEND".into(),
+                true,
+            ));
+        }
+        Ok(contract)
+    }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "release-manifest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+sha2.workspace = true
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std"] }
+update-manifest = { path = "../../crates/update-manifest" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

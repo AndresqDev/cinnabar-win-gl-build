@@ -1,0 +1,39 @@
+[package]
+name = "pack-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+bridge = { path = "../bridge" }
+pack-json = { path = "../pack-json" }
+assets = { path = "../assets" }
+image.workspace = true
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+pack-compile-input = { path = "../pack-compiler/input" }
+pack-entity-compiler = { path = "../pack-compiler/entity" }
+protocol = { path = "../protocol" }
+rayon.workspace = true
+resource-pack = { path = "../resource-pack" }
+serde_json = "1"
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+resource-pack = { path = "../resource-pack", features = ["test-support"] }
+block-transform = { path = "../block-transform" }
+sim = { path = "../sim" }
+json-ui = { path = "../json-ui" }
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+tempfile = "3"
+
+[lints]
+workspace = true

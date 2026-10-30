@@ -1,0 +1,291 @@
+//! A screen bound and laid out once per model: its resolved tree is kept per catalog and its
+//! layout until the data, view, viewport, physical pixel grid, language or texture metadata change.
+
+use std::sync::Arc;
+
+use json_ui::{
+    BindState, CachedLibrary, Catalog, CatalogLibrary, Context, DataSource, FormRender,
+    LayoutCacheKey, ResolveCache, ResolvedControl, ViewState, bind_incremental, rebind,
+    render_bound_cached, resolve_with_limits,
+};
+
+/// One screen's resolved tree per catalog and its last layout per model.
+#[derive(Default)]
+pub struct CachedScreen {
+    resolved: Option<ResolvedScreen>,
+    /// Factory and grid resolutions for the resolved catalog, kept across binds.
+    library: ResolveCache,
+    /// The screen's live bindings across data refreshes.
+    binding: BindState,
+    /// Fixed native grids retain their admission settings when the catalog changes.
+    virtual_grids: std::collections::BTreeMap<String, usize>,
+    laid: Option<Laid>,
+    measures: json_ui::MeasureCache,
+    /// Layout passes run after binding or display inputs change, for work regressions.
+    pub passes: usize,
+    /// Screens resolved on the frame rather than found prepared.
+    #[cfg(any(test, feature = "test-support"))]
+    pub resolves: usize,
+}
+
+struct ResolvedScreen {
+    reference: String,
+    catalog: Arc<Catalog>,
+    context: Context,
+    tree: Option<Arc<ResolvedControl>>,
+}
+
+struct Laid {
+    reference: String,
+    catalog: Arc<Catalog>,
+    data: Arc<DataSource>,
+    view: ViewState,
+    layout: LayoutCacheKey,
+    language: [usize; 3],
+    texture_metadata: u64,
+    render: FormRender,
+}
+
+impl CachedScreen {
+    /// Restricts binding and factory prototype resolution, invalidating old layout.
+    pub fn with_node_limit(mut self, limit: usize) -> Self {
+        self.binding = self.binding.with_node_limit(limit);
+        self.library = self.library.with_node_limit(self.binding.node_limit());
+        self.laid = None;
+        self.measures = json_ui::MeasureCache::default();
+        self
+    }
+
+    /// Opts one admitted native grid into bounded tile creation before its first bind.
+    pub fn virtualize_clipped_grid(&mut self, collection: &str, initial: usize) {
+        if self.virtual_grids.get(collection) == Some(&initial) {
+            return;
+        }
+        self.virtual_grids.insert(collection.to_owned(), initial);
+        self.binding.virtualize_clipped_grid(collection, initial);
+    }
+    /// Starts from a worker-resolved root belonging to this exact catalog and context.
+    pub fn from_resolved(
+        reference: &str,
+        catalog: Arc<Catalog>,
+        context: Context,
+        tree: Arc<ResolvedControl>,
+    ) -> Self {
+        Self {
+            resolved: Some(ResolvedScreen {
+                reference: reference.to_owned(),
+                catalog,
+                context,
+                tree: Some(tree),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Texture metadata participates in layout, including tiled sprite sizes.
+    pub fn invalidate_textures(&mut self) {
+        self.laid = None;
+        self.measures = json_ui::MeasureCache::default();
+    }
+
+    /// Whether the bound HUD has content for an extension to accompany.
+    pub fn has_visible_content(&self) -> bool {
+        self.laid.as_ref().is_some_and(|laid| {
+            laid.render
+                .nodes
+                .iter()
+                .any(|node| node.alpha > 0.0 && node.shown(&laid.view))
+        })
+    }
+
+    /// The laid-out screen for `data`, rebinding only when an input changed.
+    pub fn render(
+        &mut self,
+        reference: &str,
+        catalog: &Arc<Catalog>,
+        context: &Context,
+        data: Arc<DataSource>,
+        at: ([f64; 2], f32, [usize; 3]),
+        env: &json_ui::LayoutEnv,
+    ) -> Option<&FormRender> {
+        self.render_shared_with(
+            reference,
+            catalog,
+            context,
+            data,
+            at,
+            env,
+            &ViewState::default(),
+        )
+    }
+
+    /// [`Self::render`] under the caller's pointer, focus and scroll state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with(
+        &mut self,
+        reference: &str,
+        catalog: &Arc<Catalog>,
+        context: &Context,
+        data: DataSource,
+        (root, px, language): ([f64; 2], f32, [usize; 3]),
+        env: &json_ui::LayoutEnv,
+        view: &ViewState,
+    ) -> Option<&FormRender> {
+        self.render_shared_with(
+            reference,
+            catalog,
+            context,
+            Arc::new(data),
+            (root, px, language),
+            env,
+            view,
+        )
+    }
+
+    /// Reuse a controller revision without cloning or comparing all its bags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_shared_with(
+        &mut self,
+        reference: &str,
+        catalog: &Arc<Catalog>,
+        context: &Context,
+        data: Arc<DataSource>,
+        (root, px, language): ([f64; 2], f32, [usize; 3]),
+        env: &json_ui::LayoutEnv,
+        view: &ViewState,
+    ) -> Option<&FormRender> {
+        let texture_metadata = env.textures.metadata_revision();
+        let layout = LayoutCacheKey::new(root, px, env);
+        let fresh = self.laid.as_ref().is_some_and(|laid| {
+            !self.binding.has_pending_visibility()
+                && laid.reference == reference
+                && Arc::ptr_eq(&laid.catalog, catalog)
+                && laid.layout == layout
+                && laid.language == language
+                && laid.texture_metadata == texture_metadata
+                && self
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|resolved| resolved.context == *context)
+                && (Arc::ptr_eq(&laid.data, &data) || laid.data == data)
+                && laid.view == *view
+        });
+        if !fresh {
+            let current = self.resolved.as_ref().is_some_and(|resolved| {
+                resolved.reference == reference
+                    && Arc::ptr_eq(&resolved.catalog, catalog)
+                    && resolved.context == *context
+            });
+            if !current {
+                let found = crate::prepared::find(catalog, reference, context);
+                let tree = found.unwrap_or_else(|| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        self.resolves += 1;
+                    }
+                    resolve_with_limits(
+                        catalog,
+                        reference,
+                        context,
+                        usize::MAX,
+                        self.binding.node_limit(),
+                    )
+                    .control
+                    .map(Arc::new)
+                });
+                self.resolved = Some(ResolvedScreen {
+                    reference: reference.to_owned(),
+                    catalog: Arc::clone(catalog),
+                    context: context.clone(),
+                    tree,
+                });
+                self.library = ResolveCache::default().with_node_limit(self.binding.node_limit());
+                self.binding = BindState::new().with_node_limit(self.binding.node_limit());
+                for (name, initial) in &self.virtual_grids {
+                    self.binding.virtualize_clipped_grid(name, *initial);
+                }
+            }
+            let tree = self.resolved.as_ref()?.tree.as_ref()?;
+            let library = CachedLibrary {
+                library: CatalogLibrary { catalog, context },
+                cache: &self.library,
+            };
+            let previous = self.laid.take().filter(|_| current);
+            let same_frame = previous.as_ref().is_some_and(|laid| {
+                laid.layout == layout
+                    && laid.language == language
+                    && laid.texture_metadata == texture_metadata
+            });
+            let bound = match previous {
+                Some(mut laid) => {
+                    let mut bound = laid.render.bound;
+                    if !same_frame {
+                        self.measures = json_ui::MeasureCache::default();
+                    }
+                    let changed = rebind(
+                        tree,
+                        &data,
+                        &library,
+                        &mut self.binding,
+                        &mut bound,
+                        &mut self.measures,
+                    );
+                    if !changed && same_frame && laid.view == *view {
+                        laid.render.bound = bound;
+                        laid.data = data;
+                        self.laid = Some(laid);
+                        return self.laid.as_ref().map(|laid| &laid.render);
+                    }
+                    bound
+                }
+                None => {
+                    self.measures = json_ui::MeasureCache::default();
+                    bind_incremental(tree, &data, &library, &mut self.binding)
+                }
+            };
+            self.passes += 1;
+            let mut render = render_bound_cached(bound, root, env, view, &mut self.measures);
+            let mut grid_passes = 0;
+            while self.binding.show_grid_cells(&render.report) {
+                if grid_passes == 3 {
+                    return None;
+                }
+                grid_passes += 1;
+                let mut bound = render.bound;
+                rebind(
+                    tree,
+                    &data,
+                    &library,
+                    &mut self.binding,
+                    &mut bound,
+                    &mut self.measures,
+                );
+                render = render_bound_cached(bound, root, env, view, &mut self.measures);
+                self.passes += 1;
+            }
+            self.laid = Some(Laid {
+                reference: reference.to_owned(),
+                catalog: Arc::clone(catalog),
+                render,
+                data,
+                view: view.clone(),
+                layout,
+                language,
+                texture_metadata,
+            });
+        }
+        self.laid.as_ref().map(|laid| &laid.render)
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+impl CachedScreen {
+    /// The last laid-out draw nodes, in virtual px.
+    pub fn nodes(&self) -> &[json_ui::DrawNode] {
+        self.laid
+            .as_ref()
+            .map_or(&[], |laid| laid.render.nodes.as_ref())
+    }
+}

@@ -1,0 +1,585 @@
+//! Session-bound form authority and single-enqueue responses.
+#[cfg(test)]
+mod busy_tests;
+pub mod engine_focus;
+pub mod engine_input;
+pub mod engine_scroll;
+#[cfg(test)]
+mod settings_tests;
+pub mod shape_probe;
+#[cfg(test)]
+pub mod store_tests;
+pub mod values;
+use super::UiRuntime;
+use actor_animation::ActorLifetimeId;
+use protocol::{
+    CustomFormValue, FormKind, FormRequestEvent, ModalFormResponseSelection, NPC_DIALOGUE_FORM_ID,
+    NpcRequestKind, Packet, ServerFormModel, custom_form_submit_response, modal_form_busy_response,
+    modal_form_cancel_response, modal_form_submit_response, npc_request_packet,
+};
+use std::{collections::VecDeque, sync::Arc};
+pub use values::{FormEngineState, FormValue};
+
+/// How long an answered form remains visible while the server can hand off to the next form.
+///
+/// This is a presentation grace period only: the response is still queued immediately and the
+/// form cannot accept another input while it waits.
+pub const FORM_HANDOFF_GRACE_MILLIS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerFormIdentity {
+    pub session: u64,
+    pub form_id: u32,
+    pub revision: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerFormEntry {
+    pub identity: ServerFormIdentity,
+    pub form_id: u32,
+    pub kind: FormKind,
+    pub title: Option<Arc<str>>,
+    pub model: ServerFormModel,
+    fifo_sequence: u64,
+    npc_actor: Option<ActorLifetimeId>,
+}
+impl ServerFormEntry {
+    pub const fn fifo_sequence(&self) -> u64 {
+        self.fifo_sequence
+    }
+    /// Retains a protocol reply or local retirement until the response phase.
+    fn dismissal(&self) -> RetainedAnswer {
+        match &self.model {
+            ServerFormModel::NpcDialogue(npc) => RetainedAnswer::Npc {
+                actor: self.npc_actor,
+                scene_name: Arc::clone(&npc.scene_name),
+                request: NpcRequestKind::ExecuteClosingCommands,
+            },
+            _ if self.kind == FormKind::NpcDialogue => RetainedAnswer::DismissedLocally,
+            _ => RetainedAnswer::Dismissed,
+        }
+    }
+
+    /// Answerable buttons: menu buttons, or a modal's two.
+    pub fn button_count(&self) -> usize {
+        match &self.model {
+            ServerFormModel::TextMenu(menu) => menu.buttons.len(),
+            ServerFormModel::ElementMenu(menu) => menu.button_count(),
+            ServerFormModel::Modal(_) => 2,
+            ServerFormModel::NpcDialogue(npc) => npc.buttons.len(),
+            _ => 0,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalFormAction {
+    SubmitButton(u32),
+    Dismiss,
+    CustomElements,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormRespondError {
+    StaleIdentity,
+    PendingResponse,
+    InvalidButton,
+    UnsupportedControls,
+    CustomElementsUnsupported,
+}
+#[derive(Debug, Clone, PartialEq)]
+enum RetainedAnswer {
+    ButtonIndex(u32),
+    Modal(bool),
+    Custom(Arc<[CustomFormValue]>),
+    Npc {
+        actor: Option<ActorLifetimeId>,
+        scene_name: Arc<str>,
+        request: NpcRequestKind,
+    },
+    Dismissed,
+    /// Holds input until the response phase without sending a packet.
+    DismissedLocally,
+    Busy,
+}
+#[derive(Debug, Clone, PartialEq)]
+struct PendingFormResponse {
+    identity: ServerFormIdentity,
+    answer: RetainedAnswer,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormTransportError {
+    /// The queue definitely did not accept the packet: safe to retry.
+    Full,
+    /// Closed is not a delivery acknowledgement and must not retry.
+    Closed,
+}
+/// A settings controller kept alive while another settings tab is selected.
+#[derive(Debug, Clone)]
+struct ParkedSettingsForm {
+    entry: ServerFormEntry,
+    engine: FormEngineState,
+    focus: usize,
+    scroll: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ServerFormStore {
+    active: Option<ServerFormEntry>,
+    pending: VecDeque<PendingFormResponse>,
+    busy: VecDeque<PendingFormResponse>,
+    next_revision: u64,
+    replaced_by_reissue: u64,
+    watched_dimension: Option<i32>,
+    watched_epoch: Option<(u64, u64)>,
+    focus: usize,
+    scroll: usize,
+    engine: FormEngineState,
+    /// The settings screen already asked the server for its settings form.
+    settings_requested: bool,
+    /// Latest settings reply, retained without taking input from another tab.
+    settings_form: Option<ParkedSettingsForm>,
+    settings_open: bool,
+    settings_selected: bool,
+    /// Keeps an answered form rendered until the server either sends its replacement or the
+    /// short handoff grace period expires.
+    handoff_deadline_millis: Option<u64>,
+}
+impl ServerFormStore {
+    /// Retires forms and responses while preserving revision and reissue accounting.
+    pub(super) fn next_session(&self) -> Self {
+        Self {
+            next_revision: self.next_revision,
+            replaced_by_reissue: self.replaced_by_reissue,
+            ..Self::default()
+        }
+    }
+
+    pub fn admit(
+        &mut self,
+        event: FormRequestEvent,
+        fifo_sequence: u64,
+        session: u64,
+        other_ui: bool,
+    ) {
+        shape_probe::observe(&event);
+        self.next_revision = self.next_revision.saturating_add(1);
+        let identity = ServerFormIdentity {
+            session,
+            form_id: event.form_id,
+            revision: self.next_revision,
+        };
+        // NPC changes update one dialogue rather than creating another modal request.
+        if event.kind == FormKind::NpcDialogue {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|entry| entry.form_id == event.form_id)
+            {
+                self.handoff_deadline_millis = None;
+                self.active = None;
+                self.engine = FormEngineState::default();
+                self.replaced_by_reissue = self.replaced_by_reissue.saturating_add(1);
+            }
+            self.pending
+                .retain(|response| response.identity.form_id != event.form_id);
+        }
+        // The server closing an NPC dialogue only takes it down.
+        if matches!(&event.model, ServerFormModel::NpcDialogue(npc) if !npc.open) {
+            return;
+        }
+        let entry = ServerFormEntry {
+            identity,
+            form_id: event.form_id,
+            kind: event.kind,
+            title: event.title,
+            model: event.model,
+            fifo_sequence,
+            npc_actor: None,
+        };
+        let replacing_handoff = !other_ui && self.handoff_deadline_millis.take().is_some();
+        if replacing_handoff {
+            self.active = None;
+            self.engine = FormEngineState::default();
+        }
+        if entry.kind == FormKind::ServerSettings {
+            // A new reply updates this controller, never an earlier unsent answer.
+            if self.settings_form_active() {
+                self.handoff_deadline_millis = None;
+                self.active = None;
+                self.engine = FormEngineState::default();
+            }
+            self.settings_form = Some(ParkedSettingsForm {
+                engine: FormEngineState::for_model(&entry.model),
+                entry,
+                focus: 0,
+                scroll: 0,
+            });
+            self.select_settings_form(self.settings_selected);
+            return;
+        }
+        if !replacing_handoff && (other_ui || self.active.is_some() || !self.pending.is_empty()) {
+            // An NPC dialogue has no busy answer; it is simply not shown.
+            if entry.form_id == NPC_DIALOGUE_FORM_ID {
+                return;
+            }
+            self.busy.push_back(PendingFormResponse {
+                identity,
+                answer: RetainedAnswer::Busy,
+            });
+            return;
+        }
+        self.focus = 0;
+        self.scroll = 0;
+        self.engine = FormEngineState::for_model(&entry.model);
+        self.active = Some(entry);
+    }
+    /// Binds the admitted dialogue to its original actor lifetime, before local input.
+    pub fn bind_npc_actor(&mut self, identity: ServerFormIdentity, actor: ActorLifetimeId) {
+        if let Some(entry) = self.active.as_mut().filter(|entry| {
+            entry.identity == identity && matches!(entry.model, ServerFormModel::NpcDialogue(_))
+        }) {
+            entry.npc_actor = Some(actor);
+        }
+    }
+    pub fn active(&self) -> Option<&ServerFormEntry> {
+        self.active.as_ref()
+    }
+    pub fn entries(&self) -> impl Iterator<Item = &ServerFormEntry> {
+        self.active.iter()
+    }
+    pub fn get(&self, form_id: u32) -> Option<&ServerFormEntry> {
+        self.active
+            .as_ref()
+            .filter(|entry| entry.form_id == form_id)
+    }
+    /// A server settings form is up; it draws and takes input over the menu.
+    pub fn settings_form_active(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|entry| entry.kind == FormKind::ServerSettings)
+    }
+    pub fn owns_input(&self) -> bool {
+        self.active.is_some() || !self.pending.is_empty()
+    }
+    /// Whether the last answer is waiting for a possible server-form handoff.
+    pub fn handoff_pending(&self) -> bool {
+        self.handoff_deadline_millis.is_some()
+    }
+    /// Expires an unanswered visual handoff without touching its already queued response.
+    pub fn advance_form_handoff(&mut self, now_millis: u64) -> bool {
+        if self
+            .handoff_deadline_millis
+            .is_some_and(|deadline| now_millis >= deadline)
+        {
+            self.handoff_deadline_millis = None;
+            self.active = None;
+            self.engine = FormEngineState::default();
+            true
+        } else {
+            false
+        }
+    }
+    pub const fn focus(&self) -> usize {
+        self.focus
+    }
+    pub const fn scroll(&self) -> usize {
+        self.scroll
+    }
+    pub fn move_focus(&mut self, delta: i32) {
+        let Some(entry) = self.active.as_ref() else {
+            return;
+        };
+        let count = entry.button_count() + 1;
+        self.focus = (self.focus as i64 + i64::from(delta)).rem_euclid(count as i64) as usize;
+    }
+    pub fn scroll_rows(&mut self, delta: i32) {
+        self.scroll = (self.scroll as i64 + i64::from(delta)).clamp(0, 1 << 20) as usize;
+    }
+    pub fn set_scroll(&mut self, offset: usize) {
+        self.scroll = offset.min(1 << 20);
+    }
+    /// The JSON-UI path's live interaction state and custom-form values.
+    pub const fn engine(&self) -> &FormEngineState {
+        &self.engine
+    }
+    pub fn engine_mut(&mut self) -> &mut FormEngineState {
+        &mut self.engine
+    }
+    /// Retires an active NPC through its closing protocol when another menu takes ownership.
+    /// Ordinary forms retain one busy response per rejected request.
+    pub fn reject_active_busy(&mut self) {
+        if self.handoff_deadline_millis.take().is_some() {
+            // The answer is already retained in `pending`; a menu taking the screen must not
+            // manufacture a second busy response for the form kept visible during handoff.
+            self.active = None;
+            self.engine = FormEngineState::default();
+            return;
+        }
+        if let Some(entry) = self.active.take() {
+            if entry.kind == FormKind::NpcDialogue {
+                self.pending.push_back(PendingFormResponse {
+                    identity: entry.identity,
+                    answer: entry.dismissal(),
+                });
+                self.engine = FormEngineState::default();
+                return;
+            }
+            self.busy.push_back(PendingFormResponse {
+                identity: entry.identity,
+                answer: RetainedAnswer::Busy,
+            });
+        }
+    }
+    pub fn respond(
+        &mut self,
+        identity: ServerFormIdentity,
+        action: LocalFormAction,
+    ) -> Result<(), FormRespondError> {
+        self.respond_inner(identity, action, None)
+    }
+    /// Answers a form while retaining its rendered surface for a possible next form.
+    pub fn respond_at(
+        &mut self,
+        identity: ServerFormIdentity,
+        action: LocalFormAction,
+        now_millis: u64,
+    ) -> Result<(), FormRespondError> {
+        self.respond_inner(identity, action, Some(now_millis))
+    }
+    /// Retains one answer and optionally keeps its surface for a replacement.
+    fn respond_inner(
+        &mut self,
+        identity: ServerFormIdentity,
+        action: LocalFormAction,
+        now_millis: Option<u64>,
+    ) -> Result<(), FormRespondError> {
+        if !self.pending.is_empty() || self.handoff_pending() {
+            return Err(FormRespondError::PendingResponse);
+        }
+        let handoff = now_millis.is_some()
+            && matches!(
+                action,
+                LocalFormAction::SubmitButton(_) | LocalFormAction::CustomElements
+            );
+        let entry = self
+            .active
+            .as_ref()
+            .filter(|entry| entry.identity == identity)
+            .ok_or(FormRespondError::StaleIdentity)?;
+        let answer = match action {
+            LocalFormAction::CustomElements => match &entry.model {
+                ServerFormModel::Custom(_) => RetainedAnswer::Custom(self.engine.submission()),
+                _ => return Err(FormRespondError::CustomElementsUnsupported),
+            },
+            LocalFormAction::Dismiss
+                if entry.kind == FormKind::ServerSettings
+                    && matches!(entry.model, ServerFormModel::Custom(_)) =>
+            {
+                RetainedAnswer::Custom(self.engine.submission())
+            }
+            LocalFormAction::Dismiss => entry.dismissal(),
+            LocalFormAction::SubmitButton(index) => match &entry.model {
+                ServerFormModel::NpcDialogue(npc) => {
+                    let button = npc
+                        .buttons
+                        .get(index as usize)
+                        .ok_or(FormRespondError::InvalidButton)?;
+                    RetainedAnswer::Npc {
+                        actor: entry.npc_actor,
+                        scene_name: Arc::clone(&npc.scene_name),
+                        request: NpcRequestKind::ExecuteAction(button.action_index),
+                    }
+                }
+                ServerFormModel::TextMenu(_)
+                | ServerFormModel::ElementMenu(_)
+                | ServerFormModel::Modal(_) => {
+                    if index as usize >= entry.button_count() {
+                        return Err(FormRespondError::InvalidButton);
+                    }
+                    match entry.model {
+                        // button1 answers true, button2 false.
+                        ServerFormModel::Modal(_) => RetainedAnswer::Modal(index == 0),
+                        _ => RetainedAnswer::ButtonIndex(index),
+                    }
+                }
+                _ => return Err(FormRespondError::UnsupportedControls),
+            },
+        };
+        self.pending
+            .push_back(PendingFormResponse { identity, answer });
+        if handoff {
+            self.handoff_deadline_millis =
+                now_millis.map(|now| now.saturating_add(FORM_HANDOFF_GRACE_MILLIS));
+        } else {
+            self.handoff_deadline_millis = None;
+            self.active = None;
+            self.engine = FormEngineState::default();
+        }
+        Ok(())
+    }
+    pub fn note_stream_dimension(&mut self, dimension: i32) {
+        if self
+            .watched_dimension
+            .is_some_and(|previous| previous != dimension)
+        {
+            self.clear();
+        }
+        self.watched_dimension = Some(dimension);
+    }
+    pub fn synchronize_epoch(&mut self, session: u64, dimension_epoch: u64) {
+        let identity = (session, dimension_epoch);
+        if self.watched_epoch != Some(identity) {
+            self.clear();
+            self.watched_epoch = Some(identity);
+        }
+    }
+    pub fn clear(&mut self) {
+        self.active = None;
+        self.pending.clear();
+        self.busy.clear();
+        self.watched_dimension = None;
+        self.watched_epoch = None;
+        self.focus = 0;
+        self.scroll = 0;
+        self.engine = FormEngineState::default();
+        self.handoff_deadline_millis = None;
+        self.settings_form = None;
+        self.settings_open = false;
+        self.settings_selected = false;
+        self.settings_requested = false;
+    }
+    pub const fn replaced_by_reissue(&self) -> u64 {
+        self.replaced_by_reissue
+    }
+    pub fn queued_busy_count(&self) -> usize {
+        self.busy.len()
+    }
+}
+/// Builds a retained reply only while its original NPC actor is still alive.
+fn pending_packet(
+    pending: &PendingFormResponse,
+    npc_is_alive: &mut impl FnMut(ActorLifetimeId) -> bool,
+) -> Option<Packet> {
+    Some(match &pending.answer {
+        RetainedAnswer::ButtonIndex(index) => modal_form_submit_response(
+            pending.identity.form_id,
+            ModalFormResponseSelection::ButtonIndex(*index),
+        ),
+        RetainedAnswer::Modal(choice) => modal_form_submit_response(
+            pending.identity.form_id,
+            ModalFormResponseSelection::ModalButton(*choice),
+        ),
+        RetainedAnswer::Npc {
+            actor,
+            scene_name,
+            request,
+        } => {
+            let actor = (*actor).filter(|actor| npc_is_alive(*actor))?;
+            npc_request_packet(actor.runtime_id, scene_name, *request)
+        }
+        RetainedAnswer::Custom(values) => {
+            custom_form_submit_response(pending.identity.form_id, values)
+        }
+        RetainedAnswer::Dismissed => modal_form_cancel_response(pending.identity.form_id),
+        RetainedAnswer::DismissedLocally => return None,
+        RetainedAnswer::Busy => modal_form_busy_response(pending.identity.form_id),
+    })
+}
+/// Drains every due response, the local answer first, and returns whether any was sent.
+/// Accepted enqueue is consumed once, never retried on an uncertain later delivery failure.
+/// NPC replies revalidate their bound actor on every attempt and retire locally after actor loss.
+pub fn flush_form_response(
+    runtime: &mut UiRuntime,
+    mut npc_is_alive: impl FnMut(ActorLifetimeId) -> bool,
+    mut send: impl FnMut(Packet) -> Result<(), FormTransportError>,
+) -> Result<bool, FormTransportError> {
+    let session = runtime.session_id();
+    let store = runtime.server_forms_mut();
+    let mut sent = false;
+    loop {
+        let local = !store.pending.is_empty();
+        let Some(pending) = store.pending.pop_front().or_else(|| store.busy.pop_front()) else {
+            return Ok(sent);
+        };
+        if pending.identity.session != session {
+            continue;
+        }
+        let Some(packet) = pending_packet(&pending, &mut npc_is_alive) else {
+            continue;
+        };
+        match send(packet) {
+            Ok(()) => sent = true,
+            Err(FormTransportError::Full) => {
+                if local {
+                    store.pending.push_front(pending);
+                } else {
+                    store.busy.push_front(pending);
+                }
+                return Err(FormTransportError::Full);
+            }
+            Err(FormTransportError::Closed) => {
+                store.clear();
+                return Err(FormTransportError::Closed);
+            }
+        }
+    }
+}
+
+impl ServerFormStore {
+    /// Shows the same draft when returning to the server tab without ending its controller.
+    pub fn select_settings_form(&mut self, selected: bool) {
+        self.settings_selected = selected;
+        if !selected && self.settings_form_active() {
+            if self.handoff_deadline_millis.take().is_some() {
+                self.active = None;
+                self.engine = FormEngineState::default();
+            } else {
+                self.settings_form = Some(ParkedSettingsForm {
+                    entry: self.active.take().unwrap(),
+                    engine: std::mem::take(&mut self.engine),
+                    focus: self.focus,
+                    scroll: self.scroll,
+                });
+            }
+        } else if selected
+            && self.active.is_none()
+            && self.pending.is_empty()
+            && let Some(draft) = self.settings_form.take()
+        {
+            self.active = Some(draft.entry);
+            self.engine = draft.engine;
+            self.focus = draft.focus;
+            self.scroll = draft.scroll;
+        }
+    }
+
+    /// Retains this controller's final values once, including when its tab is hidden.
+    fn terminate_settings_form(&mut self) {
+        self.select_settings_form(false);
+        if let Some(draft) = self.settings_form.take() {
+            let answer = if matches!(draft.entry.model, ServerFormModel::Custom(_)) {
+                RetainedAnswer::Custom(draft.engine.submission())
+            } else {
+                draft.entry.dismissal()
+            };
+            self.pending.push_back(PendingFormResponse {
+                identity: draft.entry.identity,
+                answer,
+            });
+        }
+    }
+
+    /// Tracks the settings controller's lifetime and retries its initial request until accepted.
+    pub fn flush_settings_request(&mut self, in_settings: bool, send: impl FnOnce() -> bool) {
+        if !in_settings {
+            if self.settings_open {
+                self.terminate_settings_form();
+            }
+            self.settings_open = false;
+            self.settings_requested = false;
+        } else {
+            self.settings_open = true;
+            if !self.settings_requested && send() {
+                self.settings_requested = true;
+            }
+        }
+    }
+}

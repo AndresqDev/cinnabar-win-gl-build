@@ -1,0 +1,401 @@
+//! Flat category rows and group dividers in the independently scrolling settings sidebar.
+
+use super::super::focus;
+use super::super::motion::Kind;
+use super::super::paint::{Bounds, Canvas};
+use super::super::sidebar::background as row_background;
+use super::super::theme::{self, BODY, CAPTION, EDGE, NEUTRAL80, TEXT, TEXT_DIMMER};
+use super::{localization, section_index};
+use crate::images::{SETTINGS_ICON_HIGHLIGHT_IMAGE, SETTINGS_ICONS};
+use launcher::menu::view::SettingsFocusAxis;
+use launcher::menu::{MenuAction, MenuView};
+use ui::IconRef;
+use ui_engine::engine::screen::PaintError;
+use ui_engine::engine::screen::Translate;
+
+/// Height of one group label, excluding its divider.
+const GROUP_HEIGHT: f32 = 4.8;
+
+/// One sidebar category; installed `art` is drawn when present, else the pixel `fill` and
+/// `glyph`.
+struct Tab {
+    section: &'static str,
+    title: &'static str,
+    /// The group heading drawn above this category.
+    group: Option<&'static str>,
+    art: Option<&'static str>,
+    fill: [u8; 4],
+    glyph: Glyph,
+}
+
+#[derive(Clone, Copy)]
+enum Glyph {
+    Grid,
+    Person,
+    Mouse,
+    Gamepad,
+    Landscape,
+    Face,
+    Chest,
+    Shelves,
+    Puzzle,
+    Chat,
+    Discord,
+    Download,
+}
+
+/// Adds OreUI artwork to the shared section metadata.
+const fn tab(section: launcher::menu::settings_sections::SettingSection) -> Tab {
+    use launcher::menu::settings_sections::SettingSection::*;
+    let (art, fill, glyph, group) = match section {
+        Accessibility => (Some(SETTINGS_ICONS[0]), [65, 99, 216], Glyph::Person, None),
+        KeyboardAndMouse => (
+            Some(SETTINGS_ICONS[1]),
+            [147, 145, 132],
+            Glyph::Mouse,
+            Some("options.group.input"),
+        ),
+        ControllerAndSwitch => (
+            Some(SETTINGS_ICONS[2]),
+            [147, 145, 132],
+            Glyph::Gamepad,
+            None,
+        ),
+        Touch => (Some(SETTINGS_ICONS[3]), [147, 145, 132], Glyph::Grid, None),
+        Chat => (None, [74, 144, 226], Glyph::Chat, Some("options.social")),
+        Discord => (None, [88, 101, 242], Glyph::Discord, None),
+        General => (
+            Some(SETTINGS_ICONS[4]),
+            [152, 100, 50],
+            Glyph::Grid,
+            Some("options.general"),
+        ),
+        Updates => (None, [64, 113, 78], Glyph::Download, None),
+        Game => (
+            None,
+            [97, 141, 64],
+            Glyph::Gamepad,
+            Some("realmsSettingsScreen.worldSectionTitle"),
+        ),
+        Video => (
+            Some(SETTINGS_ICONS[5]),
+            [193, 142, 62],
+            Glyph::Landscape,
+            None,
+        ),
+        Sound => (Some(SETTINGS_ICONS[6]), [141, 90, 59], Glyph::Grid, None),
+        Account => (Some(SETTINGS_ICONS[7]), [121, 76, 45], Glyph::Face, None),
+        GlobalTexturePack => (Some(SETTINGS_ICONS[8]), [159, 108, 44], Glyph::Chest, None),
+        Shaders => (None, [193, 142, 62], Glyph::Landscape, None),
+        Mods => (None, [112, 76, 160], Glyph::Puzzle, None),
+        StorageManagement => (
+            Some(SETTINGS_ICONS[9]),
+            [141, 126, 73],
+            Glyph::Shelves,
+            None,
+        ),
+        Language => (Some(SETTINGS_ICONS[10]), [55, 110, 187], Glyph::Grid, None),
+        Creator => (Some(SETTINGS_ICONS[11]), [159, 105, 65], Glyph::Grid, None),
+        Server => (None, [65, 99, 216], Glyph::Grid, None),
+        _ => panic!("visible settings section needs artwork"),
+    };
+    let definition = section.definition();
+    Tab {
+        section: definition.name,
+        title: match definition.tab_title {
+            Some(title) => title,
+            None => panic!("sidebar section needs a title"),
+        },
+        group,
+        art,
+        fill: [fill[0], fill[1], fill[2], 255],
+        glyph,
+    }
+}
+
+/// Follows the shared registry's visible sections and order.
+const fn tabs() -> [Tab; launcher::menu::settings_sections::SETTINGS_TABS.len()] {
+    use launcher::menu::settings_sections::{SECTION_DEFINITIONS, SettingSection};
+    let mut tabs = [const { tab(SettingSection::Accessibility) };
+        launcher::menu::settings_sections::SETTINGS_TABS.len()];
+    let mut index = 0;
+    let mut row = 0;
+    while index < SECTION_DEFINITIONS.len() {
+        let definition = SECTION_DEFINITIONS[index];
+        if definition.tab_title.is_some() {
+            tabs[row] = tab(definition.id);
+            row += 1;
+        }
+        index += 1;
+    }
+    tabs
+}
+
+const TABS: [Tab; launcher::menu::settings_sections::SETTINGS_TABS.len()] = tabs();
+
+/// The category whose icon is the signed-in player's gamerpic.
+const ACCOUNT: &str = "account_forced_index";
+
+#[cfg(test)]
+mod tests;
+
+pub(super) fn draw(
+    canvas: &mut Canvas<'_>,
+    view: &MenuView,
+    b: Bounds,
+    translate: Translate<'_>,
+    gamerpic: Option<IconRef>,
+) -> Result<(), PaintError> {
+    let panel = [b[0], b[1], b[2] - canvas.r(1.6), b[3]];
+    canvas.fill(panel, NEUTRAL80.fill)?;
+    canvas.frame(panel, EDGE, theme::BORDER)?;
+    let edge = canvas.r(EDGE);
+    let viewport = [b[0] + edge, b[1] + edge, b[2] - edge, b[3]];
+    let sidebar_focus = canvas.begin_focus_region(focus::SIDEBAR, b, None, false)?;
+    let sidebar_scroll_focus = canvas.begin_focus_region(
+        focus::SIDEBAR_SCROLL,
+        viewport,
+        Some(SettingsFocusAxis::Vertical),
+        true,
+    )?;
+    canvas.focus_delegate(
+        Some(MenuAction::SettingsSection(if view.settings.section == 0 {
+            section_index(TABS[0].section)
+        } else {
+            view.settings.section
+        })),
+        None,
+    );
+    let right = viewport[2] - canvas.r(1.6);
+    let width = (right - viewport[0] - canvas.r(6.4)).max(1.0);
+    let tabs: Vec<_> = TABS
+        .iter()
+        .filter(|tab| {
+            launcher::menu::settings_sections::SettingSection::from_name(tab.section)
+                .is_some_and(|section| view.settings_section_shown(section))
+        })
+        .collect();
+    let labels: Vec<_> = tabs
+        .iter()
+        .map(|Tab { title: key, .. }| {
+            localization::word(key, view.settings_options.language(), translate)
+        })
+        .collect();
+    let heights: Vec<_> = labels
+        .iter()
+        .map(|label| {
+            canvas
+                .measure_height(label, width, BODY)
+                .map(|height| canvas.r(4.8).max(height + canvas.r(1.6)))
+        })
+        .collect::<Result<_, _>>()?;
+    let groups = tabs.iter().filter(|tab| tab.group.is_some()).count() as f32;
+    let content = heights.iter().sum::<f32>() + canvas.r(1.6 + groups * (GROUP_HEIGHT + EDGE));
+    let max = (content - (viewport[3] - viewport[1])).max(0.0);
+    let key = "oreui_settings_sidebar";
+    if let Some(offset) = canvas.offsets.get_mut(key) {
+        *offset = offset.min(max);
+    }
+    let scroll = canvas.begin_scroll(key, viewport)?;
+    let mut y = viewport[1] + canvas.r(1.6) - scroll.offset;
+    let mut focused_outline = None;
+    for (index, (tab, label)) in tabs.iter().zip(&labels).enumerate() {
+        let selector = tab.section;
+        if let Some(group) = tab.group {
+            let text = localization::word(group, view.settings_options.language(), translate);
+            y = group_label(canvas, &text, [viewport[0], right], y)?;
+        }
+        let action = MenuAction::SettingsSection(section_index(selector));
+        let mut state = canvas.interaction(view, Some(action));
+        state.pressed &= state.hovered;
+        let selected = view.settings.section == section_index(selector)
+            || view.settings.section == 0 && index == 0;
+        let row = [viewport[0], y, right, y + heights[index]];
+        let motion = canvas.feedback(state, true, selected, Kind::Surface);
+        row_background(canvas, row, motion)?;
+        if state.focused {
+            let overlap = canvas.r(if selected || state.hovered { 0.4 } else { EDGE });
+            focused_outline = Some([row[0], row[1] - overlap, row[2], row[3] + overlap]);
+        }
+        let side = super::super::icons::native_side(canvas);
+        let at = [row[0] + canvas.r(1.6), (row[1] + row[3] - side) * 0.5];
+        let icon_bounds = [at[0], at[1], at[0] + side, at[1] + side];
+        if selector != ACCOUNT || !super::account_icon::draw(canvas, view, icon_bounds, gamerpic)? {
+            icon(canvas, tab, at)?;
+        }
+        if let Some(frame) = canvas
+            .transitions
+            .as_deref()
+            .and_then(|transitions| transitions.icon_frame(section_index(selector)))
+        {
+            canvas.sprite_frame(
+                SETTINGS_ICON_HIGHLIGHT_IMAGE,
+                [at[0], at[1], at[0] + side, at[1] + side],
+                [255; 4],
+                frame,
+                super::super::transitions::ICON_HIGHLIGHT_FRAMES,
+            )?;
+        }
+        let left = at[0] + side + canvas.r(0.8);
+        let text_height = canvas.measure_height(label, width, BODY)?;
+        canvas.text(
+            label,
+            [left, (row[1] + row[3] - text_height) * 0.5],
+            width,
+            BODY,
+            TEXT,
+            false,
+        )?;
+        canvas.hit(action, row)?;
+        y = row[3];
+    }
+    if let Some(bounds) = focused_outline {
+        canvas.frame(bounds, EDGE, theme::OUTLINE)?;
+    }
+    canvas.end_scroll(scroll, content)?;
+    canvas.end_focus_region(sidebar_scroll_focus);
+    canvas.end_focus_region(sidebar_focus);
+    Ok(())
+}
+
+fn group_label(
+    canvas: &mut Canvas<'_>,
+    label: &str,
+    span: [f32; 2],
+    top: f32,
+) -> Result<f32, PaintError> {
+    let bottom = top + canvas.r(GROUP_HEIGHT);
+    let edge = canvas.r(EDGE);
+    let pad = canvas.r(1.6);
+    canvas.text_line(
+        label,
+        [span[0] + pad, bottom - canvas.r(0.8 + CAPTION.line)],
+        (span[1] - span[0] - pad * 2.0).max(1.0),
+        CAPTION,
+        TEXT_DIMMER,
+    )?;
+    canvas.fill(
+        [span[0], bottom - edge, span[1], bottom],
+        NEUTRAL80.specular[1],
+    )?;
+    canvas.fill(
+        [span[0], bottom, span[1], bottom + edge],
+        NEUTRAL80.specular[0],
+    )?;
+    Ok(bottom + edge)
+}
+
+fn icon(canvas: &mut Canvas<'_>, tab: &Tab, at: [f32; 2]) -> Result<(), PaintError> {
+    let side = super::super::icons::native_side(canvas);
+    let b = [at[0], at[1], at[0] + side, at[1] + side];
+    if let Some(art) = tab.art
+        && canvas.sprite(art, b, [255; 4])?
+    {
+        return Ok(());
+    }
+    let pixel = side / 16.0;
+    let mut block = |x: f32, y: f32, w: f32, h: f32, color| {
+        canvas.fill(
+            [
+                at[0] + x * pixel,
+                at[1] + y * pixel,
+                at[0] + (x + w) * pixel,
+                at[1] + (y + h) * pixel,
+            ],
+            color,
+        )
+    };
+    block(0.0, 0.0, 16.0, 16.0, theme::BORDER)?;
+    block(1.0, 1.0, 14.0, 14.0, tab.fill)?;
+    match tab.glyph {
+        Glyph::Person => {
+            block(5.0, 2.0, 6.0, 5.0, TEXT)?;
+            block(3.0, 8.0, 10.0, 2.0, TEXT)?;
+            block(7.0, 8.0, 2.0, 6.0, TEXT)?;
+            block(4.0, 11.0, 2.0, 3.0, TEXT)?;
+            block(10.0, 11.0, 2.0, 3.0, TEXT)?;
+        }
+        Glyph::Mouse => {
+            block(5.0, 2.0, 6.0, 12.0, theme::BORDER)?;
+            block(6.0, 3.0, 4.0, 8.0, [208, 209, 212, 255])?;
+            block(7.0, 3.0, 2.0, 3.0, tab.fill)?;
+        }
+        Glyph::Gamepad => {
+            block(3.0, 4.0, 10.0, 8.0, theme::BORDER)?;
+            block(4.0, 5.0, 8.0, 6.0, [178, 175, 160, 255])?;
+            block(5.0, 6.0, 1.0, 3.0, theme::BORDER)?;
+            block(4.0, 7.0, 3.0, 1.0, theme::BORDER)?;
+            block(10.0, 6.0, 1.0, 1.0, theme::BORDER)?;
+            block(11.0, 8.0, 1.0, 1.0, theme::BORDER)?;
+        }
+        Glyph::Landscape => {
+            block(2.0, 2.0, 12.0, 11.0, [99, 169, 218, 255])?;
+            block(3.0, 3.0, 4.0, 4.0, [255, 230, 122, 255])?;
+            block(3.0, 10.0, 10.0, 3.0, [97, 141, 64, 255])?;
+            block(7.0, 7.0, 3.0, 5.0, [97, 141, 64, 255])?;
+        }
+        Glyph::Face => {
+            block(3.0, 2.0, 10.0, 5.0, [64, 44, 35, 255])?;
+            block(3.0, 7.0, 10.0, 7.0, [178, 129, 94, 255])?;
+            block(4.0, 8.0, 3.0, 2.0, TEXT)?;
+            block(9.0, 8.0, 3.0, 2.0, TEXT)?;
+            block(5.0, 8.0, 1.0, 2.0, [63, 90, 174, 255])?;
+            block(10.0, 8.0, 1.0, 2.0, [63, 90, 174, 255])?;
+            block(5.0, 12.0, 6.0, 2.0, [74, 45, 30, 255])?;
+        }
+        Glyph::Chest => {
+            block(2.0, 7.0, 12.0, 2.0, theme::BORDER)?;
+            block(7.0, 6.0, 2.0, 5.0, [216, 208, 177, 255])?;
+        }
+        Glyph::Shelves => {
+            for row in [3.0, 7.0, 11.0] {
+                block(2.0, row, 12.0, 2.0, [185, 166, 98, 255])?;
+            }
+        }
+        Glyph::Puzzle => {
+            block(3.0, 5.0, 8.0, 8.0, TEXT)?;
+            block(6.0, 3.0, 2.0, 2.0, TEXT)?;
+            block(11.0, 8.0, 2.0, 2.0, TEXT)?;
+        }
+        Glyph::Chat => {
+            block(2.0, 3.0, 12.0, 7.0, theme::BORDER)?;
+            block(3.0, 4.0, 10.0, 5.0, [230, 230, 230, 255])?;
+            block(4.0, 10.0, 4.0, 2.0, theme::BORDER)?;
+            block(4.0, 10.0, 2.0, 1.0, [230, 230, 230, 255])?;
+        }
+        Glyph::Discord => {
+            block(3.0, 4.0, 10.0, 9.0, TEXT)?;
+            block(2.0, 6.0, 2.0, 5.0, TEXT)?;
+            block(4.0, 3.0, 2.0, 2.0, TEXT)?;
+            block(10.0, 3.0, 2.0, 2.0, TEXT)?;
+            block(5.0, 7.0, 2.0, 2.0, tab.fill)?;
+            block(9.0, 7.0, 2.0, 2.0, tab.fill)?;
+            block(4.0, 13.0, 2.0, 1.0, TEXT)?;
+            block(10.0, 13.0, 2.0, 1.0, TEXT)?;
+        }
+        Glyph::Download => {
+            block(7.0, 2.0, 2.0, 7.0, TEXT)?;
+            block(4.0, 6.0, 2.0, 2.0, TEXT)?;
+            block(10.0, 6.0, 2.0, 2.0, TEXT)?;
+            block(6.0, 8.0, 4.0, 2.0, TEXT)?;
+            block(7.0, 10.0, 2.0, 1.0, TEXT)?;
+            block(3.0, 10.0, 2.0, 2.0, TEXT)?;
+            block(11.0, 10.0, 2.0, 2.0, TEXT)?;
+            block(3.0, 12.0, 10.0, 2.0, TEXT)?;
+        }
+        Glyph::Grid => {
+            for row in 0..3 {
+                for column in 0..3 {
+                    block(
+                        3.0 + column as f32 * 4.0,
+                        3.0 + row as f32 * 4.0,
+                        2.0,
+                        2.0,
+                        theme::BORDER,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}

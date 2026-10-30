@@ -1,0 +1,294 @@
+//! Authoritative local-player facts shared by gameplay and UI projections.
+//!
+//! Callers apply committed game modes, hunger and mount changes only after their
+//! shared session/FIFO guard accepts the event. Abilities retain their separate
+//! bootstrap binding and sequence fence. Equipment stays in the inventory ledger.
+
+use protocol::{ActorAttribute, GameModeUpdate, PlayerGameMode};
+
+use crate::game_mode_capabilities::GameModeCapabilities;
+
+mod abilities;
+mod instabuild;
+mod stat;
+
+pub use stat::LocalPlayerStat;
+
+/// Session state consumed synchronously by movement and presentation.
+#[derive(Clone, Debug, Default)]
+pub struct LocalPlayerFacts {
+    session_id: u64,
+    local_abilities: abilities::LocalAbilities,
+    instabuild: instabuild::InstabuildLayers,
+    player_game_mode: Option<PlayerGameMode>,
+    world_default_game_mode: Option<PlayerGameMode>,
+    player_mode_from_default: bool,
+    server_authoritative_block_breaking: Option<bool>,
+    hunger: Option<LocalPlayerStat>,
+    mount_unique_id: Option<i64>,
+    movement: ActorMovementFacts,
+    input_locks: protocol::ClientInputLocks,
+}
+
+/// Facts owned by one actor lifetime, separate from session permissions and abilities.
+#[derive(Clone, Debug, Default)]
+struct ActorMovementFacts {
+    immobile: bool,
+    /// A cleared gravity bit overrides the default player gravity.
+    gravity_cleared: bool,
+    uniform_air_drag: bool,
+    air_drag_modifier: Option<f32>,
+}
+
+impl LocalPlayerFacts {
+    /// Replaces input permissions only for the current committed session.
+    pub fn apply_input_locks(&mut self, session_id: u64, locks: protocol::ClientInputLocks) {
+        if self.session_id == session_id {
+            self.input_locks = locks;
+        }
+    }
+
+    /// Reads server permissions without changing actor-owned immobility.
+    #[must_use]
+    pub const fn input_locks(&self) -> protocol::ClientInputLocks {
+        self.input_locks
+    }
+
+    /// Starts a session with unknown facts and no accepted ability binding.
+    #[must_use]
+    pub fn new(session_id: u64) -> Self {
+        Self {
+            session_id,
+            ..Self::default()
+        }
+    }
+
+    /// Clears all facts on a new session; repeating the current session is a no-op.
+    pub fn begin_session(&mut self, session_id: u64) {
+        if self.session_id != session_id {
+            *self = Self::new(session_id);
+        }
+    }
+
+    /// Returns the session whose committed facts this owner retains.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
+
+    /// Retires the block-breaking negotiation without changing other player facts.
+    pub fn clear_block_breaking_mode(&mut self) {
+        self.server_authoritative_block_breaking = None;
+    }
+
+    /// Installs the bootstrap negotiation only for this session after successful setup.
+    pub fn install_block_breaking_mode(
+        &mut self,
+        session_generation: u64,
+        mode: bool,
+        setup_succeeded: bool,
+    ) {
+        if self.session_id() == session_generation && setup_succeeded {
+            self.server_authoritative_block_breaking = Some(mode);
+        }
+    }
+
+    /// Returns retained negotiation; it does not authorize a mining request by itself.
+    #[must_use]
+    pub const fn server_authoritative_block_breaking(&self) -> Option<bool> {
+        self.server_authoritative_block_breaking
+    }
+
+    /// Installs an explicit mode without clearing or inventing attribute values.
+    pub fn publish_player_game_mode(&mut self, game_mode: PlayerGameMode) {
+        self.assign_mode(game_mode);
+        self.player_game_mode = Some(game_mode);
+        self.player_mode_from_default = false;
+    }
+
+    /// Installs StartGame's resolved mode and its relationship to the world default.
+    pub fn publish_bootstrap_game_modes(
+        &mut self,
+        player: PlayerGameMode,
+        world_default: PlayerGameMode,
+        player_uses_world_default: bool,
+    ) {
+        self.assign_mode(player);
+        self.player_game_mode = Some(player);
+        self.world_default_game_mode = Some(world_default);
+        self.player_mode_from_default = player_uses_world_default;
+    }
+
+    /// Applies an accepted mode change; false leaves state intact for an odd packet.
+    pub fn apply_game_mode_update(&mut self, update: GameModeUpdate) -> bool {
+        match update {
+            GameModeUpdate::Explicit(mode) => {
+                self.assign_mode(mode);
+                self.player_game_mode = Some(mode);
+                self.player_mode_from_default = false;
+                true
+            }
+            GameModeUpdate::LegacyViewer => {
+                self.apply_game_mode_update(GameModeUpdate::Explicit(PlayerGameMode::Spectator))
+            }
+            GameModeUpdate::WorldDefault => match self.world_default_game_mode {
+                Some(default) => {
+                    self.assign_mode(default);
+                    self.player_game_mode = Some(default);
+                    self.player_mode_from_default = true;
+                    true
+                }
+                None => false,
+            },
+            GameModeUpdate::Unknown(_) => false,
+        }
+    }
+
+    /// Updates the world default and players bound to it; false marks an odd packet.
+    pub fn apply_default_game_mode_update(&mut self, update: GameModeUpdate) -> bool {
+        match update {
+            GameModeUpdate::Explicit(mode) => {
+                self.world_default_game_mode = Some(mode);
+                if self.player_mode_from_default {
+                    self.assign_mode(mode);
+                    self.player_game_mode = Some(mode);
+                }
+                true
+            }
+            GameModeUpdate::LegacyViewer => self.apply_default_game_mode_update(
+                GameModeUpdate::Explicit(PlayerGameMode::Spectator),
+            ),
+            GameModeUpdate::WorldDefault | GameModeUpdate::Unknown(_) => false,
+        }
+    }
+
+    /// Applies a committed mode's ability assignment to the mode-owned layers.
+    fn assign_mode(&mut self, mode: PlayerGameMode) {
+        self.instabuild.assign_mode(mode);
+        self.assign_mode_to_local_abilities(mode);
+    }
+
+    /// Returns effective creation permission after accepted mode and ability updates.
+    pub fn instabuild(&self) -> Option<bool> {
+        self.instabuild.resolve()
+    }
+
+    /// Returns the retained resolved mode, or None before it is known.
+    #[must_use]
+    pub const fn player_game_mode(&self) -> Option<PlayerGameMode> {
+        self.player_game_mode
+    }
+
+    /// Returns the committed world default used for world activity reporting.
+    #[must_use]
+    pub const fn world_default_game_mode(&self) -> Option<PlayerGameMode> {
+        self.world_default_game_mode
+    }
+
+    /// Resolves known mode defaults against the latest accepted ability evidence.
+    #[must_use]
+    pub fn game_mode_capabilities(&self) -> Option<GameModeCapabilities> {
+        self.player_game_mode
+            .map(|mode| GameModeCapabilities::resolve(mode, self.local_abilities()))
+    }
+
+    /// Keeps the existing survival-stat visibility default while the mode is unknown.
+    #[must_use]
+    pub const fn survival_stats_visible(&self) -> bool {
+        match self.player_game_mode {
+            Some(mode) => mode.shows_survival_stats(),
+            None => true,
+        }
+    }
+
+    /// Retains accepted hunger using the existing quantization; false preserves prior state.
+    pub fn apply_hunger_attribute(&mut self, attribute: &ActorAttribute) -> bool {
+        let Some(hunger) = LocalPlayerStat::from_attribute(attribute) else {
+            return false;
+        };
+        self.hunger = Some(hunger);
+        true
+    }
+
+    /// Returns the hunger attribute in the same units used by the existing HUD adapter.
+    #[must_use]
+    pub const fn hunger(&self) -> Option<LocalPlayerStat> {
+        self.hunger
+    }
+
+    /// Applies a mount change after the caller accepts its committed identity.
+    pub fn set_mount(&mut self, ridden_unique_id: Option<i64>) {
+        self.mount_unique_id = ridden_unique_id;
+    }
+
+    /// Returns the committed mount, or None when the player is not riding.
+    #[must_use]
+    pub const fn mount_unique_id(&self) -> Option<i64> {
+        self.mount_unique_id
+    }
+
+    /// Retires actor-owned movement facts while retaining session permissions and abilities.
+    pub fn clear_actor_movement_authority(&mut self, session_id: u64) {
+        if self.session_id == session_id {
+            self.movement = ActorMovementFacts::default();
+        }
+    }
+
+    /// Applies FIFO-committed local flags for this session; omitted fields retain their state.
+    pub fn apply_local_movement_flags(
+        &mut self,
+        session_id: u64,
+        flags: crate::MovementFlagUpdate,
+    ) -> bool {
+        if self.session_id != session_id {
+            return false;
+        }
+        if let Some(immobile) = flags.immobile {
+            self.movement.immobile = immobile;
+        }
+        if let Some(has_gravity) = flags.has_gravity {
+            self.movement.gravity_cleared = !has_gravity;
+        }
+        if let Some(uniform_air_drag) = flags.uniform_air_drag {
+            self.movement.uniform_air_drag = uniform_air_drag;
+        }
+        true
+    }
+
+    /// Applies a FIFO-committed `minecraft:air_drag_modifier` current for this session.
+    pub fn apply_air_drag_modifier(&mut self, session_id: u64, current: f32) -> bool {
+        if self.session_id != session_id {
+            return false;
+        }
+        self.movement.air_drag_modifier = Some(current);
+        true
+    }
+
+    #[must_use]
+    pub const fn has_gravity(&self) -> bool {
+        !self.movement.gravity_cleared
+    }
+
+    #[must_use]
+    pub const fn uses_uniform_air_drag(&self) -> bool {
+        self.movement.uniform_air_drag
+    }
+
+    /// Returns None until the server defines the attribute.
+    #[must_use]
+    pub const fn air_drag_modifier(&self) -> Option<f32> {
+        self.movement.air_drag_modifier
+    }
+
+    /// Server immobility prevents travel without locking camera or raw input.
+    #[must_use]
+    pub const fn is_immobile(&self) -> bool {
+        self.movement.immobile
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod abilities_tests;

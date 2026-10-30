@@ -1,0 +1,82 @@
+//! Publishes packet deltas and compact actor positions to the retained debug renderer.
+
+use chunk_pipeline::WorldStream;
+use render_model::primitive_shapes::PrimitiveShapeStore;
+use render_scene::PrimitiveShapesScene;
+use std::sync::{Arc, Mutex};
+
+/// Session identity prevents a new connection from inheriting the previous server's shapes.
+#[derive(Default)]
+pub struct PrimitiveShapePublisher {
+    session: Option<u64>,
+}
+
+impl PrimitiveShapePublisher {
+    /// Applies committed packets once and samples each attached actor once per rendered frame.
+    pub fn publish(
+        &mut self,
+        stream: Option<&mut WorldStream>,
+        scene: &mut PrimitiveShapesScene,
+        now: f32,
+        partial_tick: f32,
+        local_feet: Option<[f32; 3]>,
+    ) {
+        let session = stream
+            .as_ref()
+            .map(|stream| stream.authority().actor_session_id());
+        if self.session != session {
+            scene.store = Arc::new(Mutex::new(PrimitiveShapeStore::default()));
+            self.session = session;
+        }
+        scene.clock = now;
+        let Some(stream) = stream else {
+            return;
+        };
+        scene.dimension = stream.current_dimension();
+        scene.render_distance =
+            render_scene::adjusted_player_render_distance_blocks(stream.render_distance_blocks())
+                .unwrap_or(0.0);
+        let mut store = scene.store.lock().expect("primitive store lock poisoned");
+        while let Some(event) = stream.pop_primitive_shapes() {
+            if event.skipped_entries != 0 {
+                bevy::log::warn!(
+                    skipped = event.skipped_entries,
+                    "ignored invalid primitive shape entries"
+                );
+            }
+            store.apply(event);
+        }
+        store.update_actors(|id| {
+            if id == stream.authority().local_player_unique_id() {
+                return local_feet;
+            }
+            stream
+                .authority()
+                .actor_by_unique_id(id)?
+                .interpolated_position(partial_tick)
+        });
+    }
+}
+
+/// Publishes attached shapes and their retained text using this frame's actor clock.
+#[allow(clippy::too_many_arguments)]
+pub fn drive_primitive_shapes(
+    stream: Option<&mut WorldStream>,
+    mut scene: bevy::prelude::ResMut<PrimitiveShapesScene>,
+    now: f32,
+    partial_tick: f32,
+    view: &crate::local_player::LocalViewPose,
+    presentation: &mut client_ui::ui_runtime::presentation::UiPresentationRuntime,
+    runtime: &client_ui::ui_runtime::UiRuntime,
+    mut publisher: bevy::prelude::Local<PrimitiveShapePublisher>,
+) {
+    publisher.publish(
+        stream,
+        &mut scene,
+        now,
+        partial_tick,
+        Some(view.feet_translation().to_array()),
+    );
+    let mut store = scene.store.lock().expect("primitive store lock poisoned");
+    presentation.prepare_primitive_text(&mut store, runtime);
+}

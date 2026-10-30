@@ -1,0 +1,259 @@
+//! Test guest for the Experience runtime. `on-interact` selects a behavior by
+//! `pos.x`; every other position it touches is relative to the interacted block
+//! `p`, and `up` is the block above it. World errors are told by their WIT
+//! kebab-case names. Using its overlay host, the bus, adds a plate on the
+//! clicked face or removes the plate the click targets. `client-message` reads
+//! the block of its player's focus and writes its data, or without a focus tries
+//! the same at the origin, which its callback refuses; it echoes the message back
+//! to the sender's client part and tells what happened. `epoch` does the same read
+//! and write, resends a short item list and tells what happened. Its channels come
+//! from its `experience.toml`.
+
+use experience_sdk::Value;
+use experience_sdk::server::{
+    BlockChange, BlockPos, Callback, ContentRules, Experience, Face, GuestError, LogLevel,
+    OverlayRegistration, Pixel, PlayerId, Registration, WorldError, log, nodes,
+};
+
+/// The declarations of `experience.toml`, which `build.rs` writes.
+mod experience {
+    experience_sdk::include_declarations!();
+}
+
+use experience::channels;
+
+mod contract;
+mod entities;
+mod interaction;
+mod worlds;
+
+const COUNTER: &str = "probe:counter";
+const AIR: &str = "minecraft:air";
+const UNOWNED_BLOCK: &str = "minecraft:stone";
+const NIL_PLAYER: &str = "00000000-0000-0000-0000-000000000000";
+
+struct Probe;
+
+impl Experience for Probe {
+    /// Registers the actor used by entity conformance callbacks.
+    fn entity_definitions() -> Result<Vec<experience_sdk::server::EntityDefinition>, GuestError> {
+        Ok(entities::definitions())
+    }
+    /// Exercises interactions and typed rider input through the current WIT.
+    fn on_entity(
+        ctx: &Callback,
+        handle: experience_sdk::server::EntityHandle,
+        event: experience_sdk::server::EntityEvent,
+    ) -> Result<(), GuestError> {
+        entities::on_entity(ctx, handle, event)
+    }
+    /// Exercises the simulation imports only in the clock conformance instance.
+    fn on_tick(
+        ctx: &Callback,
+        step: experience_sdk::server::SimulationStep,
+    ) -> Result<(), GuestError> {
+        entities::on_tick(ctx)?;
+        if ctx.world().id.value == "probe:clock" {
+            let current = ctx
+                .simulation()
+                .map_err(|e| GuestError::Failed(e.to_string()))?;
+            if current.tick != step.tick || current.duration_nanos != step.duration_nanos {
+                return Err(GuestError::Failed("inconsistent simulation time".into()));
+            }
+            if step.tick == 1 {
+                let _ = ctx.schedule(2, 3);
+            }
+        }
+        Ok(())
+    }
+    /// A repeating callback can cancel itself through its typed handle.
+    fn on_timer(
+        ctx: &Callback,
+        handle: experience_sdk::server::ScheduleHandle,
+        _step: experience_sdk::server::SimulationStep,
+    ) -> Result<(), GuestError> {
+        ctx.cancel_schedule(&handle)
+            .map_err(|e| GuestError::Failed(e.to_string()))
+    }
+
+    /// Exercises ordered player observations through the canonical server world.
+    fn on_player(
+        ctx: &Callback,
+        player: PlayerId,
+        event: experience_sdk::server::PlayerEvent,
+    ) -> Result<(), GuestError> {
+        worlds::on_player(ctx, player, event)
+    }
+
+    /// Registers a destination definition for world API probes.
+    fn world_definitions() -> Result<experience_sdk::server::WorldRegistration, GuestError> {
+        Ok(worlds::definitions())
+    }
+
+    /// The 0.5 export: the counter, the lamp and the node.
+    fn registration() -> Result<Registration, GuestError> {
+        Ok(contract::registration(COUNTER))
+    }
+
+    /// The 0.10 export: the bus and its plate.
+    fn overlays() -> Result<OverlayRegistration, GuestError> {
+        Ok(contract::overlays())
+    }
+
+    /// The 0.12 export: the bus has no item and drops nothing, as AE2's cable bus.
+    fn content_rules() -> Result<ContentRules, GuestError> {
+        Ok(contract::content_rules())
+    }
+
+    fn on_place(ctx: &Callback, change: BlockChange) -> Result<(), GuestError> {
+        tell_actor(ctx, &change, "placed");
+        Ok(())
+    }
+
+    /// Tells the size of the broken block's data, and whether the break harvests.
+    fn on_break(ctx: &Callback, change: BlockChange) -> Result<(), GuestError> {
+        let len = change
+            .previous_data
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |data| data.len().to_string());
+        let harvested = if ctx.harvested() { " harvested" } else { "" };
+        tell_actor(ctx, &change, &format!("broke {len}{harvested}"));
+        Ok(())
+    }
+
+    fn on_interact(
+        ctx: &Callback,
+        player: PlayerId,
+        pos: BlockPos,
+        clicked_face: Face,
+        _hit: Option<Pixel>,
+        target: Option<u8>,
+    ) -> Result<(), GuestError> {
+        if ctx.get_block(pos).is_ok_and(|id| id == contract::BUS) {
+            let told = contract::use_bus(ctx, pos, clicked_face, target);
+            let _ = ctx.tell(&player, &told);
+            return Ok(());
+        }
+        interaction::interact(ctx, &player, pos)
+    }
+
+    fn on_neighbor_changed(
+        _ctx: &Callback,
+        pos: BlockPos,
+        neighbor: BlockPos,
+    ) -> Result<(), GuestError> {
+        log(
+            LogLevel::Info,
+            &format!("neighbor {neighbor:?} of {pos:?} changed"),
+        );
+        Ok(())
+    }
+
+    /// Counts the update in the block's data, as x=0 counts interactions.
+    fn on_scheduled_update(ctx: &Callback, pos: BlockPos) -> Result<(), GuestError> {
+        log(LogLevel::Info, &format!("scheduled {}", count(ctx, pos)));
+        Ok(())
+    }
+
+    fn epoch(ctx: &Callback, player: PlayerId) -> Result<(), GuestError> {
+        let access = world_access(ctx);
+        let channel = channels::ITEMS;
+        let send =
+            outcome(raw(ctx).send_client(&player, channel.id, channel.schema, &nodes(items(2))));
+        let _ = ctx.tell(&player, &format!("epoch {access} send {send}"));
+        Ok(())
+    }
+}
+
+impl experience_sdk::server::__private::Dispatch for Probe {
+    /// Echoes arbitrary admitted records to exercise the host ABI.
+    fn dispatch(
+        ctx: &Callback,
+        player: PlayerId,
+        channel: String,
+        schema: u16,
+        payload: Vec<Value>,
+    ) -> Result<(), GuestError> {
+        let access = world_access(ctx);
+        let fields = payload.len();
+        let echo = outcome(raw(ctx).send_client(&player, &channel, schema, &nodes(payload)));
+        let text = format!("client {channel} {schema} {fields} {access} echo {echo}");
+        let _ = ctx.tell(&player, &text);
+        Ok(())
+    }
+}
+
+experience_sdk::export_experience!(Probe);
+
+/// The focus, and a block read and a data write at it, or at the origin without one, as
+/// `focus {x y z|none} read {id|error} write {outcome}`; a callback without a snapshot refuses
+/// both.
+fn world_access(ctx: &Callback) -> String {
+    let focus = ctx.focus();
+    let target = focus.unwrap_or(BlockPos { x: 0, y: 64, z: 0 });
+    let read = id_or_error(ctx.get_block(target));
+    let write = outcome(ctx.set_block_data(target, Some(&[1])));
+    format!("focus {} read {read} write {write}", describe(focus))
+}
+
+/// `x y z`, or `none`.
+fn describe(pos: Option<BlockPos>) -> String {
+    pos.map_or_else(
+        || "none".to_owned(),
+        |BlockPos { x, y, z }| format!("{x} {y} {z}"),
+    )
+}
+
+/// An item list of `count` entries: one list of records, each an index and a name.
+fn items(count: i64) -> Vec<Value> {
+    let item = |i: i64| Value::Record(vec![Value::Integer(i), Value::Text(format!("item {i}"))]);
+    vec![Value::List((0..count).map(item).collect())]
+}
+
+/// Describes [`next_count`]: `count {n}`, or `error {name}` if a call failed.
+fn count(ctx: &Callback, p: BlockPos) -> String {
+    match next_count(ctx, p) {
+        Ok(n) => format!("count {n}"),
+        Err(error) => format!("error {}", error.name()),
+    }
+}
+
+/// Increments the little-endian u32 in `p`'s data (absent counts as 0) and
+/// returns the new count.
+fn next_count(ctx: &Callback, p: BlockPos) -> Result<u32, WorldError> {
+    let next = ctx
+        .block_data(p)?
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map_or(0, u32::from_le_bytes)
+        .wrapping_add(1);
+    ctx.set_block_data(p, Some(&next.to_le_bytes()))?;
+    Ok(next)
+}
+
+fn tell_actor(ctx: &Callback, change: &BlockChange, text: &str) {
+    if let Some(actor) = &change.actor {
+        let _ = ctx.tell(actor, text);
+    }
+}
+
+fn id_or_error(result: Result<String, WorldError>) -> String {
+    result.unwrap_or_else(|error| error.name().to_owned())
+}
+
+fn outcome(result: Result<(), WorldError>) -> &'static str {
+    result.map_or_else(|error| error.name(), |()| "ok")
+}
+
+fn presence(result: Result<Option<Vec<u8>>, WorldError>) -> &'static str {
+    match result {
+        Ok(None) => "absent",
+        Ok(Some(data)) if data.is_empty() => "empty",
+        Ok(Some(_)) => "present",
+        Err(error) => error.name(),
+    }
+}
+
+/// Uses the canonical ABI only for deliberately malformed protocol probes.
+fn raw<'a>(ctx: &'a Callback<'a>) -> &'a experience_sdk::server::__private::RawCallback {
+    experience_sdk::server::__private::raw(ctx)
+}

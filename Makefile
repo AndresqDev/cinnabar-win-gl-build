@@ -1,0 +1,212 @@
+.DEFAULT_GOAL := help
+
+CARGO ?= cargo
+# Cargo profile for `make play`; PROFILE=release keeps developer features with shipping optimizations.
+PROFILE ?= play
+# Capture reads the client executable from Cargo artifact messages.
+CLIENT_MESSAGE_FORMAT ?= human
+# Cargo names the dev profile output directory debug.
+PROFILE_DIR = $(if $(filter dev,$(PROFILE)),debug,$(PROFILE))
+EXE = $(if $(filter Windows_NT,$(OS)),.exe)
+# Reuse compiled dependencies across worktrees when sccache is installed.
+ifneq ($(shell command -v sccache 2>/dev/null),)
+export RUSTC_WRAPPER ?= sccache
+endif
+GO ?= go
+POWERSHELL ?= powershell
+
+NO_VSYNC ?= 0
+TRACY ?= 0
+CLIENT_FEATURES = $(if $(filter 1,$(TRACY)),--features tracy)
+# Identifies the client build in its session log and supplies runtime acceptance markers.
+# The pre-rename RUST_MCBE_BUILD_COMMIT is still honoured for one release.
+ifdef RUST_MCBE_BUILD_COMMIT
+ifndef CINNABAR_BUILD_COMMIT
+$(warning RUST_MCBE_BUILD_COMMIT is deprecated; set CINNABAR_BUILD_COMMIT instead)
+CINNABAR_BUILD_COMMIT := $(RUST_MCBE_BUILD_COMMIT)
+endif
+endif
+CINNABAR_BUILD_COMMIT ?= $(shell git rev-parse HEAD)
+DIST_PLATFORM ?= $(if $(filter Windows_NT,$(OS)),windows,$(if $(findstring Darwin,$(shell uname -s)),macos,linux))
+DIST_CLIENT ?= target/release/$(if $(filter windows,$(DIST_PLATFORM)),cinnabar.exe,cinnabar)
+DIST_CORE ?= target/release/$(if $(filter windows,$(DIST_PLATFORM)),bedrock-core.exe,bedrock-core)
+DIST_BINARIES ?= $(dir $(DIST_CLIENT))
+DIST_OUT ?= .local/dist/$(DIST_PLATFORM)
+DIST_TARGET ?= $(shell rustc --print host-tuple)
+DIST_GIT_COMMIT ?= $(CINNABAR_BUILD_COMMIT)
+DIST_NOTICES ?= THIRD_PARTY_NOTICES.md
+
+VANILLA_SOURCE_MANIFEST ?= assets/vanilla-source.json
+# The pinned pack's extraction directory comes from the manifest, its one definition.
+ifeq ($(OS),Windows_NT)
+VANILLA_CACHE_DIR := $(shell $(POWERSHELL) -NoProfile -Command "(Get-Content -Raw '$(VANILLA_SOURCE_MANIFEST)' | ConvertFrom-Json).cache_dir")
+else
+VANILLA_CACHE_DIR := $(shell sed -n 's/^[[:space:]]*"cache_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $(VANILLA_SOURCE_MANIFEST))
+endif
+PACK_DIR ?= $(VANILLA_CACHE_DIR)/resource_pack
+PACK_SENTINEL ?= $(PACK_DIR)/blocks.json
+FONT_PACK_DIR ?= .local/assets/font-source
+HUD_PACK_DIR ?= $(PACK_DIR)
+FONT_SOURCE_MANIFEST ?= assets/cinnangles-sans-source.json
+FONT_SOURCE ?= assets/fonts/CinnanglesSans.ttf
+BEDROCK_TARGET_MANIFEST ?= assets/bedrock-target.json
+REGISTRY_FOUNDATION_MANIFEST ?= assets/registry-foundation-v2225.json
+HUD_SOURCE_MANIFEST ?= assets/hud-source-v2225.json
+# Development-only outputs of explicitly selected local packs; the carrier table owns the rest.
+LOCAL_ASSET_DIR ?= .local/assets/compiled
+PHYSICS_REGISTRY ?= $(LOCAL_ASSET_DIR)/block-physics-v2225.bin
+CINNABAR_CLOUDS_PNG ?=
+REGISTRY_FOUNDATION_CHECK = $(GO) -C tools/registrygen run ./cmd/foundationcheck -manifest "$(abspath $(REGISTRY_FOUNDATION_MANIFEST))"
+ASSET_COMPILER_BINARY = assetc
+ASSETC = $(CARGO) run --profile $(PROFILE) --locked -p asset-compiler --bin $(ASSET_COMPILER_BINARY) --
+VANILLA_ASSET_FETCH = $(ASSETC) vanilla-pack --source-manifest "$(VANILLA_SOURCE_MANIFEST)" --accept-eula
+# One in-process parallel pass over the carrier table; carriers whose fingerprint is unchanged are skipped.
+ASSETS_PREPARE = $(ASSETC) prepare --accept-eula $(if $(strip $(CINNABAR_CLOUDS_PNG)),--clouds-override "$(CINNABAR_CLOUDS_PNG)")
+LOCAL_FONT_ASSET_COMPILE = $(ASSETC) font-assets --pack "$(FONT_PACK_DIR)" --source-manifest "$(VANILLA_SOURCE_MANIFEST)" --out "$(LOCAL_ASSET_DIR)/vanilla-v1.mcbefont" --report "$(LOCAL_ASSET_DIR)/font-assets.json"
+LOCAL_HUD_ASSET_COMPILE = $(ASSETC) hud-assets --pack "$(HUD_PACK_DIR)" --source-manifest "$(HUD_SOURCE_MANIFEST)" --out "$(LOCAL_ASSET_DIR)/vanilla-v1.mcbehud" --report "$(LOCAL_ASSET_DIR)/hud-assets.json"
+
+.PHONY: help vanilla-assets assets font-assets-local hud-assets-local physics-assets local-server play dist-local
+.PHONY: registry-foundation-check jsonui-editor figma-plugin
+
+help:
+	@echo make registry-foundation-check - Validate the exact protocol-2225 registry foundation
+	@echo make vanilla-assets  - Acquire the pinned official Mojang sample resource pack
+	@echo make assets          - Build every stale carrier in one parallel pass, fetching the pack if needed
+	@echo make NAME-assets     - Build one carrier and what it reads, e.g. hud-assets or audio-bank-assets
+	@echo make font-assets-local - Compile a reviewed local bitmap font source via FONT_PACK_DIR
+	@echo make hud-assets-local - Compile from an explicitly selected matching pack via HUD_PACK_DIR
+	@echo make physics-assets  - Compile block movement and selection geometry
+	@echo make local-server    - Build the dragonfly local-world server and experience-runtime beside the core binary
+	@echo make play            - Refresh stale assets, build the core, and run the full game from the menu
+	@echo make play TRACY=1    - Run with opt-in Tracy frame attribution
+	@echo make dist-local      - Stage an unsigned local-development-only bundle under .local/dist
+	@echo make jsonui-editor   - Build the static JSON-UI editor site into JSONUI_EDITOR_OUT
+	@echo make figma-plugin    - Build the Figma to JSON-UI plugin into tools/figma-plugin/dist
+	@echo Override optional settings with NO_VSYNC=1
+	@echo Set CINNABAR_CLOUDS_PNG to the exact local-only Bedrock 1.26.33.1 clouds.png
+
+registry-foundation-check:
+	$(REGISTRY_FOUNDATION_CHECK)
+
+JSONUI_EDITOR_OUT ?= target/jsonui-editor-site
+
+jsonui-editor: $(FONT_SOURCE)
+	bash tools/jsonui-editor/build.sh "$(abspath $(JSONUI_EDITOR_OUT))" "$(abspath $(FONT_SOURCE))"
+	@echo Serve it locally with: python3 -m http.server --directory $(JSONUI_EDITOR_OUT) 8000
+	@echo then open http://localhost:8000/
+
+figma-plugin: $(FONT_SOURCE)
+	bash tools/figma-plugin/build.sh "$(abspath $(FONT_SOURCE))"
+
+vanilla-assets: $(PACK_SENTINEL)
+
+assets:
+	$(ASSETS_PREPARE)
+
+# Any one carrier, plus the carriers it reads, by its carrier-table name.
+%-assets: FORCE_PREPARE
+	$(ASSETS_PREPARE) --only $*
+
+FORCE_PREPARE:
+
+font-assets-local:
+	$(LOCAL_FONT_ASSET_COMPILE)
+
+hud-assets-local:
+	$(LOCAL_HUD_ASSET_COMPILE)
+
+physics-assets:
+	$(ASSETS_PREPARE) --only physics
+
+$(PACK_SENTINEL): $(VANILLA_SOURCE_MANIFEST)
+	$(VANILLA_ASSET_FETCH)
+
+# A failed install or check leaves no target behind to look current.
+.DELETE_ON_ERROR:
+
+# Separate module: dragonfly needs a newer gophertunnel than the core, so it cannot join go.work.
+LOCAL_SERVER_OUT ?= target/release/bedrock-local-server$(if $(filter windows,$(DIST_PLATFORM)),.exe)
+
+local-server:
+	cd tools/localserver && GOWORK=off $(GO) build -o "$(abspath $(LOCAL_SERVER_OUT))" .
+	$(CARGO) build -p experience-runtime -p cinnabar-cxb --release --locked
+
+# Full game from the launcher menu: refresh assets, build the core and local server beside the client
+# (plus the pinned DX12 shader compiler on Windows), run it.
+play-build: assets
+ifeq ($(CINNABAR_DEV_SERVER_EXPERIENCES),1)
+	$(CARGO) build --profile $(PROFILE) -p mod-host --bin mod-host --locked
+	$(CARGO) build --profile $(PROFILE) -p mod-host --bin cinnabar-media-helper --features media --locked
+endif
+	$(GO) build -tags joinprofile -ldflags "$(CORE_STAMP)" -o "$(abspath target/$(PROFILE_DIR)/bedrock-core$(EXE))" ./core/cmd/bedrock-core
+	-cd tools/localserver && GOWORK=off $(GO) build -o "$(abspath target/$(PROFILE_DIR)/bedrock-local-server$(EXE))" .
+	CINNABAR_BUILD_COMMIT="$(CINNABAR_BUILD_COMMIT)" $(CARGO) build --profile $(PROFILE) -p cinnabar --locked $(CLIENT_FEATURES) --message-format=$(CLIENT_MESSAGE_FORMAT)
+ifeq ($(OS),Windows_NT)
+	$(POWERSHELL) -NoProfile -ExecutionPolicy Bypass -File packaging/windows/fetch-dxc.ps1 -Out "target/$(PROFILE_DIR)"
+endif
+
+# macOS grants Game Mode only to bundled games, so `make play` runs the build from a dev bundle
+# whose Info.plist comes from the release template; its binaries are refreshed hard links.
+DEV_APP = target/$(PROFILE_DIR)/Cinnabar Dev.app
+# The release bundle identifier from build-app.sh, suffixed so dev never shares its preferences.
+DEV_APP_ID = $(shell sed -n 's/^bundle_id="$${BUNDLE_ID:-\(.*\)}"/\1/p' packaging/macos/build-app.sh).dev
+DEV_APP_BINARIES = cinnabar bedrock-core bedrock-local-server mod-host cinnabar-media-helper $(ASSET_COMPILER_BINARY)
+play: play-build
+ifneq ($(findstring Darwin,$(shell uname -s)),)
+	@mkdir -p "$(DEV_APP)/Contents/MacOS"
+	@sed -e "s|@BUNDLE_ID@|$(DEV_APP_ID)|g" -e "s|@VERSION@|$(PKG_VERSION)|g" packaging/macos/Info.plist.in > "$(DEV_APP)/Contents/Info.plist"
+	@for binary in $(DEV_APP_BINARIES); do \
+		if [ -f "target/$(PROFILE_DIR)/$$binary" ]; then ln -f "target/$(PROFILE_DIR)/$$binary" "$(DEV_APP)/Contents/MacOS/$$binary"; \
+		else rm -f "$(DEV_APP)/Contents/MacOS/$$binary"; fi; \
+	done
+	CINNABAR_BUILD_COMMIT="$(CINNABAR_BUILD_COMMIT)" "$(DEV_APP)/Contents/MacOS/cinnabar" $(if $(filter 1,$(NO_VSYNC)),--no-vsync)
+else
+	CINNABAR_BUILD_COMMIT="$(CINNABAR_BUILD_COMMIT)" $(CARGO) run --profile $(PROFILE) -p cinnabar --locked $(CLIENT_FEATURES) -- $(if $(filter 1,$(NO_VSYNC)),--no-vsync)
+endif
+
+dist-local:
+	$(CARGO) run --locked -p dist-local -- --platform "$(DIST_PLATFORM)" --client "$(DIST_CLIENT)" --core "$(DIST_CORE)" --binaries "$(DIST_BINARIES)" --physics "$(PHYSICS_REGISTRY)" --notices "$(DIST_NOTICES)" --target "$(DIST_TARGET)" --git-commit "$(DIST_GIT_COMMIT)" --out "$(DIST_OUT)"
+
+# Release packaging (see packaging/README.md). Signing credentials come from the environment.
+PKG_VERSION ?= $(shell sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n 1)
+# Update manifest keys the client trusts (id:base64[,...]); read by the client build.
+UPDATE_TRUSTED_KEYS ?=
+# Unset when empty, as under plain cargo, so switching between them never rebuilds the client.
+ifneq ($(UPDATE_TRUSTED_KEYS),)
+export UPDATE_TRUSTED_KEYS
+else
+unexport UPDATE_TRUSTED_KEYS
+endif
+PKG_CORE_LDFLAGS = -s -w
+# Shell expansion stamping bedrock-core with the workspace version and the selected build commit.
+CORE_STAMP = $$(CINNABAR_BUILD_COMMIT="$(CINNABAR_BUILD_COMMIT)" bash packaging/common/core-ldflags.sh)
+# Optional diagnostics for the release Rust build, such as --timings.
+PACKAGE_CARGO_FLAGS ?=
+# The runtime table owns Rust package/bin pairs; Go integrations retain their module-specific builds.
+PACKAGE_RUST_BINARIES = $(shell awk '$$2 != "-" {printf "-p %s --bin %s ", $$2, $$1}' packaging/common/runtime-binaries.txt)
+.PHONY: package-binaries package-macos package-windows package-linux
+package-binaries:
+	CINNABAR_BUILD_COMMIT="$(CINNABAR_BUILD_COMMIT)" $(CARGO) build $(PACKAGE_CARGO_FLAGS) --release --locked --no-default-features $(PACKAGE_RUST_BINARIES) -p asset-compiler --bin $(ASSET_COMPILER_BINARY)
+	$(GO) build -trimpath -ldflags "$(PKG_CORE_LDFLAGS) $(CORE_STAMP)" -o "$(DIST_CORE)" ./core/cmd/bedrock-core
+	cd tools/localserver && GOWORK=off $(GO) build -trimpath -ldflags "-s -w" -o "$(abspath $(LOCAL_SERVER_OUT))" .
+
+package-macos: package-binaries $(FONT_SOURCE)
+	bash packaging/macos/build-app.sh
+	bash packaging/macos/sign-notarize.sh .local/dist/macos-release/Cinnabar.app
+	bash packaging/macos/make-dmg.sh .local/dist/macos-release/Cinnabar.app .local/dist/macos-release/Cinnabar-$(PKG_VERSION).dmg
+	bash packaging/macos/sign-notarize.sh .local/dist/macos-release/Cinnabar-$(PKG_VERSION).dmg
+
+package-windows: package-binaries $(FONT_SOURCE)
+	$(POWERSHELL) -NoProfile -ExecutionPolicy Bypass -File packaging/windows/build-installer.ps1
+
+package-linux: package-binaries $(FONT_SOURCE)
+	bash packaging/linux/build-appimage.sh
+
+.PHONY: diag
+diag:
+	$(CARGO) run -p devtool --locked -- diag
+
+SECONDS ?= 180
+.PHONY: capture play-build
+capture:
+	$(CARGO) run -p devtool --locked -- capture --seconds "$(SECONDS)" $(if $(BASELINE),--baseline "$(BASELINE)") $(if $(HZ),--refresh-hz "$(HZ)") $(if $(filter 1,$(NO_VSYNC)),--no-vsync)

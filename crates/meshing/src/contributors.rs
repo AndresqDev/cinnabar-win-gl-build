@@ -1,0 +1,764 @@
+use assets::{
+    BLOCK_VISUAL_VARIANT_TOP_SNOW, BlockFace, BlockFlags, ContributorRole, DIAGNOSTIC_MATERIAL,
+    NO_MODEL_TEMPLATE, NetworkIdMode, RuntimeAssets, VisualKind,
+    seasonal_foliage::SeasonalFoliageBlock, seasonal_foliage::seasonal_foliage_cell_shelters,
+};
+use world::{PalettedStorage, SubChunk};
+
+use crate::{BlockClassifier, Face, SIDE};
+
+#[path = "contributors/mesh_inputs.rs"]
+pub(crate) mod mesh_inputs;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResolvedPaletteEntry {
+    pub(crate) network_value: u32,
+    pub(crate) sequential_id: Option<u32>,
+    pub(crate) contributor_role: ContributorRole,
+    pub(crate) flags: BlockFlags,
+    pub(crate) faces: [u32; Face::ALL.len()],
+    pub(crate) kind: VisualKind,
+    pub(crate) model_template: u32,
+    pub(crate) variant: u32,
+}
+
+impl ResolvedPaletteEntry {
+    pub(crate) const AIR: Self = Self {
+        network_value: 0,
+        sequential_id: None,
+        contributor_role: ContributorRole::Air,
+        flags: BlockFlags::AIR,
+        faces: [DIAGNOSTIC_MATERIAL; Face::ALL.len()],
+        kind: VisualKind::Invisible,
+        model_template: NO_MODEL_TEMPLATE,
+        variant: 0,
+    };
+    const DIAGNOSTIC: Self = Self {
+        network_value: 0,
+        sequential_id: None,
+        contributor_role: ContributorRole::Primary,
+        flags: BlockFlags::empty(),
+        faces: [DIAGNOSTIC_MATERIAL; Face::ALL.len()],
+        kind: VisualKind::Diagnostic,
+        model_template: NO_MODEL_TEMPLATE,
+        variant: 0,
+    };
+
+    const fn air(network_value: u32) -> Self {
+        Self {
+            network_value,
+            ..Self::AIR
+        }
+    }
+
+    const fn diagnostic(network_value: u32, sequential_id: Option<u32>) -> Self {
+        Self {
+            network_value,
+            sequential_id,
+            ..Self::DIAGNOSTIC
+        }
+    }
+
+    pub(crate) const fn emits_cube_geometry(self) -> bool {
+        self.flags.contains(BlockFlags::CUBE_GEOMETRY)
+            || matches!(self.kind, VisualKind::Diagnostic)
+    }
+}
+
+/// Palette-native contributors resolved for one sub-chunk coordinate.
+///
+/// A diagnostic is mutually exclusive with real contributors. A second,
+/// model-routed block (a plant under top snow or under a placed block) is kept
+/// beside the primary so both are tessellated. Liquid geometry is meshed
+/// separately, but its exact network value is retained here so layered
+/// plants/solids do not erase it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResolvedContributors {
+    primary: Option<ResolvedPaletteEntry>,
+    extra_model: Option<ResolvedPaletteEntry>,
+    liquid: Option<ResolvedPaletteEntry>,
+    diagnostic: Option<ResolvedPaletteEntry>,
+}
+
+impl ResolvedContributors {
+    pub(crate) const fn primary_entry(self) -> Option<ResolvedPaletteEntry> {
+        self.primary
+    }
+
+    pub(crate) const fn liquid_entry(self) -> Option<ResolvedPaletteEntry> {
+        self.liquid
+    }
+
+    #[must_use]
+    pub const fn primary_network_value(self) -> Option<u32> {
+        match self.primary {
+            Some(entry) => Some(entry.network_value),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn liquid_network_value(self) -> Option<u32> {
+        match self.liquid {
+            Some(entry) => Some(entry.network_value),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn diagnostic_network_value(self) -> Option<u32> {
+        match self.diagnostic {
+            Some(entry) => Some(entry.network_value),
+            None => None,
+        }
+    }
+
+    /// Certifies a full opaque cube using the same resolved contributor as terrain meshing.
+    pub fn is_opaque_cube(self, assets: &RuntimeAssets) -> bool {
+        let entry = self.geometry_entry();
+        self.diagnostic.is_none()
+            && entry
+                .flags
+                .contains(BlockFlags::CUBE_GEOMETRY | BlockFlags::OCCLUDES_FULL_FACE)
+            && matches!(entry.kind, VisualKind::Cube)
+            && entry.faces.into_iter().all(|id| {
+                // Runtime asset validation requires all positional variants to share flags.
+                assets.materials().get(id as usize).is_some_and(|material| {
+                    material.flags
+                        & (assets::MATERIAL_FLAG_ALPHA_BLEND
+                            | assets::MATERIAL_FLAG_ALPHA_CUTOUT
+                            | assets::MATERIAL_FLAG_TWO_SIDED)
+                        == 0
+                })
+            })
+    }
+
+    /// Whether resolution retained no geometry, liquid or diagnostic contributor.
+    pub const fn is_empty(self) -> bool {
+        self.primary.is_none() && self.liquid.is_none() && self.diagnostic.is_none()
+    }
+
+    pub(crate) const fn geometry_entry(self) -> ResolvedPaletteEntry {
+        match (self.diagnostic, self.primary, self.liquid) {
+            (Some(entry), _, _) | (None, Some(entry), _) => entry,
+            (None, None, Some(_)) | (None, None, None) => ResolvedPaletteEntry::AIR,
+        }
+    }
+
+    fn push(&mut self, entry: ResolvedPaletteEntry) {
+        if self.diagnostic.is_some() || entry.flags.contains(BlockFlags::AIR) {
+            return;
+        }
+        match entry.contributor_role {
+            ContributorRole::Primary => {
+                match self.primary {
+                    None => self.primary = Some(entry),
+                    Some(primary) if self.extra_model.is_none() => {
+                        // TopSnow tessellates the underlying crossed plant on
+                        // that plant's own render layer, independently of its
+                        // opaque snow surface.
+                        if primary.variant & BLOCK_VISUAL_VARIANT_TOP_SNOW != 0
+                            && entry.kind == VisualKind::Cross
+                        {
+                            self.extra_model = Some(entry);
+                        } else if entry.variant & BLOCK_VISUAL_VARIANT_TOP_SNOW != 0
+                            && primary.kind == VisualKind::Cross
+                        {
+                            self.primary = Some(entry);
+                            self.extra_model = Some(primary);
+                        // The chunk builder also tessellates any other extra
+                        // block in its own layer, such as a plant left under a
+                        // block placed over covering snow. Model geometry has
+                        // its own route; two cube contributors stay unsupported.
+                        } else if is_model_kind(entry) {
+                            self.extra_model = Some(entry);
+                        } else if is_model_kind(primary) {
+                            self.primary = Some(entry);
+                            self.extra_model = Some(primary);
+                        } else {
+                            self.fail_closed(entry.network_value, entry.sequential_id);
+                        }
+                    }
+                    Some(_) => self.fail_closed(entry.network_value, entry.sequential_id),
+                }
+            }
+            ContributorRole::LiquidAdditional if matches!(entry.kind, VisualKind::Liquid) => {
+                if self
+                    .liquid
+                    .is_some_and(|liquid| liquid.network_value != entry.network_value)
+                {
+                    self.fail_closed(entry.network_value, entry.sequential_id);
+                } else if self.liquid.is_none() {
+                    self.liquid = Some(entry);
+                }
+            }
+            ContributorRole::LiquidAdditional | ContributorRole::Air => {
+                self.fail_closed(entry.network_value, entry.sequential_id);
+            }
+        }
+    }
+
+    fn fail_closed(&mut self, network_value: u32, sequential_id: Option<u32>) {
+        self.primary = None;
+        self.extra_model = None;
+        self.liquid = None;
+        self.diagnostic = Some(ResolvedPaletteEntry::diagnostic(
+            network_value,
+            sequential_id,
+        ));
+    }
+}
+
+pub(crate) struct StoragePaletteFacts<'a> {
+    storage: &'a PalettedStorage,
+    entries: Box<[ResolvedPaletteEntry]>,
+}
+
+pub(crate) enum PaletteSource<'a> {
+    Air,
+    Uniform(ResolvedContributors),
+    Mixed(Box<[StoragePaletteFacts<'a>]>),
+}
+
+/// Block flags and six-face materials parallel to storage palettes, never to
+/// the 4,096 voxel positions.
+pub(crate) struct PaletteFacts<'a> {
+    pub(crate) source: PaletteSource<'a>,
+    uniform_seasonal_shelter: bool,
+    /// Per-voxel answers of a mixed section, decoded once by [`PaletteFacts::decode_voxels`].
+    decoded: Option<DecodedVoxels>,
+}
+
+/// A mixed section's [`PaletteFacts::at`] and seasonal-shelter answers for all 4,096 voxels, as
+/// an index into a table holding one answer per distinct combination of layer palette indices.
+struct DecodedVoxels {
+    voxels: Box<[u16]>,
+    entries: Vec<ResolvedPaletteEntry>,
+    shelters: Vec<bool>,
+    /// Whether [`PaletteFacts::model_entries_at`] holds a model-template contributor.
+    model_candidates: Vec<bool>,
+}
+
+/// Largest table of layer-index combinations a section decodes into; larger palettes keep the
+/// packed lookups.
+const MAX_DECODED_COMBINATIONS: usize = 1 << 12;
+
+impl<'a> PaletteFacts<'a> {
+    pub(crate) fn new(
+        classifier: BlockClassifier,
+        visuals: &RuntimeAssets,
+        network_id_mode: NetworkIdMode,
+        sub_chunk: &'a SubChunk,
+    ) -> Self {
+        let mut contributors = ResolvedContributors::default();
+        let mut main = Some(SeasonalFoliageBlock::AIR);
+        let mut extra = None;
+        let mut unsupported_extra = false;
+        for (layer, storage) in sub_chunk.storages().iter().enumerate() {
+            let Some(network_value) = storage.uniform_runtime_id() else {
+                return Self::mixed(classifier, visuals, network_id_mode, sub_chunk);
+            };
+            let entry = resolve_palette_entry(classifier, visuals, network_id_mode, network_value);
+            match layer {
+                0 => main = Some(seasonal_block(entry)),
+                1 => extra = Some(seasonal_block(entry)),
+                _ => unsupported_extra |= !entry.flags.contains(BlockFlags::AIR),
+            }
+            contributors.push(entry);
+        }
+
+        let uniform_seasonal_shelter =
+            unsupported_extra || seasonal_foliage_cell_shelters(main, extra);
+
+        if contributors.is_empty() {
+            Self {
+                source: PaletteSource::Air,
+                uniform_seasonal_shelter,
+                decoded: None,
+            }
+        } else {
+            Self {
+                source: PaletteSource::Uniform(contributors),
+                uniform_seasonal_shelter,
+                decoded: None,
+            }
+        }
+    }
+
+    fn mixed(
+        classifier: BlockClassifier,
+        visuals: &RuntimeAssets,
+        network_id_mode: NetworkIdMode,
+        sub_chunk: &'a SubChunk,
+    ) -> Self {
+        let storages = sub_chunk
+            .storages()
+            .iter()
+            .map(|storage| StoragePaletteFacts {
+                storage,
+                entries: storage
+                    .palette()
+                    .values()
+                    .iter()
+                    .copied()
+                    .map(|network_value| {
+                        resolve_palette_entry(classifier, visuals, network_id_mode, network_value)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            source: PaletteSource::Mixed(storages),
+            uniform_seasonal_shelter: true,
+            decoded: None,
+        }
+    }
+
+    /// Decodes a mixed section's per-voxel answers once, for the section a mesher asks about
+    /// every voxel and its neighbours; each distinct combination of layer palette indices is
+    /// answered by the same lookups [`Self::at`] makes. Truncated storage stays undecoded.
+    pub(crate) fn decode_voxels(&mut self) {
+        let PaletteSource::Mixed(storages) = &self.source else {
+            return;
+        };
+        // A combination of layer indices is a mixed-radix number, each layer's digit below
+        // `1 << bits`, so it addresses a dense table with no hashing.
+        let mut combinations = 1_usize;
+        for storage in storages.iter() {
+            combinations = combinations.saturating_mul(1 << storage.storage.bits_per_index());
+        }
+        if combinations > MAX_DECODED_COMBINATIONS {
+            return;
+        }
+        let mut voxels = vec![0_u16; SIDE * SIDE * SIDE].into_boxed_slice();
+        let mut radix = 1_u16;
+        for storage in storages.iter() {
+            let Some(indices) = unpacked_indices(storage.storage) else {
+                return;
+            };
+            for (key, index) in voxels.iter_mut().zip(&indices) {
+                *key += index * radix;
+            }
+            radix <<= storage.storage.bits_per_index();
+        }
+        let mut answer_of = vec![u16::MAX; combinations];
+        let (mut entries, mut shelters, mut model_candidates) =
+            (Vec::new(), Vec::new(), Vec::new());
+        for (linear, voxel) in voxels.iter_mut().enumerate() {
+            let slot = &mut answer_of[usize::from(*voxel)];
+            if *slot == u16::MAX {
+                let (x, y, z) = (linear >> 8, linear & 15, (linear >> 4) & 15);
+                *slot = entries.len() as u16;
+                entries.push(self.at(x, y, z));
+                shelters.push(self.seasonal_shelters_at(x, y, z));
+                model_candidates.push(
+                    self.model_entries_at(x, y, z)
+                        .into_iter()
+                        .flatten()
+                        .any(is_model_entry),
+                );
+            }
+            *voxel = *slot;
+        }
+        self.decoded = Some(DecodedVoxels {
+            voxels,
+            entries,
+            shelters,
+            model_candidates,
+        });
+    }
+
+    /// False only when the voxel provably has no [`is_model_entry`] contributor in
+    /// [`Self::model_entries_at`]; undecoded sections answer true.
+    pub(crate) fn may_have_model_at(&self, x: usize, y: usize, z: usize) -> bool {
+        self.decoded_slot(x, y, z)
+            .is_none_or(|(decoded, slot)| decoded.model_candidates[slot])
+    }
+
+    /// The decoded table and answer slot of a voxel inside the section.
+    fn decoded_slot(&self, x: usize, y: usize, z: usize) -> Option<(&DecodedVoxels, usize)> {
+        let decoded = self.decoded.as_ref()?;
+        if x >= SIDE || y >= SIDE || z >= SIDE {
+            return None;
+        }
+        Some((
+            decoded,
+            usize::from(decoded.voxels[(x << 8) | (z << 4) | y]),
+        ))
+    }
+
+    pub(crate) const fn is_air(&self) -> bool {
+        matches!(self.source, PaletteSource::Air)
+    }
+
+    /// Native seasonal selection uses storage zero and its extra block, not
+    /// the reordered surface/covered-plant rendering contributors.
+    pub(crate) fn seasonal_shelters_at(&self, x: usize, y: usize, z: usize) -> bool {
+        if let Some((decoded, slot)) = self.decoded_slot(x, y, z) {
+            return decoded.shelters[slot];
+        }
+        let PaletteSource::Mixed(storages) = &self.source else {
+            return self.uniform_seasonal_shelter;
+        };
+        let entry_at = |storage: &StoragePaletteFacts<'_>| {
+            packed_palette_index(storage.storage, x, y, z)
+                .and_then(|index| storage.entries.get(index))
+                .copied()
+        };
+        let main = storages.first().and_then(entry_at).map(seasonal_block);
+        let extra = match storages.get(1) {
+            Some(storage) => {
+                let Some(entry) = entry_at(storage) else {
+                    return true;
+                };
+                Some(seasonal_block(entry))
+            }
+            None => None,
+        };
+        // Update packets can address layers beyond vanilla's two wire layers.
+        // Unclassified non-air extras cannot prove an exposed seasonal cell.
+        storages.iter().skip(2).any(|storage| {
+            entry_at(storage).is_none_or(|entry| !entry.flags.contains(BlockFlags::AIR))
+        }) || seasonal_foliage_cell_shelters(main, extra)
+    }
+
+    pub(crate) fn has_model_geometry(&self) -> bool {
+        match &self.source {
+            PaletteSource::Air => false,
+            PaletteSource::Uniform(contributors) => {
+                is_model_entry(contributors.geometry_entry())
+                    || contributors.extra_model.is_some_and(is_model_entry)
+            }
+            PaletteSource::Mixed(storages) => storages
+                .iter()
+                .any(|storage| storage.entries.iter().copied().any(is_model_entry)),
+        }
+    }
+
+    fn contributors_at(&self, x: usize, y: usize, z: usize) -> ResolvedContributors {
+        match &self.source {
+            PaletteSource::Air => ResolvedContributors::default(),
+            PaletteSource::Uniform(contributors) => *contributors,
+            PaletteSource::Mixed(storages) => {
+                let mut contributors = ResolvedContributors::default();
+                for storage in storages {
+                    let Some(index) = packed_palette_index(storage.storage, x, y, z) else {
+                        contributors.fail_closed(0, None);
+                        return contributors;
+                    };
+                    let Some(&entry) = storage.entries.get(index) else {
+                        contributors.fail_closed(0, None);
+                        return contributors;
+                    };
+                    contributors.push(entry);
+                }
+                contributors
+            }
+        }
+    }
+
+    /// The primary contributor plus at most one extra model-routed block, such
+    /// as a plant under top snow or under a placed block. The primary remains
+    /// the sole neighbour-occlusion participant.
+    pub(crate) fn model_entries_at(
+        &self,
+        x: usize,
+        y: usize,
+        z: usize,
+    ) -> [Option<ResolvedPaletteEntry>; 2] {
+        let contributors = self.contributors_at(x, y, z);
+        [contributors.primary, contributors.extra_model]
+    }
+
+    /// Visits every voxel with `classify` applied to its [`Self::at`] answer. A decoded section
+    /// classifies each distinct answer once instead of once per voxel.
+    pub(crate) fn for_each_voxel_class<T: Copy>(
+        &self,
+        classify: impl Fn(&ResolvedPaletteEntry) -> T,
+        mut visit: impl FnMut(usize, usize, usize, T),
+    ) {
+        if let Some(decoded) = &self.decoded {
+            let classes = decoded.entries.iter().map(&classify).collect::<Vec<_>>();
+            for (linear, &slot) in decoded.voxels.iter().enumerate() {
+                visit(
+                    linear >> 8,
+                    linear & 15,
+                    (linear >> 4) & 15,
+                    classes[usize::from(slot)],
+                );
+            }
+            return;
+        }
+        for x in 0..SIDE {
+            for y in 0..SIDE {
+                for z in 0..SIDE {
+                    visit(x, y, z, classify(&self.at(x, y, z)));
+                }
+            }
+        }
+    }
+
+    /// Resolves the surface used by cube visibility and neighbour occlusion.
+    pub(crate) fn at(&self, x: usize, y: usize, z: usize) -> ResolvedPaletteEntry {
+        if let Some((decoded, slot)) = self.decoded_slot(x, y, z) {
+            return decoded.entries[slot];
+        }
+        let PaletteSource::Mixed(storages) = &self.source else {
+            return self.contributors_at(x, y, z).geometry_entry();
+        };
+        let mut contributors = ResolvedContributors::default();
+        for storage in storages {
+            let Some(&entry) = packed_palette_index(storage.storage, x, y, z)
+                .and_then(|index| storage.entries.get(index))
+            else {
+                return ResolvedPaletteEntry::diagnostic(0, None);
+            };
+            contributors.push(entry);
+        }
+        contributors.geometry_entry()
+    }
+}
+
+/// A contributor the model pass tessellates: a crossed or model visual with a template.
+pub(crate) const fn is_model_entry(entry: ResolvedPaletteEntry) -> bool {
+    is_model_kind(entry) && entry.model_template != NO_MODEL_TEMPLATE
+}
+
+/// Whether `entry` draws through the model route rather than as a cube, even
+/// before a template is admitted.
+const fn is_model_kind(entry: ResolvedPaletteEntry) -> bool {
+    matches!(entry.kind, VisualKind::Cross | VisualKind::Model)
+}
+
+const fn seasonal_block(entry: ResolvedPaletteEntry) -> SeasonalFoliageBlock {
+    SeasonalFoliageBlock {
+        flags: entry.flags,
+        kind: entry.kind,
+        variant: entry.variant,
+    }
+}
+
+/// Resolves all bounded storage layers without expanding them into a flat
+/// 4,096-entry block array.
+pub struct ContributorResolver<'a> {
+    facts: PaletteFacts<'a>,
+    palette_entry_count: usize,
+}
+
+impl<'a> ContributorResolver<'a> {
+    #[must_use]
+    pub fn new(
+        classifier: BlockClassifier,
+        visuals: &RuntimeAssets,
+        network_id_mode: NetworkIdMode,
+        sub_chunk: &'a SubChunk,
+    ) -> Self {
+        Self {
+            facts: PaletteFacts::new(classifier, visuals, network_id_mode, sub_chunk),
+            palette_entry_count: sub_chunk
+                .storages()
+                .iter()
+                .map(|storage| storage.palette().values().len())
+                .sum(),
+        }
+    }
+
+    /// Number of palette facts retained by this resolver. This is bounded by
+    /// storage palette cardinality, never the 4,096 voxel coordinates.
+    #[must_use]
+    pub const fn palette_entry_count(&self) -> usize {
+        self.palette_entry_count
+    }
+
+    #[must_use]
+    pub fn resolve(&self, coordinate: [u8; 3]) -> ResolvedContributors {
+        if coordinate
+            .into_iter()
+            .any(|coordinate| usize::from(coordinate) >= SIDE)
+        {
+            let mut contributors = ResolvedContributors::default();
+            contributors.fail_closed(0, None);
+            return contributors;
+        }
+        self.facts.contributors_at(
+            usize::from(coordinate[0]),
+            usize::from(coordinate[1]),
+            usize::from(coordinate[2]),
+        )
+    }
+
+    /// Resolves one coordinate directly from packed storage palettes without
+    /// constructing the palette-fact cache. This path performs no heap
+    /// allocation and is intended for sparse, per-frame queries such as the
+    /// camera eye medium; full sub-chunk meshing should keep using `new`.
+    #[must_use]
+    pub fn resolve_direct(
+        classifier: BlockClassifier,
+        visuals: &RuntimeAssets,
+        network_id_mode: NetworkIdMode,
+        sub_chunk: &SubChunk,
+        coordinate: [u8; 3],
+    ) -> ResolvedContributors {
+        if coordinate
+            .into_iter()
+            .any(|coordinate| usize::from(coordinate) >= SIDE)
+        {
+            let mut contributors = ResolvedContributors::default();
+            contributors.fail_closed(0, None);
+            return contributors;
+        }
+
+        let mut contributors = ResolvedContributors::default();
+        for layer in 0..sub_chunk.storages().len() {
+            let Some(network_value) =
+                sub_chunk.runtime_id(layer, coordinate[0], coordinate[1], coordinate[2])
+            else {
+                contributors.fail_closed(0, None);
+                return contributors;
+            };
+            contributors.push(resolve_palette_entry(
+                classifier,
+                visuals,
+                network_id_mode,
+                network_value,
+            ));
+        }
+        contributors
+    }
+}
+
+pub(crate) fn resolve_palette_entry(
+    classifier: BlockClassifier,
+    visuals: &RuntimeAssets,
+    network_id_mode: NetworkIdMode,
+    network_value: u32,
+) -> ResolvedPaletteEntry {
+    if classifier.is_air(network_value) {
+        return ResolvedPaletteEntry::air(network_value);
+    }
+    palette_entry_of_block(
+        visuals,
+        network_id_mode,
+        network_value,
+        visuals.resolve(network_id_mode, network_value),
+    )
+}
+
+/// The non-air [`resolve_palette_entry`] answer for `block`, which must be
+/// `visuals.resolve(network_id_mode, network_value)`; callers that already hold the
+/// resolved block reuse it instead of resolving (and counting a miss) twice.
+pub(crate) fn palette_entry_of_block(
+    visuals: &RuntimeAssets,
+    network_id_mode: NetworkIdMode,
+    network_value: u32,
+    block: assets::ResolvedBlock,
+) -> ResolvedPaletteEntry {
+    let sequential_id = if block.is_known() {
+        match network_id_mode {
+            NetworkIdMode::Sequential => Some(network_value),
+            NetworkIdMode::Hashed => visuals.sequential_id_for_hash(network_value),
+        }
+    } else {
+        None
+    };
+    let mut flags = block.flags();
+    flags.remove(BlockFlags::AIR);
+    let faces = if flags.contains(BlockFlags::CUBE_GEOMETRY)
+        || matches!(block.kind(), VisualKind::Liquid | VisualKind::Model)
+    {
+        Face::ALL.map(|face| block.face(block_face(face)).material_id())
+    } else {
+        flags.remove(BlockFlags::LEAF_MODEL);
+        if block.kind() != VisualKind::Model {
+            flags.remove(BlockFlags::OCCLUDES_FULL_FACE);
+        }
+        [DIAGNOSTIC_MATERIAL; Face::ALL.len()]
+    };
+    ResolvedPaletteEntry {
+        network_value,
+        sequential_id,
+        contributor_role: block.contributor_role(),
+        flags,
+        faces,
+        kind: block.kind(),
+        model_template: block.model_template().unwrap_or(NO_MODEL_TEMPLATE),
+        variant: block.variant(),
+    }
+}
+
+pub(crate) const fn pack_model_transform(local: [u8; 3], transform: u32) -> u32 {
+    (local[0] as u32)
+        | ((local[1] as u32) << 4)
+        | ((local[2] as u32) << 8)
+        | ((transform << 12) & !crate::MODEL_REF_FLAG_RANDOM_OFFSET)
+}
+
+/// Every voxel's palette index in `storage`, in [`packed_palette_index`]'s linear order; `None`
+/// when its words do not cover the section.
+fn unpacked_indices(storage: &PalettedStorage) -> Option<Box<[u16]>> {
+    let voxels = SIDE * SIDE * SIDE;
+    let bits = usize::from(storage.bits_per_index());
+    if bits == 0 {
+        return Some(vec![0; voxels].into_boxed_slice());
+    }
+    if bits > 16 {
+        return None;
+    }
+    let values_per_word = 32 / bits;
+    let words = storage.packed_words();
+    if words.len() * values_per_word < voxels {
+        return None;
+    }
+    let mask = (1_u32 << bits) - 1;
+    let mut indices = Vec::with_capacity(voxels);
+    'words: for &word in words {
+        for slot in 0..values_per_word {
+            if indices.len() == voxels {
+                break 'words;
+            }
+            indices.push(((word >> (slot * bits)) & mask) as u16);
+        }
+    }
+    Some(indices.into_boxed_slice())
+}
+
+/// Palette index of one voxel in `storage`, `None` outside the section or past its words;
+/// the same answer [`PalettedStorage::runtime_id`] looks its palette value up with.
+pub(crate) fn packed_palette_index(
+    storage: &PalettedStorage,
+    x: usize,
+    y: usize,
+    z: usize,
+) -> Option<usize> {
+    if x >= SIDE || y >= SIDE || z >= SIDE {
+        return None;
+    }
+    if storage.bits_per_index() == 0 {
+        return Some(0);
+    }
+
+    let linear = (x << 8) | (z << 4) | y;
+    let bits = usize::from(storage.bits_per_index());
+    let values_per_word = 32 / bits;
+    let word = *storage.packed_words().get(linear / values_per_word)?;
+    let shift = (linear % values_per_word) * bits;
+    let mask = (1_u32 << storage.bits_per_index()) - 1;
+    Some(((word >> shift) & mask) as usize)
+}
+
+const fn block_face(face: Face) -> BlockFace {
+    match face {
+        Face::NegativeX => BlockFace::West,
+        Face::PositiveX => BlockFace::East,
+        Face::NegativeY => BlockFace::Down,
+        Face::PositiveY => BlockFace::Up,
+        Face::NegativeZ => BlockFace::North,
+        Face::PositiveZ => BlockFace::South,
+    }
+}
+
+#[cfg(test)]
+#[path = "contributors/tests.rs"]
+mod tests;

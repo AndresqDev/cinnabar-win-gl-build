@@ -1,0 +1,38 @@
+[package]
+name = "oreui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+tracy = []
+
+[dependencies]
+cosmetics = { path = "../cosmetics" }
+assets = { path = "../assets" }
+bridge = { path = "../bridge" }
+image.workspace = true
+launcher = { path = "../launcher" }
+protocol = { path = "../protocol" }
+render-api = { path = "../render-api" }
+render-model = { path = "../render-model" }
+resource-pack = { path = "../resource-pack", default-features = false }
+semantic-input = { path = "../input" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing.workspace = true
+ui = { path = "../ui" }
+ui-engine = { path = "../ui-engine" }
+
+[dev-dependencies]
+update-manifest = { path = "../update-manifest" }
+render-model = { path = "../render-model", features = ["test-support"] }
+test-alloc = { path = "../test-alloc" }
+render-api = { path = "../render-api" }
+tempfile = "3"
+ui-engine = { path = "../ui-engine", features = ["test-support"] }
+
+[lints]
+workspace = true

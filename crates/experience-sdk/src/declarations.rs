@@ -1,0 +1,428 @@
+//! For a guest's build script: what `experience.toml` declares for both halves, as constants, so
+//! that neither half restates a channel, action or template.
+//!
+//! ```no_run
+//! // build.rs's `main`, with experience-sdk as a build dependency with `declarations`
+//! experience_sdk::declarations::generate("../experience.toml");
+//! ```
+//!
+//! ```ignore
+//! // src/lib.rs
+//! mod experience {
+//!     experience_sdk::include_declarations!();
+//! }
+//! // experience::channels::CONTROLLER, experience::actions::…, experience::templates::…
+//! ```
+//!
+//! - `channels`: each `[[client.channels]]` as a [`Channel`](crate::Channel), named after its id
+//!   without the `<experience id>.` prefix (`benergistics.controller` is `CONTROLLER`).
+//! - `actions`: each `[client]` action id as a `&str`, named the same way.
+//! - `templates`: each `[client]` template path `ui/<name>.json` as a `&str`, named `<NAME>`.
+//!
+//! A player mod's build script calls [`generate_mod`] on its `mod.toml` instead, which gives
+//! `actions`, `templates` and `keys` (each `[[keys]]` id, named the same way).
+//!
+//! A name is upper snake case: every character but an ASCII letter or digit becomes `_`, and a
+//! leading digit gets a `_` before it. Two declarations with one name are refused. Everything
+//! else about the declarations is for `cinnabar-cxb build`, which checks them with the client's
+//! own verifier, and the server-only keys are the runtime's.
+
+use std::collections::BTreeSet;
+use std::fmt::Write;
+use std::path::Path;
+
+use serde::Deserialize;
+
+/// The file that [`generate`] writes into `OUT_DIR` and [`include_declarations!`] includes.
+///
+/// [`include_declarations!`]: crate::include_declarations
+pub const FILE: &str = crate::__declarations_rs!();
+
+/// Writes the declarations of the `experience.toml` at `path`, relative to the package, to
+/// [`FILE`] in `OUT_DIR`, and has Cargo rerun the build script when that file changes.
+///
+/// # Panics
+///
+/// When the file cannot be read or written, or declares what has no constant, naming the
+/// reason: that is how a build script fails.
+pub fn generate(path: impl AsRef<Path>) {
+    write(path.as_ref(), source);
+}
+
+/// Writes the declarations of a player mod's `mod.toml` at `path` as [`generate`] does, after
+/// the checks [`ModManifest::parse_declarations`](crate::mod_manifest::ModManifest::parse_declarations)
+/// makes: `[files]` is filled only after the build.
+///
+/// # Panics
+///
+/// As [`generate`].
+pub fn generate_mod(path: impl AsRef<Path>) {
+    write(path.as_ref(), mod_source);
+}
+
+#[expect(
+    clippy::print_stdout,
+    reason = "build scripts talk to Cargo through `cargo::` directives on stdout"
+)]
+fn write(path: &Path, source: fn(&str) -> Result<String, String>) {
+    println!("cargo::rerun-if-changed={}", path.display());
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let parsed: Experience = toml::from_str(&text).unwrap_or_default();
+    for asset in parsed.client.assets {
+        let asset_path = path.parent().unwrap_or(Path::new(".")).join(&asset);
+        assert!(
+            asset_path.is_file(),
+            "drawing asset {} is missing",
+            asset_path.display()
+        );
+        println!("cargo::rerun-if-changed={}", asset_path.display());
+    }
+    let source = source(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let out = Path::new(&std::env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR")).join(FILE);
+    std::fs::write(&out, source)
+        .unwrap_or_else(|error| panic!("writing {}: {error}", out.display()));
+}
+
+/// The parts of `experience.toml` that have constants.
+#[derive(Default, Deserialize)]
+struct Experience {
+    id: String,
+    #[serde(default)]
+    client: Client,
+}
+
+#[derive(Default, Deserialize)]
+struct Client {
+    #[serde(default)]
+    channels: Vec<ChannelDecl>,
+    #[serde(default)]
+    actions: Vec<String>,
+    #[serde(default)]
+    templates: Vec<String>,
+    #[serde(default)]
+    assets: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ChannelDecl {
+    id: String,
+    schema: u16,
+    direction: DirectionDecl,
+    fields: Vec<FieldDecl>,
+}
+
+/// [`Direction`](crate::Direction) as the manifest spells it.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectionDecl {
+    ToClient,
+    ToServer,
+}
+
+/// [`Field`](crate::Field) as the manifest spells it.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FieldDecl {
+    Bool,
+    Integer {
+        min: i64,
+        max: i64,
+    },
+    Text {
+        max_bytes: u16,
+    },
+    Choice {
+        variants: u16,
+    },
+    List {
+        item: Box<FieldDecl>,
+        max_items: u16,
+    },
+    Record {
+        fields: Vec<FieldDecl>,
+    },
+}
+
+const SDK: &str = "::experience_sdk";
+const ALLOW: &str = "#[allow(dead_code, reason = \"each half uses the declarations it needs\")]";
+
+/// The Rust source of `experience.toml`'s declarations, or why one has no constant.
+fn source(text: &str) -> Result<String, String> {
+    let Experience { id, client } = toml::from_str(text).map_err(|error| error.to_string())?;
+    let prefix = format!("{id}.");
+    let mut out =
+        String::from("// Generated by experience_sdk::declarations from experience.toml.\n");
+
+    let mut names = Names::default();
+    let _ = writeln!(
+        out,
+        "\n/// `[[client.channels]]`.\n{ALLOW}\npub mod channels {{"
+    );
+    for channel in &client.channels {
+        let name = channel
+            .id
+            .strip_prefix(&prefix)
+            .ok_or_else(|| format!("channel {} is outside the namespace {prefix}", channel.id))?;
+        let name = names.take(name, &channel.id)?;
+        let direction = match channel.direction {
+            DirectionDecl::ToClient => "ToClient",
+            DirectionDecl::ToServer => "ToServer",
+        };
+        let _ = write!(
+            out,
+            "    /// `{}`, revision {}.\n    pub const {name}: {SDK}::Channel = {SDK}::Channel {{ \
+             id: {:?}, schema: {}, direction: {SDK}::Direction::{direction}, fields: &[",
+            channel.id, channel.schema, channel.id, channel.schema,
+        );
+        fields(&mut out, &channel.fields);
+        out.push_str("] };\n");
+    }
+    out.push_str("}\n");
+
+    ids(
+        &mut out,
+        "actions",
+        "`[client]` actions",
+        &prefix,
+        &client.actions,
+    )?;
+    templates(&mut out, "`[client]` templates", &client.templates)?;
+    let mut names = Names::default();
+    let _ = writeln!(
+        out,
+        "\n/// Signed drawing assets.\n{ALLOW}\npub mod assets {{"
+    );
+    for path in &client.assets {
+        let name = Path::new(path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("invalid drawing asset {path}"))?;
+        let name = names.take(name, path)?;
+        let _ = writeln!(
+            out,
+            "    pub const {name}: {SDK}::Asset = {SDK}::Asset::new({path:?});"
+        );
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// The Rust source of `mod.toml`'s declarations, or why it is refused.
+fn mod_source(text: &str) -> Result<String, String> {
+    let manifest = crate::mod_manifest::ModManifest::parse_declarations(text)?;
+    let prefix = format!("{}.", manifest.id);
+    let mut out = String::from("// Generated by experience_sdk::declarations from mod.toml.\n");
+    ids(&mut out, "actions", "`actions`", &prefix, &manifest.actions)?;
+    templates(&mut out, "`templates`", &manifest.templates)?;
+    let keys: Vec<String> = manifest.keys.into_iter().map(|key| key.id).collect();
+    ids(&mut out, "keys", "`[[keys]]`", &prefix, &keys)?;
+    Ok(out)
+}
+
+/// A module of `&str` constants, one per id, named after the id without `prefix`.
+fn ids(
+    out: &mut String,
+    module: &str,
+    doc: &str,
+    prefix: &str,
+    ids: &[String],
+) -> Result<(), String> {
+    let mut names = Names::default();
+    let _ = writeln!(out, "\n/// {doc}.\n{ALLOW}\npub mod {module} {{");
+    for id in ids {
+        let name = names.take(id.strip_prefix(prefix).unwrap_or(id), id)?;
+        let _ = writeln!(out, "    pub const {name}: &str = {id:?};");
+    }
+    out.push_str("}\n");
+    Ok(())
+}
+
+/// The `templates` module: each `ui/<name>.json` path as a `&str`, named `<NAME>`.
+fn templates(out: &mut String, doc: &str, paths: &[String]) -> Result<(), String> {
+    let mut names = Names::default();
+    let _ = writeln!(out, "\n/// {doc}.\n{ALLOW}\npub mod templates {{");
+    for template in paths {
+        let name = template
+            .strip_prefix("ui/")
+            .and_then(|name| name.strip_suffix(".json"))
+            .ok_or_else(|| format!("template {template} is not ui/<name>.json"))?;
+        let name = names.take(name, template)?;
+        let _ = writeln!(out, "    pub const {name}: &str = {template:?};");
+    }
+    out.push_str("}\n");
+    Ok(())
+}
+
+/// Writes `fields` as `Field` expressions, separated by commas.
+fn fields(out: &mut String, fields: &[FieldDecl]) {
+    for (index, decl) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        field(out, decl);
+    }
+}
+
+fn field(out: &mut String, decl: &FieldDecl) {
+    let _ = match decl {
+        FieldDecl::Bool => write!(out, "{SDK}::Field::Bool {{}}"),
+        FieldDecl::Integer { min, max } => {
+            write!(out, "{SDK}::Field::Integer {{ min: {min}, max: {max} }}")
+        }
+        FieldDecl::Text { max_bytes } => {
+            write!(out, "{SDK}::Field::Text {{ max_bytes: {max_bytes} }}")
+        }
+        FieldDecl::Choice { variants } => {
+            write!(out, "{SDK}::Field::Choice {{ variants: {variants} }}")
+        }
+        FieldDecl::List { item, max_items } => {
+            let _ = write!(out, "{SDK}::Field::List {{ item: &");
+            field(out, item);
+            write!(out, ", max_items: {max_items} }}")
+        }
+        FieldDecl::Record { fields: items } => {
+            let _ = write!(out, "{SDK}::Field::Record {{ fields: &[");
+            fields(out, items);
+            write!(out, "] }}")
+        }
+    };
+}
+
+/// The constant names of one module, each taken once.
+#[derive(Default)]
+struct Names(BTreeSet<String>);
+
+impl Names {
+    /// The constant name of `text`, declared as `declared`, unless it is empty or another
+    /// declaration has it.
+    fn take(&mut self, text: &str, declared: &str) -> Result<String, String> {
+        if text.is_empty() {
+            return Err(format!("{declared} has no name to make a constant of"));
+        }
+        let name = constant(text);
+        if !self.0.insert(name.clone()) {
+            return Err(format!("{declared} is the second declaration named {name}"));
+        }
+        Ok(name)
+    }
+}
+
+/// `text` as an upper snake case Rust constant name.
+fn constant(text: &str) -> String {
+    let mut name: String = text
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert(0, '_');
+    }
+    name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{constant, mod_source, source};
+    use crate::mod_manifest::API;
+
+    const HEADER: &str = "id = \"demo\"\nversion = \"0.1.0\"\napi = \"0.3\"\ndata-schema = 1\n";
+
+    /// A `[[client.channels]]` entry without fields.
+    fn channel(id: &str, schema: u16) -> String {
+        format!(
+            "[[client.channels]]\nid = \"{id}\"\nschema = {schema}\n\
+             direction = \"to_client\"\nfields = []\n"
+        )
+    }
+
+    fn refusal(client: &str) -> String {
+        source(&format!("{HEADER}[client]\n{client}")).unwrap_err()
+    }
+
+    #[test]
+    fn names_are_upper_snake_case_constants() {
+        assert_eq!(constant("items"), "ITEMS");
+        assert_eq!(constant("pick-row.v2"), "PICK_ROW_V2");
+        assert_eq!(constant("2d"), "_2D");
+    }
+
+    #[test]
+    fn a_channel_needs_a_name_in_the_namespace() {
+        for id in ["other.items", "demo.", "demo"] {
+            let error = refusal(&channel(id, 1));
+            assert!(error.contains(id), "{id}: {error}");
+        }
+    }
+
+    /// Two revisions of one channel, or ids that differ only in separators, would share a name.
+    #[test]
+    fn two_declarations_with_one_name_are_refused() {
+        let error = refusal(&(channel("demo.items", 1) + &channel("demo.items", 2)));
+        assert!(error.contains("ITEMS"), "{error}");
+        let error = refusal("actions = [\"demo.pick-row\", \"demo.pick_row\"]\n");
+        assert!(error.contains("PICK_ROW"), "{error}");
+    }
+
+    #[test]
+    fn a_template_outside_ui_is_refused() {
+        let error = refusal("templates = [\"screens/terminal.json\"]\n");
+        assert!(error.contains("screens/terminal.json"), "{error}");
+    }
+
+    /// Each module names its own declarations, and the server keys and tables are not the
+    /// SDK's to read.
+    #[test]
+    fn modules_name_independently_and_server_keys_are_ignored() {
+        let text = format!(
+            "{HEADER}[client]\nactions = [\"demo.terminal\"]\ntemplates = [\"ui/terminal.json\"]\n\
+             {}[files]\n\"server.wasm\" = \"00\"\n",
+            channel("demo.terminal", 1),
+        );
+        source(&text).unwrap();
+        source(HEADER).unwrap();
+    }
+
+    /// `mod.toml`'s actions, templates and keys, named as `experience.toml`'s are.
+    #[test]
+    fn a_mod_manifest_declares_actions_templates_and_keys() {
+        let hash = "0".repeat(64);
+        let text = format!(
+            "id = \"bei\"
+version = \"0.1.0\"
+api = \"{API}\"
+permissions = [\"keys\"]
+             templates = [\"ui/overlay.json\"]
+actions = [\"bei.next-page\"]
+             [[keys]]
+id = \"bei.show_recipes\"
+key = \"r\"
+label = \"k\"
+             [files]
+\"mod.wasm\" = \"{hash}\"
+\"ui/overlay.json\" = \"{hash}\"
+"
+        );
+        let out = mod_source(&text).unwrap();
+        assert!(
+            out.contains("pub const NEXT_PAGE: &str = \"bei.next-page\";"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub const OVERLAY: &str = \"ui/overlay.json\";"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub const SHOW_RECIPES: &str = \"bei.show_recipes\";"),
+            "{out}"
+        );
+        let clash = text.replace("bei.next-page", "bei.next-page\", \"bei.next_page");
+        assert!(mod_source(&clash).unwrap_err().contains("NEXT_PAGE"));
+        assert!(mod_source("id = 1").is_err());
+    }
+}

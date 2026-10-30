@@ -1,0 +1,67 @@
+//! Personal-mod rendering: sandboxed post passes before the HUD and world primitives in the
+//! transparent phase. Nothing is queued or drawn while no mod renders. Pass pipelines are
+//! owned per pass revision, so replaced or reloaded passes release them.
+
+use render_scene::ModRenderScene;
+
+mod buffers;
+mod passes;
+#[cfg(test)]
+pub(crate) use passes::PassGpu;
+
+pub(crate) mod composition;
+mod primitives;
+pub(crate) mod retained;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+use bevy::prelude::{Entity, GlobalTransform, Mat4, Msaa, Mut, UVec4, Vec3, World, default};
+use bevy::{
+    prelude::{App, Plugin, Resource},
+    render::{RenderApp, extract_resource::ExtractResourcePlugin},
+};
+pub use passes::ModPassLabel;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModRenderPlugin;
+
+impl Plugin for ModRenderPlugin {
+    fn build(&self, app: &mut App) {
+        install(app);
+    }
+
+    fn finish(&self, app: &mut App) {
+        install(app);
+    }
+}
+
+#[derive(Resource)]
+struct Installed;
+
+fn install(app: &mut App) {
+    app.init_resource::<ModRenderScene>();
+    app.init_resource::<render_scene::mod_scene::retained::DrawingFrame>();
+    crate::pipeline_warmup::register_pending::<passes::PassGpu>(app);
+    crate::pipeline_warmup::register::<composition::CompositionGpu>(app);
+    let Some(render_app) = app.get_sub_app(RenderApp) else {
+        return;
+    };
+    if render_app.world().contains_resource::<Installed>() {
+        crate::chunk::blocks::install(app);
+        retained::clips::install_graph(app.sub_app_mut(RenderApp).world_mut());
+        crate::chunk::blocks::install_graph(app.sub_app_mut(RenderApp).world_mut());
+        crate::actor_render::masks::install_graph(app.sub_app_mut(RenderApp).world_mut());
+        passes::install_graph(app.sub_app_mut(RenderApp).world_mut());
+        composition::install_graph(app.sub_app_mut(RenderApp).world_mut());
+        return;
+    }
+    app.add_plugins(ExtractResourcePlugin::<ModRenderScene>::default());
+    primitives::install(app);
+    retained::install(app);
+    app.sub_app_mut(RenderApp).insert_resource(Installed);
+    passes::install(app.sub_app_mut(RenderApp));
+    composition::install(app.sub_app_mut(RenderApp));
+}
+
+use mod_render::block_highlights;

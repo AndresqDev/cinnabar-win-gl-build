@@ -1,0 +1,451 @@
+//! Actor-clock damage rotation composed onto the rendered player camera.
+
+use bevy::prelude::{Mat4, Quat, Query, Res, ResMut, Resource, SystemSet, Transform, With};
+
+use super::{CameraSettingsAuthority, FirstPersonHandMotion, FlyCamera, ServerCameraView};
+use crate::observations::WorldObservation;
+use semantic_input::PerspectiveMode;
+
+/// Completes actor camera effects before an explicit rendered-pose override.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActorCameraEffects;
+
+/// The native damage shake at full strength, in [`super::ViewTilt`] degrees: a tilt of these
+/// angles that suppresses the native shake presents the same view.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DamageShake {
+    pub roll_degrees: f32,
+    pub pitch_degrees: f32,
+}
+
+/// The damage shake of the last presented first-person view, at full strength: before the
+/// player's damage-shake setting, a mod tilt or suppression. None while no shake is active.
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq)]
+pub struct PresentedDamageShake(pub Option<DamageShake>);
+
+/// Samples hurt and bob on their own clocks, applying movement bob to the selected views, and
+/// publishes the damage shake it samples at full strength.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_actor_damage_camera_rotation(
+    settings: Res<CameraSettingsAuthority>,
+    mut hand: ResMut<FirstPersonHandMotion>,
+    mut shake: ResMut<PresentedDamageShake>,
+    legacy: Option<Res<super::legacy::LegacyCameraMotion>>,
+    server: Res<ServerCameraView>,
+    world: Option<WorldObservation<'_>>,
+    partial_tick: f32,
+    physics_partial_tick: f32,
+    mut cameras: Query<&mut Transform, With<FlyCamera>>,
+) {
+    hand.legacy_effect = None;
+    shake.0 = None;
+    if !server.renders_first_person(settings.perspective() == PerspectiveMode::FirstPerson) {
+        return;
+    }
+    let alpha = render_model::legacy_combat::partial_tick(partial_tick);
+    if render_api::DEFAULT_COMBAT_VISUALS == render_api::CombatVisuals::Legacy112 {
+        let stream = world.and_then(|world| world.stream);
+        let actor =
+            stream.and_then(|stream| stream.authority().actor(stream.local_player_runtime_id()));
+        shake.0 = actor.and_then(|actor| legacy_damage_shake(actor, alpha));
+        let geometry = stream
+            .and_then(|stream| {
+                stream
+                    .authority()
+                    .actor_rig(stream.local_player_runtime_id())
+            })
+            .and_then(|rig| rig.skin_geometry)
+            .map(|geometry| geometry.as_ref());
+        let endpoints = legacy
+            .as_deref()
+            .map(|legacy| legacy.state.endpoints)
+            .unwrap_or_default();
+        let tilt = tilt_view_effect(settings.view_tilt_rotation());
+        let sample = |bobbing| {
+            tilt * sampled_legacy_effect(
+                actor,
+                endpoints,
+                alpha,
+                physics_partial_tick,
+                bobbing,
+                settings.hurt_shake_intensity(),
+                geometry,
+            )
+        };
+        let mode = settings.feel().view_bobbing;
+        let effect = sample(mode.hand_enabled());
+        hand.legacy_effect = Some(effect);
+        let camera_effect = if mode.hand_enabled() == mode.camera_enabled() {
+            effect
+        } else {
+            sample(false)
+        };
+        if camera_effect.is_finite() {
+            for mut camera in &mut cameras {
+                // Inverting the selected view effect gives Hurt × Bob × Vbase.
+                *camera = Transform::from_matrix(camera.to_matrix() * camera_effect.inverse());
+            }
+        }
+        return;
+    }
+    let damage = world
+        .and_then(|world| world.stream)
+        .and_then(|stream| stream.authority().actor(stream.local_player_runtime_id()))
+        .map_or(Quat::IDENTITY, |actor| {
+            let death_ticks = actor
+                .attributes
+                .get("minecraft:health")
+                .filter(|health| health.current.ceil() < 1.0)
+                .map(|_| f32::from(actor.status.native_death_ticks()) + alpha);
+            let hurt_progress = if actor.status.hurt_time > 0 {
+                (f32::from(actor.status.hurt_time) - alpha)
+                    / f32::from(client_world::HURT_DURATION_TICKS)
+            } else {
+                0.0
+            };
+            let hurt_angle = actor.status.hurt_direction.unwrap_or(0.0).to_radians();
+            shake.0 = (hurt_progress > 0.0)
+                .then(|| axis_tilt(hurt_shake_degrees(hurt_progress), hurt_angle));
+            damage_rotation(
+                death_ticks,
+                hurt_progress,
+                hurt_angle,
+                settings.hurt_shake_intensity(),
+            )
+        })
+        * settings.view_tilt_rotation();
+    let bob = if settings.feel().view_bobbing.camera_enabled() {
+        hand.bob.matrix().inverse()
+    } else {
+        Mat4::IDENTITY
+    };
+    let effect = Mat4::from_quat(damage) * bob;
+    if effect == Mat4::IDENTITY || !effect.is_finite() {
+        return;
+    }
+    for mut camera in &mut cameras {
+        *camera = Transform::from_matrix(camera.to_matrix() * effect);
+    }
+}
+
+/// A mod's camera-frame tilt as a view effect beside the damage shake, so the camera receives
+/// the tilt after hurt and bob and the first-person hand follows it.
+fn tilt_view_effect(tilt: Quat) -> Mat4 {
+    Mat4::from_quat(tilt.inverse())
+}
+
+/// Shares actor-clock hurt and physics-clock bob between world and first-person draws.
+fn sampled_legacy_effect(
+    actor: Option<&client_world::ActorSnapshot>,
+    endpoints: render_model::legacy_combat::LegacyCameraEndpoints,
+    actor_alpha: f32,
+    physics_alpha: f32,
+    view_bobbing: bool,
+    hurt_strength: f32,
+    geometry: Option<&assets::SkinGeometry>,
+) -> Mat4 {
+    let Some(actor) = actor else {
+        return Mat4::IDENTITY;
+    };
+    let death_ticks = (actor.status.dead
+        || actor
+            .attributes
+            .get("minecraft:health")
+            .is_some_and(|health| health.current.ceil() < 1.0))
+    .then(|| f32::from(actor.status.native_death_ticks()));
+    let hurt = render_model::legacy_combat::legacy_hurt_matrix(
+        actor.status.hurt_time,
+        actor.status.hurt_direction.unwrap_or(0.0),
+        death_ticks,
+        actor_alpha,
+        hurt_strength,
+    );
+    let bob = if view_bobbing
+        && matches!(actor.kind, protocol::ActorKind::Player { .. })
+        && geometry.is_none_or(|geometry| !geometry.animation_no_head_bob)
+    {
+        endpoints.bob_matrix(physics_alpha)
+    } else {
+        Mat4::IDENTITY
+    };
+    hurt * bob
+}
+
+/// The Bedrock 1.12 shake the legacy camera samples for `actor` at full strength. The camera
+/// turns by the inverse of [`render_model::legacy_combat::legacy_hurt_matrix`], whose shake
+/// axis is the view axis turned by minus the hurt direction.
+fn legacy_damage_shake(actor: &client_world::ActorSnapshot, alpha: f32) -> Option<DamageShake> {
+    let direction = actor.status.hurt_direction.unwrap_or(0.0);
+    let radians = render_model::legacy_combat::legacy_hurt_radians(actor.status.hurt_time, alpha)
+        .filter(|_| direction.is_finite())?;
+    Some(axis_tilt(-radians.to_degrees(), (-direction).to_radians()))
+}
+
+/// The tilt turning `degrees` about the camera axis `(sin turn, 0, cos turn)`, the view axis
+/// turned toward the right axis by `turn` radians: roll and pitch are the angle's components on
+/// the view and right axes. It is that rotation exactly when one component is zero, as for
+/// every hurt direction the client records.
+fn axis_tilt(degrees: f32, turn: f32) -> DamageShake {
+    let (sin, cos) = turn.sin_cos();
+    DamageShake {
+        roll_degrees: degrees * cos,
+        pitch_degrees: degrees * sin,
+    }
+}
+
+/// The current camera profile's full-strength shake angle in degrees at `hurt_progress`, which
+/// falls from 1 at the hit to 0 when the shake ends.
+fn hurt_shake_degrees(hurt_progress: f32) -> f32 {
+    let phase =
+        hurt_progress * hurt_progress * hurt_progress * hurt_progress * std::f32::consts::PI;
+    sim::minecraft_sin(f64::from(phase)) as f32 * super::hurt::HURT_TILT_DEGREES
+}
+
+/// Returns native camera-local damage rotation from sampled actor state.
+fn damage_rotation(
+    death_ticks: Option<f32>,
+    hurt_progress: f32,
+    hurt_angle: f32,
+    strength: f32,
+) -> Quat {
+    let mut rotation = Quat::IDENTITY;
+    if let Some(ticks) = death_ticks.filter(|ticks| *ticks > 0.0) {
+        rotation = Quat::from_rotation_z(-super::hurt::death_roll_degrees(ticks).to_radians());
+    }
+    if hurt_progress > 0.0 {
+        let angle = (hurt_shake_degrees(hurt_progress) * strength).to_radians();
+        rotation *= Quat::from_rotation_y(hurt_angle)
+            * Quat::from_rotation_z(angle)
+            * Quat::from_rotation_y(-hurt_angle);
+    }
+    rotation
+}
+
+/// Samples death time after actor ticking and clears it when the local actor leaves or recovers.
+pub fn collect_death_fov_inputs(
+    stream: Option<&chunk_pipeline::WorldStream>,
+    partial_tick: Option<bevy::prelude::Res<crate::actor_publication::ActorFramePartialTick>>,
+    mut inputs: bevy::prelude::ResMut<crate::camera::CameraFovInputs>,
+) {
+    let ticks = stream
+        .and_then(|stream| stream.authority().actor(stream.local_player_runtime_id()))
+        .filter(|actor| actor.status.dead)
+        .map(|actor| actor.status.native_death_ticks());
+    inputs.set_death_ticks(ticks, partial_tick.map_or(0.0, |tick| tick.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero shake strength keeps ordinary bob; the damage direction turns the shake's axis.
+    #[test]
+    fn hurt_strength_scales_only_the_damage_shake() {
+        let mut stream = crate::presentation::combat::tests::player_stream();
+        let id = stream.local_player_runtime_id();
+        crate::presentation::combat::tests::event(&mut stream, 2, protocol::ActorStatusKind::Hurt);
+        let mut actor = stream.authority().actor(id).unwrap().clone();
+        let sample = |actor: &client_world::ActorSnapshot, strength| {
+            sampled_legacy_effect(
+                Some(actor),
+                Default::default(),
+                0.5,
+                0.5,
+                false,
+                strength,
+                None,
+            )
+        };
+        actor.status.hurt_direction = Some(0.0);
+        let ahead = sample(&actor, 1.0);
+        actor.status.hurt_direction = Some(90.0);
+        assert_ne!(sample(&actor, 1.0), ahead);
+        let endpoints = render_model::legacy_combat::LegacyCameraEndpoints {
+            walked: [0.3, 0.6],
+            bob: [0.05, 0.1],
+            fall_degrees: [-4.0, -2.0],
+        };
+        assert_eq!(sample(&actor, 0.0), Mat4::IDENTITY);
+        assert_eq!(
+            sampled_legacy_effect(Some(&actor), endpoints, 0.5, 0.5, true, 0.0, None),
+            endpoints.bob_matrix(0.5)
+        );
+    }
+
+    /// The documented sign convention: a tilt of roll `a cos d` and pitch `-a sin d` reproduces
+    /// the native shake of angle `a` from hurt direction `d`, exactly on the axes.
+    #[test]
+    fn view_tilt_signs_match_the_native_damage_shake() {
+        let shake = |direction| {
+            render_model::legacy_combat::legacy_hurt_matrix(5, direction, None, 0.5, 1.0)
+        };
+        let right = shake(0.0).transform_vector3(Vec3::X);
+        let angle = (-right.y).asin().to_degrees();
+        assert!(angle > 1.0, "the sample is mid-shake");
+        for direction in [0.0_f32, 90.0, 180.0, -90.0] {
+            let (sin, cos) = direction.to_radians().sin_cos();
+            let tilt = crate::camera::ViewTilt {
+                roll_degrees: angle * cos,
+                pitch_degrees: -angle * sin,
+                suppress_hurt_shake: true,
+            };
+            assert!(
+                tilt_view_effect(tilt.rotation()).abs_diff_eq(shake(direction), 1e-5),
+                "{direction}"
+            );
+        }
+        let up = crate::camera::ViewTilt {
+            roll_degrees: 0.0,
+            pitch_degrees: 10.0,
+            suppress_hurt_shake: false,
+        };
+        let forward = up.rotation() * Vec3::NEG_Z;
+        assert!(forward.y > 0.17, "positive pitch turns the camera up");
+    }
+
+    /// For each axis direction, a suppressing tilt of the full-strength shake draws the native
+    /// shake of either camera profile, and the shake ends with the hurt ticks.
+    #[test]
+    fn damage_shake_tilt_reproduces_the_native_shake_on_each_axis() {
+        let mut stream = crate::presentation::combat::tests::player_stream();
+        let id = stream.local_player_runtime_id();
+        crate::presentation::combat::tests::event(&mut stream, 2, protocol::ActorStatusKind::Hurt);
+        stream.advance_actor_interpolation_frame(3);
+        let mut actor = stream.authority().actor(id).unwrap().clone();
+        let tilt = |shake: DamageShake| {
+            crate::camera::ViewTilt {
+                roll_degrees: shake.roll_degrees,
+                pitch_degrees: shake.pitch_degrees,
+                suppress_hurt_shake: true,
+            }
+            .rotation()
+        };
+        for direction in [0.0_f32, 90.0, 180.0, -90.0] {
+            actor.status.hurt_direction = Some(direction);
+            let shake = legacy_damage_shake(&actor, 0.5).unwrap();
+            let native = render_model::legacy_combat::legacy_hurt_matrix(
+                actor.status.hurt_time,
+                direction,
+                None,
+                0.5,
+                1.0,
+            );
+            assert_ne!(native, Mat4::IDENTITY);
+            assert!(
+                tilt_view_effect(tilt(shake)).abs_diff_eq(native, 1e-5),
+                "legacy {direction}"
+            );
+            let modern = axis_tilt(hurt_shake_degrees(0.5), direction.to_radians());
+            assert!(
+                tilt(modern).abs_diff_eq(
+                    damage_rotation(None, 0.5, direction.to_radians(), 1.0),
+                    1e-5
+                ),
+                "modern {direction}"
+            );
+        }
+        actor.status.hurt_time = 0;
+        assert_eq!(legacy_damage_shake(&actor, 0.5), None);
+    }
+
+    use bevy::prelude::Vec3;
+
+    #[test]
+    fn actor_half_hurt_rolls_positive_z_and_direction_rotates_its_axis() {
+        let right = damage_rotation(None, 0.5, 0.0, 1.0) * Vec3::X;
+        assert!(right.y > 0.047 && right.y < 0.048);
+        assert!(right.z.abs() < 1e-6);
+        let up = damage_rotation(None, 0.5, std::f32::consts::FRAC_PI_2, 1.0) * Vec3::Y;
+        assert!(up.z > 0.047 && up.z < 0.048);
+        assert!(up.x.abs() < 1e-6);
+    }
+
+    #[test]
+    fn native_death_counter_continues_beyond_the_body_clock() {
+        let right = damage_rotation(Some(200.0), 0.0, 0.0, 1.0) * Vec3::X;
+        assert!((right.x - 20.0_f32.to_radians().cos()).abs() < 1e-6);
+        assert!((right.y + 20.0_f32.to_radians().sin()).abs() < 1e-6);
+        assert_eq!(damage_rotation(Some(-1.0), 0.0, 0.0, 1.0), Quat::IDENTITY);
+    }
+
+    #[test]
+    fn damage_bob_scale_does_not_disable_the_independent_death_rotation() {
+        assert_eq!(damage_rotation(None, 0.5, 0.0, 0.0), Quat::IDENTITY);
+        assert_eq!(
+            damage_rotation(Some(200.0), 0.5, 0.0, 0.0),
+            damage_rotation(Some(200.0), 0.0, 0.0, 1.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_effect_tests {
+    use super::*;
+
+    #[test]
+    fn authored_bob_suppression_keeps_hurt_rotation() {
+        let mut geometry = serde_json::json!({"description":{"identifier":"geometry.body"},
+            "bones":[{"name":"body"}]});
+        geometry[assets::entity::GEOMETRY_NO_HEAD_BOB_FIELD] = true.into();
+        let source =
+            serde_json::json!({"format_version":"1.12.0", "minecraft:geometry":[geometry]});
+        let skin = assets::parse_skin_geometry(
+            r#"{"geometry":{"default":"geometry.body"}}"#,
+            &source.to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut stream = crate::presentation::combat::tests::player_stream();
+        let id = stream.local_player_runtime_id();
+        crate::presentation::combat::tests::event(&mut stream, 2, protocol::ActorStatusKind::Hurt);
+        let actor = stream.authority().actor(id);
+        let endpoints = render_model::legacy_combat::LegacyCameraEndpoints {
+            walked: [0.3, 0.6],
+            bob: [0.05, 0.1],
+            fall_degrees: [-4.0, -2.0],
+        };
+        let suppressed = sampled_legacy_effect(actor, endpoints, 0.5, 0.5, true, 1.0, Some(&skin));
+        let hurt_only = sampled_legacy_effect(actor, Default::default(), 0.5, 0.5, true, 1.0, None);
+        assert_eq!(suppressed, hurt_only);
+        assert_ne!(suppressed, Mat4::IDENTITY);
+        assert_ne!(
+            suppressed,
+            sampled_legacy_effect(actor, endpoints, 0.5, 0.5, true, 1.0, None)
+        );
+    }
+
+    #[test]
+    fn hurt_and_death_keep_the_actor_fraction_when_physics_has_a_different_fraction() {
+        let mut stream = crate::presentation::combat::tests::player_stream();
+        let id = stream.local_player_runtime_id();
+        crate::presentation::combat::tests::event(&mut stream, 2, protocol::ActorStatusKind::Hurt);
+        let endpoints = render_model::legacy_combat::LegacyCameraEndpoints {
+            walked: [0.3, 0.6],
+            bob: [0.05, 0.1],
+            fall_degrees: [-4.0, -2.0],
+        };
+        for dead in [false, true] {
+            if dead {
+                crate::presentation::combat::tests::event(
+                    &mut stream,
+                    3,
+                    protocol::ActorStatusKind::Death,
+                );
+            }
+            let actor = stream.authority().actor(id).unwrap();
+            let expected = render_model::legacy_combat::legacy_hurt_matrix(
+                actor.status.hurt_time,
+                actor.status.hurt_direction.unwrap_or(0.0),
+                dead.then(|| f32::from(actor.status.native_death_ticks())),
+                0.85,
+                1.0,
+            ) * endpoints.bob_matrix(0.2);
+            let actual = sampled_legacy_effect(Some(actor), endpoints, 0.85, 0.2, true, 1.0, None);
+            assert_eq!(actual, expected);
+            assert!(!actual.abs_diff_eq(
+                sampled_legacy_effect(Some(actor), endpoints, 0.2, 0.2, true, 1.0, None),
+                1e-5,
+            ));
+        }
+    }
+}

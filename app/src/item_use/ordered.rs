@@ -1,0 +1,117 @@
+//! Attempts each item-use edge once; accepted held uses keep their gameplay state.
+
+use super::*;
+use bevy::prelude::In;
+use client_presentation::local_player::LocalViewPose;
+
+/// Retires the previous session and dimension before any input or server write is consumed.
+pub(crate) fn synchronize_scope(
+    ui: Res<UiRuntimeResource>,
+    client_world: Res<ClientWorld>,
+    movement: Res<MovementTicker>,
+    mut runtime: ResMut<ItemUseRuntime>,
+) {
+    runtime.synchronize(ui.session_id());
+    runtime.observe_world(
+        movement.interaction_authority_identity().0,
+        client_world
+            .stream
+            .as_ref()
+            .map_or(0, |stream| stream.current_dimension()),
+    );
+}
+
+/// Applies server events before the ordered batch can select a slot or use an item.
+pub(crate) fn synchronize_server_events(
+    mut runtime: ResMut<ItemUseRuntime>,
+    mut physics: Option<ResMut<client_interaction::movement::LocalPhysicsController>>,
+) {
+    take_server_item_use(&mut runtime, physics.as_deref_mut());
+}
+
+/// Records whether the use button holds an accepted use before any
+/// admission can reject this edge, so a rejected press cannot swallow the
+/// release of a use the button now owns.
+pub(crate) fn observe_button(
+    In(input): In<crate::ordered_interactions::InteractionInput>,
+    player: Res<client_state::PlayerRuntime>,
+    mut runtime: ResMut<ItemUseRuntime>,
+) {
+    let allowed = player
+        .facts
+        .game_mode_capabilities()
+        .is_none_or(|caps| caps.can_use_items);
+    runtime.observe_use_button(allowed && input.edge.buttons.held(Action::Use));
+}
+
+/// Resolves one input edge without retaining its pose or unadmitted press.
+pub(crate) fn press(
+    In(input): In<crate::ordered_interactions::InteractionInput>,
+    mut player: ResMut<client_state::PlayerRuntime>,
+    mut context: ItemUseContext,
+    mut runtime: ResMut<ItemUseRuntime>,
+    mut movement: ResMut<MovementTicker>,
+    mut swings: ResMut<SwingTracker>,
+    mut view: ResMut<LocalViewPose>,
+) {
+    if context.client_world.respawn.input_held() {
+        runtime.cancel_for_respawn();
+        return;
+    }
+    swings.sync_ticks_for_item(
+        movement.interaction_authority_identity(),
+        movement.completed_tick(),
+        &context.effects,
+        crate::melee::selected_attack_timing(&player, &context.client_world)
+            .and_then(|timing| timing.swing_duration_ticks),
+    );
+    let allowed = player
+        .facts
+        .game_mode_capabilities()
+        .is_none_or(|caps| caps.can_use_items);
+    let held = allowed && input.edge.buttons.held(Action::Use);
+    runtime.observe_use_button(held);
+    // A frame with an admitted pulse has no physical use press, so its press edge is the pulse.
+    let pressed = allowed && input.edge.pressed;
+    let mut pending = if context.pulse.as_ref().is_some_and(|policy| policy.pulse) {
+        gameplay::item_use::PendingUseInput::pulse(pressed)
+    } else {
+        gameplay::item_use::PendingUseInput::new(pressed)
+    };
+    runtime.with_pending_input(&mut pending, |runtime| {
+        if !runtime.has_work(held) {
+            return;
+        }
+        let release_facing = runtime
+            .riptide_release_facing()
+            .unwrap_or_else(|| riptide::release_facing(input.context.aim, &input.context.view));
+        let policy = frame::FramePolicy {
+            held,
+            before_flush: release_facing.assisted && runtime.is_releasing(held),
+            aim_rotation: input.context.aim,
+            release_facing,
+            sample: None,
+        };
+        if let Some(proposal) =
+            frame::observe(&player, &context, runtime, &movement, &mut view, policy)
+        {
+            frame::admit(
+                &mut player,
+                &mut context,
+                runtime,
+                &mut movement,
+                &mut swings,
+                &mut view,
+                &proposal,
+            );
+        }
+    });
+}
+
+/// Delivers an already-admitted release carrier before the next mutating event.
+pub(crate) fn flush_release(
+    mut movement: ResMut<MovementTicker>,
+    network: Res<NetworkHandle<PackApplication>>,
+) {
+    movement.send_held_release(|packets| network.send_inventory_packets(packets));
+}

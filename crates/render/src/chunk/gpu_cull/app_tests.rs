@@ -1,0 +1,390 @@
+//! Real render apps on a validating NOOP device and native fallback backends.
+
+use render_scene::{ChunkRenderInstance, ChunkRenderQueue};
+
+use bevy::{
+    asset::{AssetPlugin, Assets},
+    camera::{CameraPlugin, RenderTarget},
+    core_pipeline::CorePipelinePlugin,
+    image::ImagePlugin,
+    mesh::MeshPlugin,
+    render::{
+        RenderPlugin,
+        renderer::{RenderAdapterInfo, RenderInstance},
+        settings::RenderCreation,
+    },
+    window::WindowPlugin,
+};
+
+use super::model::CullRecord;
+use super::*;
+use render_scene::ChunkUploadPriority;
+
+/// A render plugin on the first adapter of `backends`; `None` when none is present.
+pub(in crate::chunk) fn render_plugin(
+    backends: wgpu::Backends,
+    required_features: WgpuFeatures,
+) -> Option<RenderPlugin> {
+    render_plugin_with_storage_limit(backends, required_features, None)
+}
+
+/// Overrides the storage budget while retaining the adapter's other supported limits.
+pub(super) fn render_plugin_with_storage_limit(
+    backends: wgpu::Backends,
+    required_features: WgpuFeatures,
+    storage_limit: Option<u32>,
+) -> Option<RenderPlugin> {
+    let noop = backends == wgpu::Backends::NOOP;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        flags: wgpu::InstanceFlags::from_env_or_default(),
+        backend_options: wgpu::BackendOptions {
+            noop: wgpu::NoopBackendOptions {
+                enable: noop,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = match bevy::tasks::block_on(
+        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+    ) {
+        Ok(adapter) => adapter,
+        Err(wgpu::RequestAdapterError::NotFound { .. }) => return None,
+        Err(error) => panic!("terrain fixture adapter request failed: {error}"),
+    };
+    if !adapter.features().contains(required_features) {
+        return None;
+    }
+    let mut required_limits = if noop {
+        wgpu::Limits {
+            max_storage_buffers_per_shader_stage: required_vertex_storage_buffers(),
+            ..Default::default()
+        }
+    } else {
+        adapter.limits()
+    };
+    if let Some(storage) = storage_limit {
+        required_limits.max_storage_buffers_per_shader_stage = storage;
+    }
+    let descriptor = wgpu::DeviceDescriptor {
+        required_features,
+        required_limits,
+        ..Default::default()
+    };
+    if !descriptor.required_limits.check_limits(&adapter.limits()) {
+        return None;
+    }
+    let adapter_info = adapter.get_info();
+    let (device, queue) = bevy::tasks::block_on(adapter.request_device(&descriptor)).unwrap();
+    Some(RenderPlugin {
+        render_creation: RenderCreation::manual(
+            RenderDevice::from(device),
+            RenderQueue::new(queue),
+            RenderAdapterInfo::new(adapter_info),
+            RenderAdapter::new(adapter),
+            RenderInstance::new(instance),
+        ),
+        synchronous_pipeline_compilation: true,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn noop_render_plugin(required_features: WgpuFeatures) -> RenderPlugin {
+    render_plugin(wgpu::Backends::NOOP, required_features).expect("the NOOP adapter is built in")
+}
+
+#[test]
+fn minimum_storage_device_selects_compact_pipelines_after_device_initialization() {
+    let render =
+        render_plugin_with_storage_limit(wgpu::Backends::NOOP, WgpuFeatures::empty(), Some(4))
+            .unwrap();
+    let (mut app, _) = chunk_app_with(render, Msaa::Off, camera_transform(), |app| {
+        app.add_plugins((crate::ActorRenderPlugin, crate::HandRigRenderPlugin));
+    });
+    frame(&mut app);
+    let world = app.sub_app(RenderApp).world();
+    let pipeline = world.resource::<ChunkPipeline>();
+    assert!(pipeline.compact);
+    assert!(!pipeline.unit_supported);
+    assert!(!world.resource::<GpuCullSupport>().0);
+    assert!(!world.resource::<DirectOcclusionSupport>().0);
+    assert!(world.contains_resource::<crate::actor_render::pipeline::ActorPipeline>());
+}
+
+/// A sub-chunk filled with one solid block.
+pub(super) fn mesh() -> meshing::ChunkMesh {
+    let source = world::SubChunk::decode(&[9, 1, 0, 1, 2], &world::RawBlockIds { air: 0 });
+    meshing::mesh_sub_chunk(
+        &meshing::BlockClassifier::new(0),
+        &assets::RuntimeAssets::diagnostic(),
+        assets::NetworkIdMode::Sequential,
+        &meshing::Neighbourhood::empty(),
+        &source,
+    )
+}
+
+pub(in crate::chunk) fn frame(app: &mut App) {
+    app.update();
+    app.sub_app(RenderApp)
+        .world()
+        .resource::<RenderDevice>()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .unwrap();
+}
+
+/// The chunk renderer on `render`'s device, with a camera at `transform` drawing to an image.
+pub(in crate::chunk) fn chunk_app(
+    render: RenderPlugin,
+    msaa: Msaa,
+    transform: Transform,
+) -> (App, Entity) {
+    chunk_app_with(render, msaa, transform, |_| {})
+}
+
+/// Configures additional production passes before the fixture finishes installing its plugins.
+pub(in crate::chunk) fn chunk_app_with(
+    render: RenderPlugin,
+    msaa: Msaa,
+    transform: Transform,
+    configure: impl FnOnce(&mut App),
+) -> (App, Entity) {
+    let mut app = App::new();
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(WindowPlugin {
+            primary_window: None,
+            ..Default::default()
+        })
+        .add_plugins((AssetPlugin::default(), TransformPlugin))
+        .add_plugins(render)
+        .add_plugins((
+            ImagePlugin::default(),
+            MeshPlugin,
+            CameraPlugin,
+            CorePipelinePlugin,
+        ))
+        .add_plugins(ChunkRenderPlugin::default());
+    crate::render_test_support::fail_on_render_error(&mut app);
+    let image = app
+        .world_mut()
+        .resource_mut::<Assets<Image>>()
+        .add(Image::new_target_texture(
+            64,
+            48,
+            TextureFormat::Rgba8Unorm,
+            None,
+        ));
+    let camera = app
+        .world_mut()
+        .spawn((
+            Camera3d::default(),
+            Camera::default(),
+            RenderTarget::Image(image.into()),
+            msaa,
+            transform,
+        ))
+        .id();
+    configure(&mut app);
+    app.finish();
+    app.cleanup();
+    (app, camera)
+}
+
+pub(in crate::chunk) const KEYS: [SubChunkKey; 2] =
+    [SubChunkKey::new(0, 0, 0, 0), SubChunkKey::new(0, 1, 0, 0)];
+
+pub(in crate::chunk) fn insert_meshes(app: &mut App, keys: &[SubChunkKey]) {
+    for &key in keys {
+        app.world_mut()
+            .resource_mut::<ChunkRenderQueue>()
+            .try_insert(key, mesh(), ChunkUploadPriority::new(0.0))
+            .unwrap();
+    }
+}
+
+pub(in crate::chunk) fn camera_transform() -> Transform {
+    Transform::from_xyz(-6.0, 20.0, -6.0).looking_at(Vec3::new(8.0, 8.0, 8.0), Vec3::Y)
+}
+
+/// Toggling occlusion changes submission without evicting or remeshing terrain.
+#[test]
+fn occlusion_toggle_preserves_terrain_allocations_and_restores_gpu_culling() {
+    let (mut app, _) = chunk_app(
+        noop_render_plugin(WgpuFeatures::INDIRECT_FIRST_INSTANCE),
+        Msaa::Off,
+        camera_transform(),
+    );
+    #[derive(Resource, Default)]
+    struct Selected(bool);
+    app.sub_app_mut(RenderApp)
+        .init_resource::<Selected>()
+        .add_systems(
+            Render,
+            (|frame: Res<GpuCullFrame>, mut selected: ResMut<Selected>| {
+                selected.0 = frame.view.is_some();
+            })
+            .in_set(RenderSystems::Render),
+        );
+    insert_meshes(&mut app, &KEYS);
+    for enabled in [true, false, true] {
+        app.world_mut()
+            .resource_mut::<render_scene::ChunkOcclusionCulling>()
+            .0 = enabled;
+        for _ in 0..4 {
+            frame(&mut app);
+        }
+        assert_eq!(app.world().resource::<ChunkEntities>().0.len(), KEYS.len());
+        let render = app.sub_app(RenderApp).world();
+        let cull = render.resource::<GpuCull>();
+        assert_eq!(cull.slot_count() as usize, KEYS.len());
+        assert!(cull.table.records().iter().all(CullRecord::is_live));
+        assert_eq!(render.resource::<Selected>().0, enabled);
+    }
+}
+
+/// Every frame queues, prepares, culls and draws the GPU path without a validation error.
+#[test]
+fn count_capable_devices_run_the_two_phase_cull_through_the_render_schedule() {
+    let (mut app, _) = chunk_app(
+        noop_render_plugin(
+            WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT | WgpuFeatures::INDIRECT_FIRST_INSTANCE,
+        ),
+        Msaa::Sample4,
+        camera_transform(),
+    );
+    insert_meshes(&mut app, &KEYS);
+    let keys = KEYS;
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    let render_world = app.sub_app(RenderApp).world();
+    assert_eq!(
+        render_world.resource::<GpuCullSupport>(),
+        &GpuCullSupport(true)
+    );
+    let cull = render_world.resource::<GpuCull>();
+    assert_eq!(cull.submission, GpuCullSubmission::Count);
+    assert_eq!(cull.slot_count(), 2);
+    assert!(cull.table.records().iter().all(CullRecord::is_live));
+    assert!(
+        model::slot_enabled(cull.table.enabled(), 0)
+            && model::slot_enabled(cull.table.enabled(), 1)
+    );
+    assert!(cull.bind_groups.is_some(), "the culled view was prepared");
+    assert!(
+        cull.pyramid.is_some(),
+        "the depth target admits sampling, so the late phase tests Hi-Z"
+    );
+
+    // Removing a chunk frees its slot on the next frame.
+    let entity = app.world().resource::<ChunkEntities>().0[&keys[1]];
+    app.world_mut()
+        .entity_mut(entity)
+        .remove::<ChunkRenderInstance>();
+    frame(&mut app);
+    frame(&mut app);
+    let cull = app.sub_app(RenderApp).world().resource::<GpuCull>();
+    assert_eq!(cull.slot_count(), 1);
+}
+
+/// DX12 consumes compacted counts through culled pipelines and runs the Hi-Z cull on the real
+/// driver. The cleared fixed-size fallback is rasterised on both backends by the integration
+/// tests; DX12 always offers count draws.
+#[cfg(all(target_os = "windows", debug_assertions))]
+#[test]
+fn dx12_debug_runs_two_phase_count_gpu_culling() {
+    let Some(render) = render_plugin(
+        wgpu::Backends::DX12,
+        WgpuFeatures::INDIRECT_FIRST_INSTANCE | WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT,
+    ) else {
+        eprintln!("skipping DX12 count cull app: missing compatible native adapter");
+        return;
+    };
+    let (mut app, _) = chunk_app(render, Msaa::Off, camera_transform());
+    insert_meshes(&mut app, &KEYS);
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+
+    let render_world = app.sub_app(RenderApp).world();
+    assert_eq!(
+        render_world.resource::<GpuCullSupport>(),
+        &GpuCullSupport(true)
+    );
+    assert_eq!(
+        render_world.resource::<DirectOcclusionSupport>(),
+        &DirectOcclusionSupport(false),
+        "DX12 MDI must not regress to per-section direct draws"
+    );
+    let cull = render_world.resource::<GpuCull>();
+    assert_eq!(cull.submission, GpuCullSubmission::Count);
+    assert_eq!(cull.slot_count(), 2);
+    assert!(cull.bind_groups.is_some(), "the culled view was prepared");
+    assert!(
+        cull.pyramid.is_some(),
+        "the DX12 depth target admits the late Hi-Z phase"
+    );
+}
+
+/// Every terrain variant must compile with vertex offsets on a real backend.
+#[test]
+fn native_devices_compile_opaque_and_transparent_terrain_variants() {
+    for msaa in [Msaa::Off, Msaa::Sample4] {
+        let Some(render) = render_plugin(wgpu::Backends::PRIMARY, WgpuFeatures::empty()) else {
+            eprintln!("skipping terrain pipeline compilation: missing native GPU adapter fixture");
+            return;
+        };
+        let (mut app, _) = chunk_app(render, msaa, camera_transform());
+        for _ in 0..4 {
+            frame(&mut app);
+        }
+        assert!(
+            app.world()
+                .resource::<render_scene::PipelineWarmupReadiness>()
+                .is_ready()
+        );
+    }
+}
+
+#[test]
+fn latency_cadence_terrain_preparation_can_qualify_for_one() {
+    let (mut app, _) = chunk_app(
+        noop_render_plugin(WgpuFeatures::INDIRECT_FIRST_INSTANCE),
+        Msaa::Off,
+        camera_transform(),
+    );
+    insert_meshes(&mut app, &KEYS);
+    for _ in 0..4 {
+        frame(&mut app);
+    }
+    crate::present_mode::frame_latency::adaptive::tests::assert_preparation_qualifies(|| {
+        frame(&mut app);
+        let world = app.sub_app(RenderApp).world();
+        assert!(world.resource::<GpuCullSupport>().0);
+        assert!(world.resource::<GpuCull>().slot_count() > 0);
+        assert!(world.resource::<GpuCull>().bind_groups.is_some());
+    });
+}
+
+/// Creates another isolated render target for a fixture camera.
+pub(in crate::chunk) fn spawn_camera(app: &mut App, transform: Transform, order: isize) -> Entity {
+    let image = app
+        .world_mut()
+        .resource_mut::<Assets<Image>>()
+        .add(Image::new_target_texture(
+            64,
+            48,
+            TextureFormat::Rgba8Unorm,
+            None,
+        ));
+    app.world_mut()
+        .spawn((
+            Camera3d::default(),
+            Camera { order, ..default() },
+            RenderTarget::Image(image.into()),
+            Msaa::Off,
+            transform,
+        ))
+        .id()
+}

@@ -1,0 +1,97 @@
+[package]
+name = "client-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+platform-specific = ["macos"]
+reads = [
+    "assets/cinnangles-sans-source.json",
+    "crates/mod-api/wit/extension.wit",
+    "crates/protocol/fixtures/*",
+]
+
+[features]
+test-support = ["render-model/test-support", "oreui/test-support", "ui-engine/test-support", "ui-screens/test-support", "mod-ui/test-support"]
+tracy = ["oreui/tracy"]
+
+[dependencies]
+particles = { path = "../particles" }
+web-time.workspace = true
+cosmetics = { path = "../cosmetics" }
+uuid.workspace = true
+protocol-ids = { path = "../protocol-ids" }
+pack-json = { path = "../pack-json" }
+env-compat = { path = "../env-compat" }
+simulation-clock = { path = "../simulation-clock" }
+bridge = { path = "../bridge" }
+anyhow.workspace = true
+assets = { path = "../assets" }
+client-world = { path = "../client-world" }
+glam.workspace = true
+actor-animation = { path = "../actor-animation" }
+render-api = { path = "../render-api" }
+render-model = { path = "../render-model" }
+player-state = { path = "../player-state" }
+launcher = { path = "../launcher" }
+inventory = { path = "../inventory" }
+json-ui = { path = "../json-ui" }
+oreui = { path = "../oreui" }
+mod-ui = { path = "../mod-ui" }
+protocol = { path = "../protocol" }
+semantic-input = { path = "../input" }
+ui = { path = "../ui" }
+ui-engine = { path = "../ui-engine" }
+ui-screens = { path = "../ui-screens" }
+world = { path = "../world" }
+server-experience = { path = "../server-experience", default-features = false, features = ["data"] }
+image.workspace = true
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel = "0.5"
+url = "2"
+rayon.workspace = true
+resource-pack = { path = "../resource-pack" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+launcher-host = { path = "../launcher-host" }
+server-experience = { path = "../server-experience", features = ["host"] }
+
+# Android and iOS have no clipboard adapter yet; their chat copy and paste report unavailable.
+[target.'cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32")))'.dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.104"
+wasm-bindgen = "0.2.127"
+wasm-bindgen-futures = "0.4.77"
+
+[dev-dependencies]
+mod-api = { path = "../mod-api" }
+chunk-pipeline = { path = "../chunk-pipeline" }
+update-manifest = { path = "../update-manifest" }
+cosmetics = { path = "../cosmetics", features = ["test-support"] }
+render-model = { path = "../render-model", features = ["test-support"] }
+test-alloc = { path = "../test-alloc" }
+launcher = { path = "../launcher", features = ["test-support"] }
+oreui = { path = "../oreui", features = ["test-support"] }
+ui-engine = { path = "../ui-engine", features = ["test-support"] }
+ui-screens = { path = "../ui-screens", features = ["test-support"] }
+mod-ui = { path = "../mod-ui", features = ["test-support"] }
+launcher-host = { path = "../launcher-host", features = ["test-support"] }
+test-time = { path = "../test-time" }
+tempfile = "3"
+protocol = { path = "../protocol", features = ["test-support"] }
+resource-pack = { path = "../resource-pack", features = ["test-support"] }
+mod-host = { path = "../mod-host" }
+pack-compiler = { path = "../pack-compiler" }
+pack-entity-compiler = { path = "../pack-compiler/entity" }
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[lints]
+workspace = true

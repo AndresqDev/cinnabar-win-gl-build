@@ -1,0 +1,387 @@
+use super::*;
+
+/// Creates a confirmed player grid without a server movement echo.
+fn stream() -> WorldStream {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        local_player_unique_id: 1,
+        dimension: 0,
+        local_player_runtime_id: 1,
+        player_position: [0.5, 70.0, 0.5],
+        world_spawn_position: [0, 70, 0],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    stream.submit(1, WorldEvent::ChunkRadiusUpdated(2)).unwrap();
+    stream
+}
+
+/// Populates the exact player grid, retaining overlapping columns from earlier moves.
+fn populate_view(stream: &mut WorldStream, center: [i32; 2]) -> usize {
+    let radius = stream.chunk_radius.unwrap();
+    let reach = radius + world::CHUNK_VIEW_SLACK;
+    let mut count = 0;
+    for x in center[0] - reach..=center[0] + reach {
+        for z in center[1] - reach..=center[1] + reach {
+            if chunk_in_view(radius, [x, z], center) {
+                let column = ChunkKey::new(stream.current_dimension(), x, z);
+                stream.loaded_columns.insert(column);
+                stream.record_known_air(SubChunkKey::from_chunk(column, 64));
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn ordinary_local_movement_bounds_residency_without_server_echoes() {
+    let mut stream = stream();
+    let server_position = stream.resolved_server_position();
+    let publisher = stream.publisher.center;
+    for center in 0..64 {
+        let count = populate_view(&mut stream, [center, 0]);
+        let position = [center as f32 * 16.0 + 0.5, 70.0, 0.5];
+        assert_eq!(stream.retain_local(position), center != 0);
+        assert_eq!(stream.loaded_columns.len(), count);
+        assert_eq!(stream.resident.len(), count);
+        assert!(stream.tracked_columns().iter().all(|key| {
+            chunk_in_view(stream.chunk_radius.unwrap(), [key.x, key.z], [center, 0])
+        }));
+        assert!(stream.column_is_data_interesting(ChunkKey::new(0, center, 0)));
+        let generation = stream.connectivity_generation();
+        assert!(!stream.retain_local([position[0] + 1.0, 70.0, 0.5]));
+        assert_eq!(stream.connectivity_generation(), generation);
+    }
+    assert_eq!(stream.resolved_server_position(), server_position);
+    assert_eq!(stream.publisher.center, publisher);
+}
+
+#[test]
+fn local_retention_forgets_recentered_requests_after_failed_send() {
+    for serviced in [false, true] {
+        let mut stream = stream();
+        stream.between_frames_service = serviced;
+        let chunk = ChunkKey::new(0, 0, 0);
+        stream.enqueue_request(chunk, -4, 1, None);
+        let batch = stream.prepare_sub_chunk_request([0, 124, 0], 1).unwrap();
+        assert_eq!(batch.receipt.members[0].position, [0, -4, 0]);
+        stream.retry_sub_chunk_request_front(batch).unwrap();
+        assert_eq!(stream.outstanding_sub_chunk_count(), 1);
+        assert_eq!(stream.pending_request_count(), 1);
+
+        assert!(stream.retain_local([320.5, 70.0, 0.5]));
+        test_time::eventually("retired request retention", || {
+            stream.poll([320.5, 70.0, 0.5], 0);
+            !stream.retention_due
+        });
+
+        assert!(!stream.requests.collision_failures.contains(&chunk));
+        assert!(!stream.requests.unencodable.contains_key(&chunk));
+        assert_eq!(stream.outstanding_sub_chunk_count(), 0);
+        assert_eq!(stream.pending_request_count(), 0);
+        assert!(stream.prepare_sub_chunk_request([0; 3], 1).is_none());
+    }
+}
+
+#[test]
+fn local_grid_eviction_cancels_out_of_range_requests() {
+    let mut stream = stream();
+    let old = ChunkKey::new(0, 0, 0);
+    stream.enqueue_request(old, 0, 1, None);
+    assert!(stream.requests.is_expected(SubChunkKey::from_chunk(old, 0)));
+    assert_ne!(stream.pending_request_count(), 0);
+    assert!(stream.retain_local([320.0, 70.0, 0.0]));
+    assert!(!stream.requests.requested.contains_key(&old));
+    assert_eq!(stream.pending_request_count(), 0);
+    assert!(stream.pop_next_request().is_none());
+}
+
+/// A serviced stream defers terrain eviction, yet the frame's request flush right after the
+/// retention call already skips every request the new grid drops, for columns holding only
+/// requests and for loaded columns alike.
+#[test]
+fn serviced_retention_retires_dropped_requests_before_the_flush() {
+    let mut stream = stream();
+    populate_view(&mut stream, [0, 0]);
+    stream.between_frames_service = true;
+    let (loaded, bare) = (ChunkKey::new(0, 0, 0), ChunkKey::new(0, 5, 0));
+    stream.enqueue_request(loaded, 0, 1, None);
+    stream.enqueue_request(bare, 0, 1, None);
+    assert_ne!(stream.pending_request_count(), 0);
+
+    assert!(stream.retain_local([320.0, 70.0, 0.0]));
+    assert_eq!(stream.pending_request_count(), 0);
+    assert!(stream.pop_next_request().is_none());
+    assert!(
+        stream.loaded_columns.contains(&loaded),
+        "terrain eviction waits for the next poll"
+    );
+    // Eviction is wall-clock budgeted, so a loaded host may spread it over several polls.
+    test_time::eventually("deferred terrain eviction", || {
+        stream.poll([320.0, 70.0, 0.0], 0);
+        !stream.retention_due
+    });
+    assert!(!stream.loaded_columns.contains(&loaded));
+}
+
+#[test]
+fn local_retention_rejects_stale_owners_and_nonfinite_positions() {
+    let mut stream = stream();
+    let session = stream.authority.actor_session_id();
+    let epoch = stream.form_dimension_epoch();
+    for (owner, dimension, observed_epoch, position) in [
+        (session.wrapping_add(1), 0, epoch, [320.0, 70.0, 0.0]),
+        (session, 1, epoch, [320.0, 70.0, 0.0]),
+        (session, 0, epoch.wrapping_add(1), [320.0, 70.0, 0.0]),
+        (session, 0, epoch, [f32::NAN, 70.0, 0.0]),
+        (session, 0, epoch, [0.0, f32::INFINITY, 0.0]),
+    ] {
+        assert!(!stream.retain_for_local_player(owner, dimension, observed_epoch, position));
+        assert_eq!(stream.local_player_chunk, None);
+    }
+    assert!(stream.retain_local([-0.5, 70.0, -16.5]));
+    assert_eq!(stream.local_player_chunk, Some(ChunkKey::new(0, -1, -2)));
+    assert!(!stream.retain_local([-15.5, 70.0, -31.5]));
+}
+
+#[test]
+fn server_spatial_commits_replace_the_local_retention_center() {
+    let mut stream = stream();
+    stream.retain_local([320.0, 70.0, 0.0]);
+    stream
+        .submit(
+            2,
+            WorldEvent::MovePlayer(MovePlayerEvent {
+                runtime_id: 1,
+                position: [-0.5, 70.0, -16.5],
+                mode: MovePlayerMode::Teleport,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(stream.local_player_chunk, None);
+    assert_eq!(stream.last_retention_center, Some(ChunkKey::new(0, -1, -2)));
+    stream.take_committed_controls();
+    assert!(stream.retain_local([320.0, 70.0, 0.0]));
+    let previous_epoch = stream.form_dimension_epoch();
+    stream
+        .submit(
+            3,
+            WorldEvent::ChangeDimension(ChangeDimensionEvent {
+                dimension: 1,
+                position: [0.0, 70.0, 0.0],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(stream.local_player_chunk, None);
+    assert!(!stream.retain_for_local_player(
+        stream.authority.actor_session_id(),
+        0,
+        previous_epoch,
+        [320.0, 70.0, 0.0],
+    ));
+}
+
+#[test]
+fn deferred_spatial_controls_keep_stale_physics_from_evicting_destination_terrain() {
+    let mut stream = stream();
+    stream
+        .submit(
+            2,
+            WorldEvent::MovePlayer(MovePlayerEvent {
+                runtime_id: 1,
+                position: [1600.5, 70.0, 0.5],
+                mode: MovePlayerMode::Teleport,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let destination = populate_view(&mut stream, [100, 0]);
+    assert!(!stream.retain_local([0.5, 70.0, 0.5]));
+    assert_eq!(stream.loaded_columns.len(), destination);
+    assert!(stream.column_is_data_interesting(ChunkKey::new(0, 100, 0)));
+    stream.take_committed_controls();
+    assert!(stream.retain_local([1616.5, 70.0, 0.5]));
+}
+
+/// A delayed correction or unmarked move must not prune around its historical anchor before
+/// physics reconciles it.
+#[test]
+fn historical_server_moves_keep_the_current_grid() {
+    let correction = WorldEvent::PlayerMovementCorrection(PlayerMovementCorrectionEvent {
+        position: [272.5, 70.0, 0.5],
+        delta: [0.0; 3],
+        pitch: 0.0,
+        yaw: 0.0,
+        subject: MovementCorrectionSubject::Player,
+        on_ground: true,
+        tick: 5,
+        vehicle_angular_velocity: None,
+    });
+    let unmarked_move = WorldEvent::MovePlayer(MovePlayerEvent {
+        runtime_id: 1,
+        position: [272.5, 70.0, 0.5],
+        source_tick: 5,
+        ..Default::default()
+    });
+    for event in [correction, unmarked_move] {
+        for local_grid in [true, false] {
+            let mut stream = stream();
+            let center = if local_grid {
+                assert!(stream.retain_local([320.5, 70.0, 0.5]));
+                20
+            } else {
+                0
+            };
+            let current = populate_view(&mut stream, [center, 0]);
+            stream.submit(2, event.clone()).unwrap();
+            assert_eq!(stream.loaded_columns.len(), current);
+            let leading = ChunkKey::new(0, center + 2, 0);
+            assert!(stream.loaded_columns.contains(&leading));
+            stream.take_committed_controls();
+            assert!(stream.retain_local([272.5, 70.0, 0.5]));
+            assert!(!stream.loaded_columns.contains(&leading));
+        }
+    }
+}
+
+#[test]
+fn server_position_retention_replaces_a_stale_local_grid() {
+    let mut stream = stream();
+    assert!(stream.retain_local([320.5, 70.0, 0.5]));
+    stream
+        .submit(
+            2,
+            WorldEvent::MovePlayer(MovePlayerEvent {
+                runtime_id: 1,
+                position: [1600.5, 70.0, 0.5],
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    assert_eq!(stream.last_retention_center, Some(ChunkKey::new(0, 20, 0)));
+    assert!(stream.retain_for_server_position());
+    assert_eq!(stream.local_player_chunk, None);
+    assert_eq!(stream.last_retention_center, Some(ChunkKey::new(0, 100, 0)));
+    assert!(!stream.retain_for_server_position());
+}
+
+/// Serviced retention starts at the next poll and resumes within later allocations.
+#[test]
+fn serviced_retention_resumes_across_bounded_polls() {
+    let mut stream = stream();
+    let original = populate_view(&mut stream, [0, 0]);
+    stream.between_frames_service = true;
+    let before = stream.maintenance_items;
+    assert!(stream.retain_local([320.5, 70.0, 0.5]));
+    assert_eq!(stream.maintenance_items, before, "the request does no work");
+    assert_eq!(
+        stream.loaded_columns.len(),
+        original,
+        "the request evicts nothing"
+    );
+    let leaving = *stream.loaded_columns.first().unwrap();
+
+    stream.poll_deadline = Some(Instant::now());
+    stream.poll([320.5, 70.0, 0.5], 0);
+    assert_eq!(stream.maintenance_items - before, 1);
+    assert!(!stream.loaded_columns.contains(&leaving));
+    assert_eq!(stream.loaded_columns.len(), original - 1);
+    assert!(stream.retention_due, "remaining eviction resumes later");
+
+    test_time::eventually("bounded retention completion", || {
+        stream.poll_deadline = Some(Instant::now());
+        let before = stream.maintenance_items;
+        stream.poll([320.5, 70.0, 0.5], 0);
+        assert!(stream.maintenance_items - before <= 1);
+        !stream.retention_due
+    });
+    assert!(
+        stream
+            .tracked_columns()
+            .iter()
+            .all(|key| { chunk_in_view(stream.chunk_radius.unwrap(), [key.x, key.z], [20, 0]) })
+    );
+    assert!(
+        !stream.retain_local([320.5, 70.0, 0.5]),
+        "nothing remains due"
+    );
+}
+
+/// A chunk decoded before a retention change but committed after it is kept like on an
+/// unserviced stream: a deferred eviction runs before the next commit, not after it.
+#[test]
+fn serviced_retention_evicts_before_a_later_commit() {
+    let column = ChunkKey::new(0, 0, 0);
+    for serviced in [false, true] {
+        let mut stream = stream();
+        stream.between_frames_service = serviced;
+        stream.submit(2, inline_air_event(column.x)).unwrap();
+        while let Some(queued) = stream.pending_decode.pop_front() {
+            stream.in_flight_decode_jobs += 1;
+            let completion = queued.job.run(queued.queued_at);
+            stream.accept_decode_completion(completion);
+        }
+        assert!(
+            !stream.loaded_columns.contains(&column),
+            "decoded, not committed"
+        );
+
+        assert!(stream.retain_local([320.5, 70.0, 0.5]));
+        stream.apply_ready();
+        stream.poll([320.5, 70.0, 0.5], 0);
+        assert!(
+            stream.loaded_columns.contains(&column),
+            "serviced: {serviced}"
+        );
+    }
+}
+
+/// Discovering a moved boundary skips the unchanged interior and keeps the exact grid.
+#[test]
+fn large_grid_crossings_visit_rows_and_leaving_columns() {
+    for radius in [16, 64] {
+        let mut stream = stream();
+        stream.chunk_radius = Some(radius);
+        stream.reevaluate_chunk_retention();
+        populate_view(&mut stream, [0, 0]);
+        let before = stream.maintenance_items;
+        assert!(stream.retain_local([16.5, 70.0, 0.5]));
+        let items = stream.maintenance_items - before;
+        assert!(
+            items <= (8 * (radius + world::CHUNK_VIEW_SLACK)) as u64,
+            "{items} items at radius {radius}"
+        );
+        assert!(
+            stream
+                .tracked_columns()
+                .into_iter()
+                .all(|key| chunk_in_view(radius, [key.x, key.z], [1, 0]))
+        );
+    }
+}
+
+/// Outlying arrivals and metadata are retired too, including columns never inside the old grid.
+#[test]
+fn boundary_retention_also_retires_outliers() {
+    let mut stream = stream();
+    populate_view(&mut stream, [0, 0]);
+    let outlier = ChunkKey::new(0, 100, -100);
+    stream.record_known_air(SubChunkKey::from_chunk(outlier, 0));
+    stream.publisher.required_columns.insert(outlier);
+    stream
+        .unsent_column_deadlines
+        .insert(outlier, Instant::now());
+    let wrong_dimension = ChunkKey::new(1, 0, 0);
+    stream.loaded_columns.insert(wrong_dimension);
+    assert!(stream.retain_local([16.5, 70.0, 0.5]));
+    assert!(
+        !stream
+            .resident
+            .contains(&SubChunkKey::from_chunk(outlier, 0))
+    );
+    assert!(!stream.publisher.required_columns.contains(&outlier));
+    assert!(!stream.unsent_column_deadlines.contains_key(&outlier));
+    assert!(!stream.loaded_columns.contains(&wrong_dimension));
+}

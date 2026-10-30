@@ -1,0 +1,833 @@
+use super::*;
+
+#[path = "culling_tests.rs"]
+mod culling;
+#[path = "pack_texture_tests.rs"]
+mod pack_textures;
+
+#[test]
+fn potted_models_sample_the_exposed_server_texture_grid() {
+    let side = 64;
+    let pixels = image::RgbaImage::from_fn(side, side, |x, y| {
+        image::Rgba([(x * 4) as u8, (y * 4) as u8, 91, 255])
+    })
+    .into_raw();
+    let quad = assets::ModelQuad {
+        positions: [[36, 256, 36], [220, 256, 220], [220, 64, 220], [36, 64, 36]],
+        uvs: [[0, 0], [4096, 0], [4096, 4096], [0, 4096]],
+        material: 0,
+        flags: assets::MODEL_QUAD_FLAG_TWO_SIDED,
+    };
+    let cropped = assets::ModelQuad {
+        uvs: [[512, 1024], [3584, 1024], [3584, 3072], [512, 3072]],
+        ..quad
+    };
+    for grid in [0, 1, 2] {
+        let overlay = assets::BlockOverlay {
+            visuals: vec![assets::BlockVisual {
+                faces: [0; 6],
+                flags: assets::BlockFlags::empty(),
+                kind: VisualKind::Model,
+                support: assets::VisualSupport::VanillaFallback,
+                contributor_role: assets::ContributorRole::Primary,
+                model_template: 1,
+                animation: assets::NO_ANIMATION,
+                variant: 0,
+                destroy: assets::compiled::block_destroy::BlockDestroyFacts::Unresolved,
+                native_material: assets::native_material::NativeMaterialFacts::Unresolved,
+            }],
+            light_properties: vec![assets::LightProperties::default()],
+            materials: vec![assets::Material {
+                texture: assets::TextureRef::new(1, 0).unwrap(),
+                ..assets::Material::unvaried()
+            }],
+            model_templates: vec![
+                assets::ModelTemplate {
+                    quad_start: 0,
+                    quad_count: 2,
+                    flags: assets::MODEL_TEMPLATE_FLAG_POTTED_PLANT,
+                },
+                assets::ModelTemplate {
+                    quad_start: 2,
+                    quad_count: 1,
+                    flags: 0,
+                },
+            ],
+            model_quads: vec![quad, cropped, quad],
+            textures: vec![assets::TextureArray {
+                layers: 1,
+                mips: assets::build_texture_mip_chain(pixels.clone().into(), side).unwrap(),
+            }],
+            texture_source_sizes: vec![[side as u16 >> grid; 2]],
+            texture_source_grids: vec![grid],
+            ..assets::BlockOverlay::default()
+        };
+        let runtime = RuntimeAssets::diagnostic()
+            .with_block_overlay(1, &overlay)
+            .unwrap();
+        let mut cache = ModelCache::default();
+        cache.begin_frame();
+        cache.finish_demand();
+        let handle = DroppedItemPublisher::potted_model(&mut cache, &runtime, 1).unwrap();
+        let cost = source_cost::template_cost(
+            &runtime,
+            runtime
+                .potted_model_template(NetworkIdMode::Sequential, 1)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            Some(cost),
+            render_model::dropped_item::ItemModelCost::from_model(&cache.models[handle as usize])
+        );
+        let DroppedItemModel::Block(model) = &cache.models[handle as usize] else {
+            panic!("pot contents must retain their model");
+        };
+        assert_eq!(model.materials.len(), 1);
+        assert_eq!(model.quads.len(), 2);
+        let sprite = &model.materials[0].0;
+        assert_eq!(sprite.rgba8.as_ref(), pixels);
+        for (retained, authored) in model.quads.iter().zip([quad, cropped]) {
+            assert_eq!(retained.positions, authored.positions);
+            // Sample interior points in both axes to detect flips and incorrect grid regions.
+            for (u, v) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                let sample = |uv: [[u16; 2]; 4], scale: f32| {
+                    let x = (f32::from(uv[0][0]) * (1.0 - u) + f32::from(uv[1][0]) * u) * scale;
+                    let y = (f32::from(uv[0][1]) * (1.0 - v) + f32::from(uv[3][1]) * v) * scale;
+                    (x as usize, y as usize)
+                };
+                let (x, y) = sample(retained.uvs, side as f32 / 4096.0);
+                let (expected_x, expected_y) = sample(authored.uvs, (side >> grid) as f32 / 4096.0);
+                let offset = (y * side as usize + x) * 4;
+                assert_eq!(
+                    &sprite.rgba8[offset..offset + 4],
+                    &[(expected_x * 4) as u8, (expected_y * 4) as u8, 91, 255],
+                    "grid {grid}, sample ({u}, {v})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn falling_blocks_keep_non_cube_world_geometry_and_cube_controls() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let target: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("assets/bedrock-target.json")).unwrap())
+            .unwrap();
+    let path = root.join(target["artifacts"]["world_assets"].as_str().unwrap());
+    let Ok(bytes) = std::fs::read(&path) else {
+        eprintln!(
+            "SKIP falling_blocks_keep_non_cube_world_geometry_and_cube_controls: missing {}",
+            path.display()
+        );
+        return;
+    };
+    let assets = RuntimeAssets::decode(&bytes).unwrap();
+    let records = assets::read_registry_for_protocol(
+        &std::fs::read(root.join(target["artifacts"]["block_registry"].as_str().unwrap())).unwrap(),
+        target["wire_protocol"].as_u64().unwrap() as u32,
+    )
+    .unwrap();
+    let mut cache = ModelCache::default();
+    cache.begin_frame();
+    cache.finish_demand();
+    for name in ["minecraft:dragon_egg", "minecraft:sand", "minecraft:gravel"] {
+        let id = records
+            .iter()
+            .find(|record| record.name.as_ref() == name)
+            .unwrap()
+            .sequential_id;
+        assert!(
+            DroppedItemPublisher::block_model(&mut cache, &assets, NetworkIdMode::Sequential, id)
+                .is_some(),
+            "falling {name} must retain its authored world geometry"
+        );
+        if name == "minecraft:dragon_egg" {
+            let DroppedItemModel::Block(model) = cache.models.last().unwrap() else {
+                panic!("egg requires its stepped model")
+            };
+            assert_eq!(model.quads.len(), 48);
+            assert!(
+                model
+                    .quads
+                    .iter()
+                    .any(|quad| quad.positions.iter().any(|p| p[1] == 240))
+            );
+        }
+    }
+}
+
+fn stream(hashes: bool, internal: u32) -> WorldStream {
+    let mut stream = WorldStream::new(protocol::WorldBootstrap {
+        local_player_unique_id: 1,
+        local_player_runtime_id: 1,
+        dimension: 0,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: 0,
+        block_network_ids_are_hashes: hashes,
+    });
+    stream.set_custom_block_ids(internal..internal + 1);
+    if !hashes {
+        stream.set_sequential_id_remap(assets::SequentialIdRemap::from_palette(
+            vec![0, internal],
+            internal + 1,
+        ));
+    }
+    stream
+}
+
+#[test]
+fn retained_items_and_falling_blocks_resolve_the_current_session_palette() {
+    let visual = ItemVisualRoute::RetainedBlock {
+        block_runtime_id: 1,
+    };
+    let falling = BlockEntityKind::Falling {
+        block_runtime_id: 1,
+    };
+    for internal in [7, 6] {
+        let stream = stream(false, internal);
+        assert_eq!(
+            item_block_id(&stream, visual, None, None),
+            Some((NetworkIdMode::Sequential, internal))
+        );
+        assert_eq!(
+            entity_block_id(&stream, &falling),
+            Some((NetworkIdMode::Sequential, internal, 1.0)),
+        );
+    }
+    assert_eq!(
+        visual,
+        ItemVisualRoute::RetainedBlock {
+            block_runtime_id: 1
+        }
+    );
+    assert_eq!(
+        falling,
+        BlockEntityKind::Falling {
+            block_runtime_id: 1
+        }
+    );
+}
+
+#[test]
+fn retained_items_and_falling_blocks_preserve_high_bit_hashes() {
+    let hash = 0x8000_0007_u32;
+    let stream = stream(true, hash);
+    let raw = i32::from_ne_bytes(hash.to_ne_bytes());
+    assert!(raw < 0);
+    assert_eq!(
+        item_block_id(
+            &stream,
+            ItemVisualRoute::RetainedBlock {
+                block_runtime_id: raw
+            },
+            None,
+            None,
+        ),
+        Some((NetworkIdMode::Hashed, hash)),
+    );
+    assert_eq!(
+        entity_block_id(
+            &stream,
+            &BlockEntityKind::Falling {
+                block_runtime_id: raw
+            }
+        ),
+        Some((NetworkIdMode::Hashed, hash, 1.0)),
+    );
+}
+
+#[test]
+fn compiled_block_item_and_tnt_visuals_are_already_internal() {
+    let stream = stream(false, 7);
+    let visual = ItemVisualRoute::BlockItem(assets::BlockVisualId(1));
+    assert_eq!(
+        item_block_id(&stream, visual, None, None),
+        Some((NetworkIdMode::Sequential, 1))
+    );
+    assert_eq!(
+        entity_block_id(&stream, &BlockEntityKind::PrimedTnt { visual }),
+        Some((NetworkIdMode::Sequential, 1, 1.0)),
+    );
+}
+
+#[test]
+fn dropped_crossed_plants_use_sprites_while_falling_blocks_keep_their_model() {
+    let cross = assets::BlockVisual {
+        faces: [0; 6],
+        flags: assets::BlockFlags::empty(),
+        kind: VisualKind::Cross,
+        support: assets::VisualSupport::Exact,
+        contributor_role: assets::ContributorRole::Primary,
+        model_template: 0,
+        animation: assets::NO_ANIMATION,
+        variant: 0,
+        destroy: assets::compiled::block_destroy::BlockDestroyFacts::Unresolved,
+        native_material: assets::native_material::NativeMaterialFacts::Unresolved,
+    };
+    let quad = assets::ModelQuad {
+        positions: [[0, 256, 0], [256, 256, 256], [256, 0, 256], [0, 0, 0]],
+        uvs: [[0, 0], [4096, 0], [4096, 4096], [0, 4096]],
+        material: 0,
+        flags: assets::MODEL_QUAD_FLAG_TWO_SIDED,
+    };
+    let overlay = assets::BlockOverlay {
+        visuals: vec![
+            cross,
+            assets::BlockVisual {
+                kind: VisualKind::Cube,
+                flags: assets::BlockFlags::CUBE_GEOMETRY,
+                model_template: assets::NO_MODEL_TEMPLATE,
+                ..cross
+            },
+        ],
+        light_properties: vec![assets::LightProperties::default(); 2],
+        materials: vec![assets::Material::unvaried()],
+        model_templates: vec![assets::ModelTemplate {
+            quad_start: 0,
+            quad_count: 1,
+            flags: 0,
+        }],
+        model_quads: vec![quad],
+        ..Default::default()
+    };
+    let assets = RuntimeAssets::diagnostic()
+        .with_block_overlay(1, &overlay)
+        .unwrap();
+    let stream = stream(false, 1);
+    for visual in [
+        ItemVisualRoute::BlockItem(assets::BlockVisualId(1)),
+        ItemVisualRoute::RetainedBlock {
+            block_runtime_id: 1,
+        },
+    ] {
+        assert_eq!(item_block_id(&stream, visual, None, Some(&assets)), None);
+    }
+    assert_eq!(
+        item_block_id(
+            &stream,
+            ItemVisualRoute::BlockItem(assets::BlockVisualId(2)),
+            None,
+            Some(&assets),
+        ),
+        Some((NetworkIdMode::Sequential, 2)),
+    );
+    assert!(block_template(&assets, NetworkIdMode::Sequential, 1).is_some());
+    assert_eq!(
+        entity_block_id(
+            &stream,
+            &BlockEntityKind::Falling {
+                block_runtime_id: 1,
+            },
+        ),
+        Some((NetworkIdMode::Sequential, 1, 1.0)),
+    );
+}
+
+use assets::{CompiledAssets, RegistryRecord};
+use std::fs;
+/// Compiles real barrel selectors with original opaque sprite artwork for held-consumer checks.
+fn barrels() -> (CompiledAssets, Vec<RegistryRecord>) {
+    barrels_with_size(assets::TILE_SIZE)
+}
+
+/// Compiles original sprites at the requested source resolution.
+fn barrels_with_size(side: u32) -> (CompiledAssets, Vec<RegistryRecord>) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::create_dir_all(root.join("biomes")).unwrap();
+    fs::create_dir_all(root.join("behavior/biomes")).unwrap();
+    fs::create_dir_all(root.join("textures/colormap")).unwrap();
+    fs::write(
+        root.join("biomes/plain.client_biome.json"),
+        r#"{"minecraft:client_biome":{"description":{"identifier":"plain"},"components":{}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("behavior/biomes/plain.biome.json"),r#"{"minecraft:biome":{"description":{"identifier":"plain"},"components":{"minecraft:climate":{"temperature":0.8,"downfall":0.4}}}}"#).unwrap();
+    fs::write(root.join("blocks.json"), r#"{"barrel":{"textures":"art"}}"#).unwrap();
+    fs::write(
+        root.join("textures/terrain_texture.json"),
+        r#"{"texture_data":{"art":{"textures":"textures/art"}}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("textures/flipbook_textures.json"), "[]").unwrap();
+    image::RgbaImage::from_fn(side, side, |x, y| {
+        image::Rgba([20, (x * 192 / side) as u8, (y * 192 / side) as u8, 255])
+    })
+    .save(root.join("textures/art.png"))
+    .unwrap();
+    for map in assets::TintMapId::ALL {
+        image::RgbaImage::from_pixel(
+            assets::TINT_MAP_SIZE,
+            assets::TINT_MAP_SIZE,
+            image::Rgba([255; 4]),
+        )
+        .save(root.join(format!("textures/colormap/{}.png", map.source_name())))
+        .unwrap();
+    }
+    let protocol = assets::active_content_registry_protocol();
+    let records =
+        assets::read_registry_for_protocol(assets::pinned_block_registry_bytes(), protocol)
+            .unwrap()
+            .into_vec()
+            .into_iter()
+            .filter(|r| matches!(r.name.as_ref(), "minecraft:air" | "minecraft:barrel"))
+            .collect::<Vec<_>>();
+    let span = records
+        .iter()
+        .map(|r| r.sequential_id as usize + 1)
+        .max()
+        .unwrap();
+    let compiled = pack_compiler::compile_pack_with_biomes(
+        root,
+        &root.join("behavior"),
+        &records,
+        &[],
+        &vec![assets::LightProperties::default(); span],
+        protocol,
+    )
+    .unwrap();
+    (compiled, records)
+}
+
+#[test]
+fn dropped_barrel_models_use_authored_carried_faces_for_both_id_modes() {
+    let (compiled, records) = barrels();
+    let runtime = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    let record = records
+        .iter()
+        .find(|r| r.name.as_ref() == "minecraft:barrel")
+        .unwrap();
+    let tiles = std::array::from_fn(|face| assets::IconSprite {
+        width: assets::BLOCK_ITEM_FACE_SIDE,
+        height: assets::BLOCK_ITEM_FACE_SIDE,
+        rgba8: [91 + face as u8, 40, 80, 255]
+            .repeat(usize::from(assets::BLOCK_ITEM_FACE_SIDE).pow(2))
+            .into(),
+    });
+    let sprite = assets::compose_block_item_sheet(&tiles).unwrap();
+    let catalog = assets::RuntimeIconCatalog::decode(
+        &assets::encode_icon_catalog_with_block_sheets(
+            runtime.provenance().source_manifest_sha256,
+            &[sprite],
+            &[],
+            &[assets::IconBlockSheet {
+                visual: assets::BlockVisualId(record.sequential_id),
+                sprite: 0,
+            }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let icons = UiPresentationRuntime::with_hud_and_icons(
+        ui_engine::test_support::fixture_font(),
+        client_ui::test_support::fixture_hud(),
+        Arc::new(catalog),
+    )
+    .unwrap();
+    for (mode, id) in [
+        (NetworkIdMode::Sequential, record.sequential_id),
+        (NetworkIdMode::Hashed, record.network_hash),
+    ] {
+        let mut cache = ModelCache::default();
+        cache.begin_frame();
+        cache.finish_demand();
+        let handle =
+            DroppedItemPublisher::carried_block_model(&mut cache, &icons, &runtime, mode, id)
+                .expect("full-cube barrel models retain authored dropped faces");
+        let DroppedItemModel::Cube(cube) = &cache.models[handle as usize] else {
+            panic!("carried cube");
+        };
+        for (face, pixels) in cube.faces.iter().enumerate() {
+            assert_eq!(pixels.as_ref(), tiles[face].rgba8.as_ref());
+        }
+    }
+}
+
+#[test]
+fn carried_actor_blocks_use_world_art_once_a_pack_retextures_them() {
+    let (compiled, records) = barrels();
+    let runtime = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    let record = records
+        .iter()
+        .find(|r| r.name.as_ref() == "minecraft:barrel")
+        .unwrap();
+    let visual = assets::BlockVisualId(record.sequential_id);
+    let tiles = std::array::from_fn(|face| assets::IconSprite {
+        width: assets::BLOCK_ITEM_FACE_SIDE,
+        height: assets::BLOCK_ITEM_FACE_SIDE,
+        rgba8: [91 + face as u8, 40, 80, 255]
+            .repeat(usize::from(assets::BLOCK_ITEM_FACE_SIDE).pow(2))
+            .into(),
+    });
+    let catalog = assets::RuntimeIconCatalog::decode(
+        &assets::encode_icon_catalog_with_block_sheets(
+            runtime.provenance().source_manifest_sha256,
+            &[assets::compose_block_item_sheet(&tiles).unwrap()],
+            &[],
+            &[assets::IconBlockSheet { visual, sprite: 0 }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let icons = UiPresentationRuntime::with_hud_and_icons(
+        ui_engine::test_support::fixture_font(),
+        client_ui::test_support::fixture_hud(),
+        Arc::new(catalog),
+    )
+    .unwrap();
+    let mut materials = assets::gui_item::full_cube_model_quads(&runtime, visual)
+        .unwrap()
+        .map(|quad| quad.material)
+        .to_vec();
+    materials.sort_unstable();
+    materials.dedup();
+    let color = [12, 140, 220, 255];
+    let pack = runtime
+        .with_block_overlay(
+            runtime.visual_count() as u32,
+            &assets::BlockOverlay {
+                base_texture_pages: runtime.texture_pages().len() as u32,
+                textures: vec![assets::TextureArray {
+                    layers: 1,
+                    mips: assets::build_texture_mip_chain(
+                        color
+                            .repeat((assets::TILE_SIZE * assets::TILE_SIZE) as usize)
+                            .into(),
+                        assets::TILE_SIZE,
+                    )
+                    .unwrap(),
+                }],
+                material_overrides: materials
+                    .into_iter()
+                    .map(|material| assets::MaterialOverride {
+                        material,
+                        texture: assets::TextureRef::new(runtime.texture_pages().len() as u32, 0)
+                            .unwrap(),
+                        animation: assets::NO_ANIMATION,
+                        variation: None,
+                    })
+                    .collect(),
+                ..assets::BlockOverlay::default()
+            },
+        )
+        .unwrap();
+    for (assets, startup) in [(&runtime, true), (&pack, false)] {
+        let mut cache = ModelCache::default();
+        cache.begin_frame();
+        cache.finish_demand();
+        let handle = DroppedItemPublisher::actor_carried_block_model(
+            &mut cache,
+            &icons,
+            assets,
+            NetworkIdMode::Sequential,
+            visual.0,
+        )
+        .unwrap();
+        match &cache.models[handle as usize] {
+            DroppedItemModel::Cube(cube) => {
+                assert!(startup, "a retextured cube must not keep its startup faces");
+                assert_eq!(cube.faces[0].as_ref(), tiles[0].rgba8.as_ref());
+            }
+            DroppedItemModel::Block(block) => {
+                assert!(!startup, "unchanged cubes use their composed carried faces");
+                assert_eq!(block.materials[0].0.rgba8[..4], color);
+            }
+            _ => panic!("carried blocks draw block models"),
+        }
+    }
+}
+
+#[test]
+fn retextured_carried_cubes_without_a_world_model_keep_their_startup_faces() {
+    let (mut compiled, records) = barrels();
+    let record = records
+        .iter()
+        .find(|record| record.name.as_ref() == "minecraft:barrel")
+        .unwrap();
+    let visual = &mut compiled.visuals[record.sequential_id as usize];
+    let top = visual.faces[0];
+    let mut materials = compiled.materials.into_vec();
+    let sides = materials.len() as u32;
+    materials.push(materials[top as usize]);
+    compiled.materials = materials.into();
+    visual.faces = [top, top, sides, sides, sides, sides];
+    visual.kind = VisualKind::Cube;
+    visual.flags = assets::BlockFlags::CUBE_GEOMETRY | assets::BlockFlags::OCCLUDES_FULL_FACE;
+    visual.model_template = assets::NO_MODEL_TEMPLATE;
+    let runtime = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    let visual = assets::BlockVisualId(record.sequential_id);
+    let tiles = std::array::from_fn(|face| assets::IconSprite {
+        width: assets::BLOCK_ITEM_FACE_SIDE,
+        height: assets::BLOCK_ITEM_FACE_SIDE,
+        rgba8: [61 + face as u8, 90, 20, 255]
+            .repeat(usize::from(assets::BLOCK_ITEM_FACE_SIDE).pow(2))
+            .into(),
+    });
+    let catalog = assets::RuntimeIconCatalog::decode(
+        &assets::encode_icon_catalog_with_block_sheets(
+            runtime.provenance().source_manifest_sha256,
+            &[assets::compose_block_item_sheet(&tiles).unwrap()],
+            &[],
+            &[assets::IconBlockSheet { visual, sprite: 0 }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let icons = UiPresentationRuntime::with_hud_and_icons(
+        ui_engine::test_support::fixture_font(),
+        client_ui::test_support::fixture_hud(),
+        Arc::new(catalog),
+    )
+    .unwrap();
+    // A pack replaces only the sides, at twice the top's resolution.
+    let side = assets::TILE_SIZE * 2;
+    let pack = runtime
+        .with_block_overlay(
+            runtime.visual_count() as u32,
+            &assets::BlockOverlay {
+                base_texture_pages: runtime.texture_pages().len() as u32,
+                textures: vec![assets::TextureArray {
+                    layers: 1,
+                    mips: assets::build_texture_mip_chain(
+                        [12, 140, 220, 255].repeat((side * side) as usize).into(),
+                        side,
+                    )
+                    .unwrap(),
+                }],
+                material_overrides: vec![assets::MaterialOverride {
+                    material: sides,
+                    texture: assets::TextureRef::new(runtime.texture_pages().len() as u32, 0)
+                        .unwrap(),
+                    animation: assets::NO_ANIMATION,
+                    variation: None,
+                }],
+                ..assets::BlockOverlay::default()
+            },
+        )
+        .unwrap();
+    assert!(pack.is_retextured(visual));
+    assert!(block_cube(&pack, NetworkIdMode::Sequential, visual.0).is_none());
+    let mut cache = ModelCache::default();
+    cache.begin_frame();
+    cache.finish_demand();
+    let handle = DroppedItemPublisher::actor_carried_block_model(
+        &mut cache,
+        &icons,
+        &pack,
+        NetworkIdMode::Sequential,
+        visual.0,
+    )
+    .expect("a carried cube must not vanish when its world model cannot be built");
+    let DroppedItemModel::Cube(cube) = &cache.models[handle as usize] else {
+        panic!("the startup carried cube");
+    };
+    assert_eq!(cube.faces[0].as_ref(), tiles[0].rgba8.as_ref());
+}
+
+#[test]
+fn static_cube_items_prefer_session_artwork_and_retain_carried_fallbacks() {
+    let (compiled, records) = barrels();
+    let runtime = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    let visual = assets::BlockVisualId(
+        records
+            .iter()
+            .find(|record| record.name.as_ref() == "minecraft:barrel")
+            .unwrap()
+            .sequential_id,
+    );
+    let tiles = std::array::from_fn(|face| assets::IconSprite {
+        width: assets::BLOCK_ITEM_FACE_SIDE,
+        height: assets::BLOCK_ITEM_FACE_SIDE,
+        rgba8: [31 + face as u8, 70, 90, 255]
+            .repeat(usize::from(assets::BLOCK_ITEM_FACE_SIDE).pow(2))
+            .into(),
+    });
+    let catalog = assets::RuntimeIconCatalog::decode(
+        &assets::encode_icon_catalog_with_block_sheets(
+            runtime.provenance().source_manifest_sha256,
+            &[assets::compose_block_item_sheet(&tiles).unwrap()],
+            &[assets::IconEntry {
+                identifier: "minecraft:barrel".into(),
+                metadata: 0,
+                sprite: 0,
+            }],
+            &[assets::IconBlockSheet { visual, sprite: 0 }],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut icons = UiPresentationRuntime::with_hud_and_icons(
+        ui_engine::test_support::fixture_font(),
+        client_ui::test_support::fixture_hud(),
+        Arc::new(catalog),
+    )
+    .unwrap();
+    let mut placement = render_model::StaticItemPlacement {
+        shield_pattern: None,
+        allow_block_models: true,
+        identifier: "minecraft:barrel".into(),
+        metadata: 0,
+        potted_block: None,
+        carried_block: Some(visual),
+        world_from_item: render_model::dropped_item_transform([0.0; 3], 0.0, 0.5),
+        light: None,
+    };
+    let icon = icons.startup_item_icon(&placement.identifier, placement.metadata);
+    assert!(icon.is_some());
+    let mut cache = ModelCache::default();
+    cache.begin_frame();
+    cache.finish_demand();
+    let model =
+        DroppedItemPublisher::placement_model(&mut cache, &icons, Some(&runtime), &placement, icon)
+            .unwrap();
+    let DroppedItemModel::Cube(cube) = &cache.models[model as usize] else {
+        panic!("framed cubes retain six carried faces");
+    };
+    for (face, pixels) in cube.faces.iter().enumerate() {
+        assert_eq!(pixels.as_ref(), tiles[face].rgba8.as_ref());
+    }
+    for assets in [None, Some(&runtime)] {
+        placement.carried_block = None;
+        let sprite =
+            DroppedItemPublisher::placement_model(&mut cache, &icons, assets, &placement, icon)
+                .unwrap();
+        assert!(matches!(
+            &cache.models[sprite as usize],
+            DroppedItemModel::Sprite(_)
+        ));
+    }
+    placement.carried_block = Some(visual);
+    let sprite =
+        DroppedItemPublisher::placement_model(&mut cache, &icons, None, &placement, icon).unwrap();
+    assert!(matches!(
+        &cache.models[sprite as usize],
+        DroppedItemModel::Sprite(_)
+    ));
+    for (metadata, override_metadata, overridden) in
+        [(0, 0, true), (7, 7, true), (7, 0, true), (3, 7, false)]
+    {
+        use client_ui::ui_runtime::{
+            UiRuntime,
+            presentation::{SessionIcon, SessionIcons},
+        };
+        let mut ui = UiRuntime::new(1);
+        ui.set_session_icons(Some(Arc::new(SessionIcons {
+            icons: vec![SessionIcon {
+                identifier: Arc::clone(&placement.identifier),
+                metadata: override_metadata,
+                width: 1,
+                height: 1,
+                rgba8: Box::new([190, 20, 80, 255]),
+            }],
+            ..Default::default()
+        })));
+        icons
+            .build(
+                &player_state::PlayerState::new(1),
+                &ui,
+                0,
+                [800, 600],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+        placement.metadata = metadata;
+        let icon = icons.startup_item_icon(&placement.identifier, metadata);
+        let model = DroppedItemPublisher::placement_model(
+            &mut cache,
+            &icons,
+            Some(&runtime),
+            &placement,
+            icon,
+        )
+        .unwrap();
+        if overridden {
+            let DroppedItemModel::Sprite(sprite) = &cache.models[model as usize] else {
+                panic!("a session icon without a sheet must replace the startup carried cube");
+            };
+            assert_eq!(sprite.rgba8.as_ref(), [190, 20, 80, 255]);
+        } else {
+            assert!(matches!(
+                &cache.models[model as usize],
+                DroppedItemModel::Cube(_)
+            ));
+        }
+    }
+}
+
+#[test]
+fn weighted_replacement_updates_dropped_pixels_and_keeps_the_variation_range() {
+    let (mut compiled, records) = barrels();
+    let record = records
+        .iter()
+        .find(|record| record.name.as_ref() == "minecraft:barrel")
+        .unwrap();
+    let visual = &mut compiled.visuals[record.sequential_id as usize];
+    let representative = compiled.materials[visual.faces[0] as usize];
+    let mut materials = compiled.materials.into_vec();
+    let selector = materials.len() as u32;
+    materials.push(assets::Material {
+        variation_start: selector + 1,
+        variation_count: 2,
+        ..representative
+    });
+    materials.extend([0.25_f32, 0.75_f32].map(|weight| assets::Material {
+        variation_weight: weight.to_bits(),
+        ..representative
+    }));
+    compiled.materials = materials.into();
+    visual.faces = [selector; 6];
+    visual.kind = VisualKind::Cube;
+    visual.flags = assets::BlockFlags::CUBE_GEOMETRY | assets::BlockFlags::OCCLUDES_FULL_FACE;
+    visual.model_template = assets::NO_MODEL_TEMPLATE;
+    let base = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    let color = [91, 40, 80, 255];
+    let replacement = assets::BlockOverlay {
+        textures: vec![assets::TextureArray {
+            layers: 1,
+            mips: assets::build_texture_mip_chain(
+                color
+                    .repeat((assets::TILE_SIZE * assets::TILE_SIZE) as usize)
+                    .into(),
+                assets::TILE_SIZE,
+            )
+            .unwrap(),
+        }],
+        material_overrides: (selector..selector + 3)
+            .map(|material| assets::MaterialOverride {
+                material,
+                texture: assets::TextureRef::new(1, 0).unwrap(),
+                animation: assets::NO_ANIMATION,
+                variation: None,
+            })
+            .collect(),
+        ..assets::BlockOverlay::default()
+    };
+    let session = base
+        .with_block_overlay(base.visual_count() as u32, &replacement)
+        .unwrap();
+    for (mode, id) in [
+        (NetworkIdMode::Sequential, record.sequential_id),
+        (NetworkIdMode::Hashed, record.network_hash),
+    ] {
+        let original = block_cube(&base, mode, id).unwrap();
+        let dropped = block_cube(&session, mode, id).unwrap();
+        for (face, original_face) in dropped.faces.iter().zip(&original.faces) {
+            assert!(face.as_chunks::<4>().0.iter().all(|pixel| *pixel == color));
+            assert_ne!(face, original_face);
+        }
+    }
+    let group = session.material(selector);
+    assert_eq!(group.variation_start, selector + 1);
+    assert_eq!(group.variation_count, 2);
+    for (leaf, weight) in [0.25_f32, 0.75_f32].into_iter().enumerate() {
+        let material = session.material(selector + 1 + leaf as u32);
+        assert_eq!(material.texture, group.texture);
+        assert_eq!(material.variation_weight, weight.to_bits());
+    }
+}
+
+#[path = "tests/sprite_routes.rs"]
+mod sprite_routes;

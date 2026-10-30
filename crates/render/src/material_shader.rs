@@ -1,0 +1,274 @@
+//! The material carrier and WGSL consume the same flag discriminants.
+
+/// Fragment bindings of each physical texture page: one filterable sRGB view
+/// and one gamma view, so `MAX_TEXTURE_PAGES` needs this many of each.
+pub(crate) const SAMPLED_TEXTURE_BINDINGS: [u32; assets::MAX_TEXTURE_PAGES] = [4, 5, 19, 20, 21];
+pub(crate) const NATIVE_LEAF_TEXTURE_BINDINGS: [u32; assets::MAX_TEXTURE_PAGES] =
+    [16, 17, 22, 23, 24];
+pub(crate) const NATIVE_LEAF_SAMPLER_BINDING: u32 = 25;
+pub(crate) const BIOME_QUERY_TABLES_BINDING: u32 = 26;
+pub(crate) const CHUNK_SAMPLER_COUNT: u32 = 2;
+pub(crate) const CHUNK_SAMPLED_TEXTURE_BINDINGS: u32 =
+    (assets::MAX_TEXTURE_PAGES + NATIVE_LEAF_TEXTURE_BINDINGS.len()) as u32;
+
+// Admitted source sizes are powers of two up to MAX_TILE_SIZE. Four bits store
+// log2(size) + 1; zero means the physical page size. Grid occupies five more bits.
+// They sit below the page field, which a reference's own width separates.
+const TEXTURE_SIZE_BITS: u32 = 4;
+const TEXTURE_WIDTH_SHIFT: u32 = assets::TEXTURE_LAYER_MASK.count_ones();
+const TEXTURE_HEIGHT_SHIFT: u32 = TEXTURE_WIDTH_SHIFT + TEXTURE_SIZE_BITS;
+const TEXTURE_GRID_SHIFT: u32 = TEXTURE_HEIGHT_SHIFT + TEXTURE_SIZE_BITS;
+const TEXTURE_SIZE_EXPONENT_MASK: u32 = (1 << TEXTURE_SIZE_BITS) - 1;
+const _: () = assert!(assets::MAX_TILE_SIZE.ilog2() < TEXTURE_SIZE_EXPONENT_MASK);
+
+/// Encodes admitted power-of-two dimensions above the shared page and layer fields.
+pub(crate) fn gpu_texture_ref(
+    reference: assets::TextureRef,
+    dimensions: [u32; 2],
+    page_size: u32,
+) -> u32 {
+    if dimensions == [page_size; 2] {
+        reference.raw()
+    } else {
+        debug_assert!(
+            dimensions
+                .iter()
+                .all(|size| size.is_power_of_two() && *size <= assets::MAX_TILE_SIZE)
+        );
+        reference.raw()
+            | ((dimensions[0].ilog2() + 1) << TEXTURE_WIDTH_SHIFT)
+            | ((dimensions[1].ilog2() + 1) << TEXTURE_HEIGHT_SHIFT)
+    }
+}
+
+/// Adds the terrain entry's UV-grid exponent without changing dimensions, page or layer.
+pub(crate) fn gpu_grid_texture_ref(
+    reference: assets::TextureRef,
+    dimensions: [u32; 2],
+    page_size: u32,
+    grid: u8,
+) -> u32 {
+    gpu_texture_ref(reference, dimensions, page_size) | (u32::from(grid) << TEXTURE_GRID_SHIFT)
+}
+
+/// Resolves the generated biome tint module's table binding, shared by every chunk shader.
+pub(crate) fn bind_biome_tables(source: &str) -> String {
+    source
+        .replace(
+            "BIOME_QUERY_TABLES_BINDING",
+            &BIOME_QUERY_TABLES_BINDING.to_string(),
+        )
+        .replace(
+            "BIOME_TINT_WORDS",
+            &format!(
+                "{}u",
+                (8 + assets::seasonal_foliage::SEASONAL_FOLIAGE_COUNT * 4)
+            ),
+        )
+}
+
+pub(crate) fn chunk_atlas_views_fit(limits: &wgpu::Limits) -> bool {
+    limits.max_sampled_textures_per_shader_stage >= CHUNK_SAMPLED_TEXTURE_BINDINGS
+        && limits.max_samplers_per_shader_stage >= CHUNK_SAMPLER_COUNT
+        && limits.max_bindings_per_bind_group > BIOME_QUERY_TABLES_BINDING
+}
+
+/// Terrain samples nearest texels and interpolates only between mip levels.
+pub(crate) fn native_leaf_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    wgpu::SamplerDescriptor {
+        label: Some("native terrain leaf sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        min_filter: wgpu::FilterMode::Nearest,
+        mag_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        lod_max_clamp: (assets::VANILLA_TERRAIN_MIP_COUNT - 1) as f32,
+        ..Default::default()
+    }
+}
+
+/// Formats the shared enchantment tint for the actor and UI shaders.
+pub(crate) fn glint_tint_source() -> String {
+    let [red, green, blue] = render_model::ActorGlint::TINT_RGB;
+    format!("vec3<f32>({red:?}, {green:?}, {blue:?})")
+}
+
+/// Generates stem colours from the same bounded material contract as the compiler.
+fn stem_colours_source() -> String {
+    let colours = (0..=7)
+        .map(|growth| {
+            let rgb = assets::stem::colour(growth).expect("bounded stem growth");
+            format!(
+                "vec3<f32>({}, {}, {}) / 255.0",
+                rgb[0] as f32, rgb[1] as f32, rgb[2] as f32
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "const STEM_COLOURS: array<vec3<f32>, 8> = array({colours});\nfn stem_colour(flags: u32) -> vec3<f32> {{\n if ((flags & {}u) == 0u) {{ return vec3(1.0); }}\n return STEM_COLOURS[(flags & {}u) >> {}u];\n}}",
+        assets::stem::MATERIAL_FLAG,
+        assets::stem::GROWTH_MASK,
+        assets::stem::GROWTH_SHIFT,
+    )
+}
+
+pub(crate) fn source(source: &str) -> String {
+    source
+        .replace("ACTOR_COMPACT_CURRENT_BONE_BASE", &format!("{}u", render_model::actor::MAX_ACTOR_POSE_BONES))
+        .replace("TERRAIN_UNIT_QUADS", &format!("{}u", render_model::terrain_units::QUADS_PER_UNIT))
+        .replace("TERRAIN_UNITS_PER_INSTANCE", &format!("{}u", render_model::terrain_units::UNITS_PER_INSTANCE))
+        .replace("FAR_TERRAIN_TILE_CELLS", &format!("{}u", far_terrain::config::TILE_CELLS))
+        .replace("FAR_TERRAIN_FACE_POSITIVE_X", &format!("{}u", far_terrain::FACE_POSITIVE_X))
+        .replace("FAR_TERRAIN_FACE_NEGATIVE_X", &format!("{}u", far_terrain::FACE_NEGATIVE_X))
+        .replace("FAR_TERRAIN_FACE_POSITIVE_Z", &format!("{}u", far_terrain::FACE_POSITIVE_Z))
+        .replace("FAR_TERRAIN_FACE_NEGATIVE_Z", &format!("{}u", far_terrain::FACE_NEGATIVE_Z))
+        .replace("// STEM_COLOURS", &stem_colours_source())
+        .replace("MATERIAL_STEM_FLAG", &format!("{}u", assets::stem::MATERIAL_FLAG))
+        .replace("ITEM_GLINT_UV_SCALE", &format!("{:?}", render_model::ITEM_GLINT_UV_SCALE))
+        .replace("GLINT_TINT_RGB", &glint_tint_source())
+        .replace("ACTOR_LIGHT_WORLD_FLAG", &format!("{}u", render_api::ACTOR_LIGHT_WORLD))
+        .replace("ACTOR_LIGHT_DIRECTIONAL_FLAG", &format!("{}u", render_api::ACTOR_LIGHT_DIRECTIONAL))
+        .replace("TEXTURE_LAYER_MASK", &format!("{}u", assets::TEXTURE_LAYER_MASK))
+        .replace(
+            "GPU_TEXTURE_PAGE_SHIFT",
+            &format!("{}u", assets::TEXTURE_PAGE_SHIFT),
+        )
+        .replace(
+            "GPU_TEXTURE_PAGE_MASK",
+            &format!("{}u", assets::TEXTURE_PAGE_MASK),
+        )
+        .replace("GPU_TEXTURE_GRID_SHIFT", &format!("{TEXTURE_GRID_SHIFT}u"))
+        .replace("GPU_TEXTURE_SIZE_EXPONENT_MASK", &format!("{TEXTURE_SIZE_EXPONENT_MASK}u"))
+        .replace("TERRAIN_QUAD_SHIFT_MASK", &format!("{}u", assets::TERRAIN_QUAD_SHIFT_MASK))
+        .replace("GPU_TEXTURE_WIDTH_SHIFT", &format!("{TEXTURE_WIDTH_SHIFT}u"))
+        .replace("GPU_TEXTURE_HEIGHT_SHIFT", &format!("{TEXTURE_HEIGHT_SHIFT}u"))
+        .replace("BLOCK_ENTITY_CULL_BACK_FACES", &format!("{}u", render_model::block_entity::mesh::BLOCK_ENTITY_CULL_BACK_FACES))
+        .replace("BLOCK_OVERLAY_FACE_OFFSET", &format!("{:?}", render_api::BLOCK_OVERLAY_FACE_OFFSET))
+        .replace("ACTOR_COLOR_MASK_MATERIAL_FLAG", &format!("{}u", render_model::ACTOR_COLOR_MASK_MATERIAL_FLAG))
+        .replace("ACTOR_MATERIAL_LEGACY112_FLAG", &format!("{}u", render_model::LEGACY_COMBAT_MATERIAL_FLAG))
+        .replace("// LEGACY_GLINT_CONSTANTS", &legacy_glint_constants())
+        .replace("ACTOR_MATERIAL_GLINT", &format!("{}u", assets::EntityRenderMaterial::Glint as u32))
+        .replace("ACTOR_MATERIAL_DEFAULT", &format!("{}u", assets::EntityRenderMaterial::Default as u32))
+        .replace("ACTOR_MATERIAL_DRAGON", &format!("{}u", assets::EntityRenderMaterial::Dragon as u32))
+        .replace("ACTOR_MATERIAL_DISSOLVE_DEPTH", &format!("{}u", assets::EntityRenderMaterial::DissolveDepth as u32))
+        .replace("ACTOR_MATERIAL_DISSOLVE_COLOR", &format!("{}u", assets::EntityRenderMaterial::DissolveColor as u32))
+        .replace("ACTOR_MATERIAL_KIND_MASK", &format!("{}u", assets::EntityRenderMaterialState::KIND_MASK))
+        .replace("ACTOR_MATERIAL_AUTHORED_FLAG", &format!("{}u", assets::EntityRenderMaterialState::AUTHORED))
+        .replace("ACTOR_MATERIAL_ALPHA_TEST_FLAG", &format!("{}u", assets::EntityRenderMaterialState::ALPHA_TEST))
+        .replace("ACTOR_MATERIAL_CULL_FLAG", &format!("{}u", assets::EntityRenderMaterialState::CULL))
+        .replace("ACTOR_MATERIAL_BLEND_FLAG", &format!("{}u", assets::EntityRenderMaterialState::BLEND))
+        .replace("ACTOR_MATERIAL_EMISSIVE_FLAG", &format!("{}u", assets::EntityRenderMaterialState::EMISSIVE))
+        .replace("ACTOR_MATERIAL_ONLY_EMISSIVE_FLAG", &format!("{}u", assets::EntityRenderMaterialState::ONLY_EMISSIVE))
+        .replace("ACTOR_MATERIAL_DISABLE_OVERLAY_FLAG", &format!("{}u", assets::EntityRenderMaterialState::DISABLE_OVERLAY))
+        .replace("ACTOR_CHART_COORDINATE_BITS", &format!("{}u", u16::BITS))
+        .replace("ACTOR_ALPHA_TEST_THRESHOLD", &format!("{:?}", assets::ENTITY_ALPHA_TEST_THRESHOLD))
+        .replace("MODEL_RANDOM_OFFSET_FLAG", &format!("{}u", meshing::MODEL_REF_FLAG_RANDOM_OFFSET))
+        .replace("MODEL_SHADE_FACE_SHIFT", &format!("{}u", meshing::LIGHT_SAMPLE_SHADE_FACE_SHIFT))
+        .replace("MODEL_BAMBOO_FLAG", &format!("{}u", assets::MODEL_TEMPLATE_FLAG_BAMBOO))
+        .replace("BAMBOO_STEM_SIDE_QUAD_MASK", &format!("{}u", assets::bamboo::STEM_SIDE_QUAD_MASK))
+        .replace("BAMBOO_POSITIVE_X_LEAF_QUAD", &format!("{}u", assets::bamboo::POSITIVE_X_LEAF_QUAD))
+        .replace("BAMBOO_POSITIVE_Z_LEAF_QUAD", &format!("{}u", assets::bamboo::POSITIVE_Z_LEAF_QUAD))
+        .replace("// BAMBOO_CONSTANTS", &format!(
+            "const BAMBOO_OFFSET_MIN: f32 = {:?};\nconst BAMBOO_OFFSET_STEP: f32 = {:?};\nconst BAMBOO_STEM_UV_STRIDE: f32 = {:?};\nconst BAMBOO_LEAF_PLANE_INSET: f32 = {:?};",
+            block_transform::bamboo::OFFSET_MIN,
+            block_transform::bamboo::OFFSET_STEP,
+            assets::bamboo::STEM_UV_STRIDE,
+            assets::bamboo::LEAF_PLANE_INSET,
+        ))
+        .replace("MODEL_LILY_PAD_FLAG", &format!("{}u", assets::MODEL_TEMPLATE_FLAG_LILY_PAD))
+        .replace("MATERIAL_DISABLE_AO_FLAG", &format!("{}u", assets::MATERIAL_FLAG_DISABLE_AO))
+        .replace("MATERIAL_DISABLE_FACE_DIMMING_FLAG", &format!("{}u", assets::MATERIAL_FLAG_DISABLE_FACE_DIMMING))
+        .replace("MATERIAL_CAULDRON_WATER_FLAG", &format!("{}u", assets::MATERIAL_FLAG_CAULDRON_WATER))
+        .replace("CAULDRON_WATER_COLOUR", &format!("vec4<f32>({}) / 255.0", assets::CAULDRON_WATER_COLOUR.map(|c| format!("{c}.0")).join(", ")))
+        .replace("// ANIMATION_GPU_LAYOUT", "struct AnimationGpu { frame_start: u32, frame_count: u32, ticks_per_frame: u32, flags: u32 }")
+        .replace("// LIQUID_GEOMETRY_CONSTANTS", &format!(
+            "const LIQUID_FACE_INSET: f32 = {:?};\nconst LIQUID_TOP_INSET_BIT: u32 = {}u;\nconst LIQUID_DEPTH_WRITE_BIT: u32 = {}u;\nconst LIQUID_TWO_SIDED_BIT: u32 = {}u;\nconst TRANSPARENT_WATER_DRAW_FLAG: u32 = {}u;\nconst TRANSPARENT_WATER_RECORD_FLAG: u32 = {}u;",
+            meshing::liquid::LIQUID_FACE_INSET,
+            meshing::liquid::LIQUID_TOP_INSET_BIT,
+            meshing::liquid::LIQUID_DEPTH_WRITE_BIT,
+            meshing::liquid::LIQUID_TWO_SIDED_BIT,
+            meshing::liquid::TRANSPARENT_WATER_DRAW_FLAG,
+            meshing::liquid::TRANSPARENT_WATER_RECORD_FLAG,
+        ))
+        .replace(
+            "// ACTOR_SHADE_CONSTANTS",
+            &format!(
+                "const ACTOR_SHADE: array<f32, 5> = array({});",
+                render_api::ACTOR_SHADE_COEFFICIENTS
+                    .map(|coefficient| format!("{coefficient:?}"))
+                    .join(", "),
+            ),
+        )
+        .replace(
+            "MATERIAL_TWO_SIDED_FLAG",
+            &format!("{}u", assets::MATERIAL_FLAG_TWO_SIDED),
+        )
+        .replace(
+            "MATERIAL_NATIVE_LEAF_COLOUR_FLAG",
+            &format!("{}u", assets::MATERIAL_FLAG_NATIVE_LEAF_COLOUR),
+        )
+        .replace(
+            "MATERIAL_OVERLAY_MASK_FLAG",
+            &format!("{}u", assets::MATERIAL_FLAG_OVERLAY_MASK),
+        )
+        .replace(
+            "MATERIAL_ALPHA_CUTOUT_FLAG",
+            &format!("{}u", assets::MATERIAL_FLAG_ALPHA_CUTOUT),
+        )
+        .replace(
+            "MATERIAL_ISOTROPIC_FLAG",
+            &format!("{}u", assets::MATERIAL_FLAG_ISOTROPIC),
+        )
+        .replace(
+            "MATERIAL_LEAF_AO_EXPONENT_MASK",
+            &format!("{}u", assets::MATERIAL_LEAF_AO_EXPONENT_MASK),
+        )
+        .replace(
+            "MATERIAL_LEAF_AO_EXPONENT_SHIFT",
+            &format!("{}u", assets::MATERIAL_LEAF_AO_EXPONENT_SHIFT),
+        )
+        .replace(
+            "MATERIAL_LEAF_AO_EXPONENT_SCALE",
+            &format!("{}.0", assets::MATERIAL_LEAF_AO_EXPONENT_SCALE),
+        )
+        .replace(
+            "NATIVE_LEAF_TEXTURE_BINDING_0",
+            &NATIVE_LEAF_TEXTURE_BINDINGS[0].to_string(),
+        )
+        .replace(
+            "NATIVE_LEAF_TEXTURE_BINDING_1",
+            &NATIVE_LEAF_TEXTURE_BINDINGS[1].to_string(),
+        )
+        .replace(
+            "NATIVE_LEAF_TEXTURE_BINDING_2",
+            &NATIVE_LEAF_TEXTURE_BINDINGS[2].to_string(),
+        )
+        .replace(
+            "NATIVE_LEAF_TEXTURE_BINDING_3",
+            &NATIVE_LEAF_TEXTURE_BINDINGS[3].to_string(),
+        )
+        .replace(
+            "NATIVE_LEAF_TEXTURE_BINDING_4",
+            &NATIVE_LEAF_TEXTURE_BINDINGS[4].to_string(),
+        )
+        .replace(
+            "NATIVE_LEAF_SAMPLER_BINDING",
+            &NATIVE_LEAF_SAMPLER_BINDING.to_string(),
+        )
+}
+
+/// Generates the legacy shader's UV rules from the shared rendering contract.
+fn legacy_glint_constants() -> String {
+    let rules = render_api::BEDROCK_112;
+    let rotation = |angle: f32| {
+        let (sin, cos) = angle.sin_cos();
+        format!("vec2<f32>({cos:?}, {sin:?})")
+    };
+    format!(
+        "const LEGACY_GLINT_ROTATION_1: vec2<f32> = {};\nconst LEGACY_GLINT_ROTATION_2: vec2<f32> = {};",
+        rotation(rules.glint_rotation_radians[0]),
+        rotation(rules.glint_rotation_radians[1]),
+    )
+}

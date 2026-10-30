@@ -1,0 +1,832 @@
+//! Accepted item-use state and atomic same-tick transaction admission.
+//!
+//! Vanilla item use handles build actions, rearms after air use, and sends use
+//! and release transactions.
+//! Extraction retains the accepted-use timing and transport rollback rules unchanged.
+use crate::{BatchSendError, melee::SwingTracker, mining::FrozenMiningSelection};
+use protocol::{HeldItemRequest, PredictedSlotChange, VerifiedNetworkItemStack};
+use simulation_clock::identity::{PositionAuthorityGeneration, SessionGeneration};
+mod admission;
+pub mod classify;
+mod crossbow;
+mod progress;
+mod server_flag;
+pub use admission::step_and_send;
+use assets::item_use::ItemUseRequirement as Needs;
+pub use classify::{AirUse, classify};
+use client_world::ResolvedUseCooldown as Cooldown;
+use server_flag::{ReleaseState, ServerUseState};
+
+/// Vanilla re-arms the next build action this long after an air use.
+const USE_REARM_MILLIS: u64 = 200;
+/// Minimum held ticks before a Riptide release can launch the player.
+pub const RIPTIDE_CHARGE_TICKS: u64 = 10;
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveUse {
+    selection: FrozenMiningSelection,
+    started_tick: u64,
+    max_ticks: u32,
+    slowdown: f64,
+    crossbow: bool,
+    riptide: bool,
+    last_progress_tick: Option<u64>,
+    /// The use button started or has held this use, so button-up releases it.
+    /// A use a server flag started is released only after the button held it.
+    button_owned: bool,
+}
+
+/// Stack and environment facts for a selected trident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RiptideUse {
+    pub level: u8,
+    pub wet: bool,
+    pub mounted: bool,
+    pub usable: bool,
+}
+
+/// The effective release-time `[pitch, yaw]` in protocol degrees and its aim policy.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct RiptideFacing {
+    pub rotation: [f32; 2],
+    pub assisted: bool,
+}
+
+/// An admitted launch carrying the same facing as its preceding action input.
+/// Movement still validates the raw level against its collision-query budget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RiptideLaunch {
+    pub level: u8,
+    pub rotation: [f32; 2],
+}
+
+/// One observed Riptide release, retained until admission or cancellation.
+#[derive(Debug, Clone, PartialEq)]
+struct RiptideRelease {
+    selection: FrozenMiningSelection,
+    level: Option<u8>,
+    facing: RiptideFacing,
+}
+
+/// A throw's locally consumed stack, shown until the server restates the slot.
+#[derive(Debug, Clone, PartialEq)]
+struct PredictedStack {
+    slot: u8,
+    /// The server's stack when the throw was predicted.
+    server: VerifiedNetworkItemStack,
+    stack: VerifiedNetworkItemStack,
+}
+
+/// One unsent tick's view of the use input and the selected stack.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseFrame {
+    pub riptide: Option<RiptideUse>,
+    /// Effective action facing at this frame; non-Riptide item use ignores it.
+    pub riptide_facing: RiptideFacing,
+    pub tick: u64,
+    pub now_millis: u64,
+    pub position: [f32; 3],
+    pub held: bool,
+    pub selection: Option<FrozenMiningSelection>,
+    pub air_use: Option<AirUse>,
+    /// The use's `Needs` are met (always true in creative).
+    pub ready: bool,
+    pub creative: bool,
+    /// Authoritative writes, including identical rejected-charge corrections.
+    pub inventory_revision: Option<u64>,
+    pub charge_projectile: Option<assets::item_use::ItemProjectileRole>,
+    /// A block interaction or recent attack consumed this press.
+    pub press_consumed: bool,
+}
+
+/// Transactions in send order, plus what the local player did on this tick.
+#[derive(Debug, Default)]
+pub struct UseOutcome {
+    pub packets: Vec<protocol::Packet>,
+    pub started: bool,
+    /// Why an item use swung the arm; its swing packet precedes `packets`.
+    pub swung: Option<protocol::SwingSource>,
+    used: bool,
+    released: bool,
+}
+
+/// Unadmitted press state belongs to either a legacy input owner or one ordered attempt.
+#[derive(Debug, Default, Clone)]
+pub struct PendingUseInput {
+    latched_press: bool,
+    /// The latched press is a mod's use pulse rather than a physical press.
+    pulse: bool,
+    /// A rejected click retries only while its verified selection remains current.
+    deferred_selection: Option<FrozenMiningSelection>,
+    /// Only this owner's rejected batch may retry a published tick.
+    rejected_swing_tick: Option<(
+        u64,
+        Option<(SessionGeneration, PositionAuthorityGeneration)>,
+    )>,
+}
+
+impl PendingUseInput {
+    /// Starts one resolved edge without publishing its latch to held-use maintenance.
+    pub fn new(pressed: bool) -> Self {
+        Self {
+            latched_press: pressed,
+            ..Self::default()
+        }
+    }
+
+    /// Starts one mod use pulse, which skips the client's use rearm delay.
+    pub fn pulse(pressed: bool) -> Self {
+        Self {
+            latched_press: pressed,
+            pulse: pressed,
+            ..Self::default()
+        }
+    }
+}
+
+/// The press latch, the accepted use, cooldowns and the throw prediction.
+#[derive(Debug, Default, Clone)]
+pub struct ItemUseRuntime {
+    pending: PendingUseInput,
+    /// The tick and hotbar slot of the latest admitted air use.
+    last_air_use: Option<(u64, u8)>,
+    last_frame_tick: Option<u64>,
+    active: Option<ActiveUse>,
+    /// Latest accepted local or server write to the reported UsingItem flag.
+    reported_using_item: Option<bool>,
+    session: Option<u64>,
+    rearm_millis: Option<u64>,
+    /// Cooldown category and the tick it ends.
+    cooldowns: Vec<(client_world::UseCooldownCategory, u64)>,
+    predicted: Option<PredictedStack>,
+    /// The admitted throw change and its source revision, until the inventory ledger takes it.
+    inventory_change: Option<(u8, u64, PredictedSlotChange)>,
+    /// The use button has stayed down since a press no block interaction consumed.
+    repeat_armed: bool,
+    /// Real release authority, separate from speculative queued button lookahead.
+    release: ReleaseState,
+    /// The unordered snapshot whose physical button phases were already observed.
+    unordered_button_frame: Option<(
+        semantic_input::identity::InputAuthorityGeneration,
+        semantic_input::identity::InputSequence,
+    )>,
+    crossbows: crossbow::CrossbowPredictions,
+    /// Launch retained only after the release transaction was admitted.
+    riptide_launch: Option<RiptideLaunch>,
+    /// Selection, eligibility and facing captured together at the first release edge.
+    riptide_release: Option<RiptideRelease>,
+    /// Server item-use authority, including stops awaiting earlier input.
+    server_using: ServerUseState,
+    /// A queued, unresolved button sequence could release the current use.
+    deferred_button_release: bool,
+    /// Session and dimension last observed, which a pending server value
+    /// belongs to.
+    world: Option<(SessionGeneration, i32)>,
+    /// The use button was down when last observed.
+    button_held: bool,
+    /// The item-use flag a local start or end last wrote, until movement's
+    /// live flag word takes it.
+    local_using: Option<bool>,
+    /// Gameplay had input focus on the last observed frame.
+    gameplay_focused: bool,
+    /// A gliding rocket's use was admitted; its boost is predicted before the server answers.
+    rocket_boost: bool,
+}
+
+impl ItemUseRuntime {
+    /// Returns the last accepted flag write without deriving it from local-use activity.
+    pub fn reported_using_item(&self) -> Option<bool> {
+        self.reported_using_item
+    }
+
+    /// Reports a server flag accepted by physics and retains it for the next movement tick.
+    pub fn adopt_server_using_item(&mut self, value: Option<bool>) {
+        if let Some(using) = value {
+            self.reported_using_item = Some(using);
+            self.server_using = if using {
+                ServerUseState::Start
+            } else {
+                ServerUseState::Stop
+            };
+        }
+    }
+
+    /// A local use end clears its flag only when a use was active.
+    fn stop_active_use(&mut self) {
+        if self.active.take().is_some() {
+            self.reported_using_item = Some(false);
+        }
+    }
+
+    /// Takes one admitted launch for the next successful movement tick.
+    pub fn take_riptide_launch(&mut self) -> Option<RiptideLaunch> {
+        self.riptide_launch.take()
+    }
+    /// Takes one admitted gliding rocket use, whose glide boost the client predicts.
+    pub fn take_rocket_boost(&mut self) -> bool {
+        std::mem::take(&mut self.rocket_boost)
+    }
+    /// A newly admitted selection ends a charge without inventing a release transaction.
+    pub fn retire_reselected_use(&mut self, slot: u8) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.selection.slot != slot)
+        {
+            self.stop_without_release();
+        }
+    }
+
+    /// Ends the use without a release transaction. Like vanilla's stop, this
+    /// clears the item-use flag after any pending server write.
+    fn stop_without_release(&mut self) {
+        self.stop_active_use();
+        self.riptide_release = None;
+        self.release = ReleaseState::Idle;
+        self.server_using = ServerUseState::Idle;
+        self.deferred_button_release = false;
+        self.local_using = Some(false);
+    }
+
+    /// Accepted use timing shared by native presentation and movement.
+    pub fn active_timing(&self) -> Option<(u64, u32)> {
+        self.active
+            .as_ref()
+            .map(|active| (active.started_tick, active.max_ticks))
+    }
+
+    /// Remaining fraction of an admitted category cooldown at the completed player tick.
+    pub fn cooldown_progress(&self, cooldown: Cooldown, tick: u64) -> f32 {
+        if cooldown.ticks == 0 {
+            return 0.0;
+        }
+        self.cooldowns
+            .iter()
+            .find(|(category, _)| *category == cooldown.category)
+            .map_or(0.0, |(_, until)| {
+                (until.saturating_sub(tick) as f32 / cooldown.ticks as f32).min(1.0)
+            })
+    }
+    /// Predicted crossbow charge for one authoritative inventory revision.
+    pub fn predicted_projectile(
+        &self,
+        slot: u8,
+        revision: u64,
+        stack: &protocol::NetworkItemStack,
+    ) -> Option<Option<assets::item_use::ItemProjectileRole>> {
+        self.crossbows.projectile_for_stack(slot, revision, stack)
+    }
+
+    /// The slot and item a running use started with.
+    pub fn active_selection(&self) -> Option<&FrozenMiningSelection> {
+        self.active.as_ref().map(|active| &active.selection)
+    }
+
+    /// Whether a use started locally and has not ended.
+    pub const fn is_using(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Whether an accepted use has observed button-up or still owes its deferred release.
+    pub fn is_releasing(&self, held: bool) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| (active.button_owned && !held) || self.has_pending_release())
+    }
+
+    /// Reports an observed release that still belongs to the accepted use.
+    pub const fn has_pending_release(&self) -> bool {
+        !matches!(self.release, ReleaseState::Idle)
+    }
+
+    /// Returns the first release-facing decision while its packet still awaits admission.
+    pub fn riptide_release_facing(&self) -> Option<RiptideFacing> {
+        self.riptide_release.as_ref().map(|release| release.facing)
+    }
+
+    /// Observes release facts on the local clock before any interaction or facing input can wait.
+    /// Returns true only when this call captures the first accepted release observation.
+    pub fn observe_riptide_release(
+        &mut self,
+        tick: u64,
+        held: bool,
+        riptide: Option<RiptideUse>,
+        selection: Option<&FrozenMiningSelection>,
+        facing: RiptideFacing,
+    ) -> bool {
+        let Some(active) = self.active.as_ref().filter(|active| active.riptide) else {
+            return false;
+        };
+        if !self.is_releasing(held) {
+            return false;
+        }
+        if active.release_selection_changed(selection, !self.release.is_captured()) {
+            self.stop_without_release();
+        } else if self.riptide_release.is_none() {
+            self.riptide_release = Some(RiptideRelease {
+                selection: selection.unwrap_or(&active.selection).clone(),
+                level: active.riptide_launch(tick, riptide, selection),
+                facing,
+            });
+            self.release = ReleaseState::Captured;
+            return true;
+        }
+        false
+    }
+
+    /// Movement-input factor while a use runs; `None` when idle.
+    pub fn movement_modifier(&self) -> Option<f64> {
+        self.active.as_ref().map(|active| active.slowdown)
+    }
+
+    /// A new session drops the press, the use, cooldowns and the prediction without packets.
+    pub fn synchronize(&mut self, session: u64) {
+        if self.session.is_some_and(|previous| previous != session) {
+            self.cancel();
+        }
+        self.session = Some(session);
+    }
+
+    /// Transfers the canonical pending input between an attempt and the active admission call.
+    pub fn swap_pending_input(&mut self, pending: &mut PendingUseInput) {
+        std::mem::swap(&mut self.pending, pending);
+    }
+
+    pub fn observe_press(&mut self, pressed: bool) {
+        if pressed {
+            self.pending.deferred_selection = None;
+            self.pending.rejected_swing_tick = None;
+            self.pending.latched_press = true;
+            self.pending.pulse = false;
+        }
+    }
+
+    /// Latches a mod's use pulse: a press that skips the client's use rearm delay. Item
+    /// cooldowns still apply, and a slot admits at most one air use per tick.
+    pub fn observe_pulse(&mut self, pressed: bool) {
+        self.observe_press(pressed);
+        self.pending.pulse |= pressed;
+    }
+
+    /// Marks the press already latched from this frame's use input as a mod's use pulse, as
+    /// `observe_pulse` would have latched it; without a latched press nothing changes.
+    pub fn mark_pulse(&mut self) {
+        self.pending.pulse = self.pending.latched_press;
+    }
+
+    /// Whether the latched press is a mod's use pulse.
+    pub const fn pulse_pending(&self) -> bool {
+        self.pending.latched_press && self.pending.pulse
+    }
+
+    /// Screens, focus loss and spectator mode cancel queued clicks, but accepted uses release.
+    pub fn cancel_pending_input(&mut self) {
+        self.pending.latched_press = false;
+        self.pending.pulse = false;
+        self.repeat_armed = false;
+        self.pending.deferred_selection = None;
+        self.pending.rejected_swing_tick = None;
+    }
+
+    /// Drops old-life charges and unsent use actions, preserving inventory and cooldown policy.
+    pub fn cancel_for_respawn(&mut self) {
+        self.cancel_pending_input();
+        self.stop_active_use();
+        self.last_frame_tick = None;
+        self.release = ReleaseState::Idle;
+        self.riptide_launch = None;
+        self.riptide_release = None;
+        self.server_using = ServerUseState::Idle;
+        self.deferred_button_release = false;
+        self.local_using = None;
+        self.button_held = false;
+        self.unordered_button_frame = None;
+        self.rocket_boost = false;
+    }
+
+    /// Clears session-owned use state after disconnect or session replacement.
+    fn cancel(&mut self) {
+        self.last_air_use = None;
+        self.cancel_for_respawn();
+        self.reported_using_item = None;
+        self.rearm_millis = None;
+        self.cooldowns.clear();
+        self.predicted = None;
+        self.inventory_change = None;
+        self.crossbows.clear();
+    }
+
+    /// Takes an admitted throw's inventory change once, including nonempty remainders.
+    pub fn take_inventory_change(&mut self) -> Option<(u8, u64, PredictedSlotChange)> {
+        self.inventory_change.take()
+    }
+
+    /// Whether a press or observed release still awaits packet admission.
+    pub const fn pending_edge(&self) -> bool {
+        self.pending.latched_press || self.has_pending_release()
+    }
+
+    /// Whether this frame has anything to resolve against an unsent tick.
+    pub const fn has_work(&self, held: bool) -> bool {
+        self.pending.latched_press || self.active.is_some() || held
+    }
+
+    /// Resolves after completed inputs drain, against the next tick and its preceding pose.
+    /// Presses and releases act immediately; held use advances once per completed tick.
+    pub fn frame_sample(
+        &self,
+        movement: &crate::movement::MovementTicker,
+        held: bool,
+        between_ticks: bool,
+    ) -> Option<crate::movement::InteractionSample> {
+        let edge = self.pending.latched_press || self.is_releasing(held);
+        let ticked = self
+            .last_frame_tick
+            .is_some_and(|tick| movement.completed_tick() >= tick);
+        (between_ticks && (edge || ticked))
+            .then(|| movement.between_ticks_sample())
+            .flatten()
+    }
+
+    /// Ends a use on release, depletion or reselection, then resolves a press or held repeat.
+    pub fn step(&mut self, frame: &UseFrame) -> UseOutcome {
+        self.observe_riptide_release(
+            frame.tick,
+            frame.held,
+            frame.riptide,
+            frame.selection.as_ref(),
+            frame.riptide_facing,
+        );
+        self.last_frame_tick = Some(frame.tick);
+        let was_using = self.active.is_some();
+        let mut outcome = UseOutcome::default();
+        let pressed = std::mem::take(&mut self.pending.latched_press);
+        let pulse = std::mem::take(&mut self.pending.pulse) && pressed;
+        if pressed {
+            self.repeat_armed = !frame.press_consumed
+                && (frame.air_use.is_some()
+                    || frame
+                        .selection
+                        .as_ref()
+                        .is_none_or(|selection| selection.item.block_runtime_id() == 0));
+        }
+        self.cooldowns.retain(|(_, until)| frame.tick < *until);
+        self.observe_use_button(frame.held);
+        let release = std::mem::take(&mut self.release);
+        self.end_use(frame, &mut outcome, release);
+        let ended = was_using && self.active.is_none();
+        if self.active.is_none() && (pressed || frame.held) {
+            self.try_use(frame, pressed, pulse, &mut outcome);
+        }
+        if !frame.held {
+            self.repeat_armed = false;
+        }
+        if ended || outcome.started {
+            // A local start or end writes the item-use flag after any server write.
+            self.server_using = ServerUseState::Idle;
+            self.deferred_button_release = false;
+            self.local_using = Some(self.active.is_some());
+        }
+        outcome
+    }
+
+    fn end_use(&mut self, frame: &UseFrame, outcome: &mut UseOutcome, release: ReleaseState) {
+        let release_pending = release.is_captured();
+        let release_observed = !matches!(release, ReleaseState::Idle);
+        let Some(active) = &self.active else {
+            return;
+        };
+        let mut selection = match &frame.selection {
+            Some(_)
+                if active.release_selection_changed(
+                    frame.selection.as_ref(),
+                    // Only a release by the button that owns the use checks the
+                    // count; vanilla's tick refresh ignores it.
+                    (!frame.held || release_observed) && !release_pending && active.button_owned,
+                ) =>
+            {
+                // Switching away stops the use without a release, as vanilla does.
+                self.stop_active_use();
+                self.riptide_release = None;
+                return;
+            }
+            Some(current) => current.clone(),
+            // An in-flight inventory request hides the stack; keep the one the use began with.
+            None => active.selection.clone(),
+        };
+        // Vanilla's normal tick refreshes the in-use stack, count included, so
+        // a later release compares with the current count.
+        if frame.selection.is_some()
+            && let Some(active) = self.active.as_mut()
+        {
+            active.selection = selection.clone();
+        }
+        let Some(active) = &self.active else {
+            return;
+        };
+        let depleted =
+            frame.tick.saturating_sub(active.started_tick) >= u64::from(active.max_ticks);
+        // Queue pressure must not turn an already-observed early release into a full charge.
+        if !release_pending
+            && depleted
+            && ((frame.held && !release_observed) || active.crossbow || !active.button_owned)
+        {
+            // A depleted use finishes locally, without a release transaction.
+            // A crossbow stores its loaded projectile for the next press's pose/action.
+            if active.crossbow && frame.charge_projectile.is_some() {
+                self.crossbows.predict(
+                    &selection,
+                    frame.inventory_revision,
+                    frame.charge_projectile,
+                );
+            }
+            self.stop_active_use();
+            return;
+        }
+        if (frame.held || !active.button_owned) && !release_pending && !release_observed {
+            return;
+        }
+        let launch = self.riptide_release.take().and_then(|release| {
+            selection = release.selection;
+            release.level.map(|level| RiptideLaunch {
+                level,
+                rotation: release.facing.rotation,
+            })
+        });
+        self.stop_active_use();
+        if let Ok(packet) = protocol::release_item_packet(held_request(&selection, frame)) {
+            outcome.packets.push(packet);
+            outcome.released = true;
+            self.riptide_launch = launch;
+        }
+    }
+
+    /// Why a latched press sends nothing on this frame, for the click-drop trace; `None` when it
+    /// is used or no press waits.
+    pub fn press_drop_reason(&self, frame: &UseFrame) -> Option<&'static str> {
+        if !self.pending.latched_press || self.active.is_some() {
+            return None;
+        }
+        let pulse = self.pending.pulse;
+        if frame.press_consumed {
+            Some("consumed_by_block_or_attack")
+        } else if self.use_tick_already_admitted(frame, pulse) {
+            Some("use_tick_already_admitted")
+        } else if self.rearm_pending(frame, pulse) {
+            Some("rearm_pending")
+        } else if frame.selection.is_none() {
+            Some("selection_unverified")
+        } else if frame
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.item.is_empty())
+        {
+            Some("no_air_use_for_item")
+        } else {
+            None
+        }
+    }
+
+    fn try_use(&mut self, frame: &UseFrame, pressed: bool, pulse: bool, outcome: &mut UseOutcome) {
+        let air_use = self.crossbows.air_use(frame);
+        if frame.press_consumed
+            || self.use_tick_already_admitted(frame, pulse)
+            || self.rearm_pending(frame, pulse)
+            || (!pressed
+                && (!self.repeat_armed
+                    || air_use.is_some_and(|air_use| !air_use.repeats_while_held())))
+        {
+            return;
+        }
+        let Some(selection) = self.displayed_selection(frame) else {
+            return;
+        };
+        // Vanilla opens a legacy request scope on every air use.
+        let Some(legacy_request_id) = protocol::next_legacy_request_id() else {
+            return;
+        };
+        self.last_air_use = Some((frame.tick, selection.slot));
+        self.rearm_millis = Some(frame.now_millis.saturating_add(USE_REARM_MILLIS));
+        let cooldown = air_use.and_then(AirUse::cooldown);
+        let on_cooldown = cooldown.is_some_and(|cooldown| self.on_cooldown(cooldown.category));
+        let mut change = None;
+        let mut active_use = None;
+        let mut predicted_stack = None;
+        let mut swung = None;
+        match air_use {
+            Some(AirUse::Hold {
+                max_ticks,
+                slowdown,
+                ..
+            }) if frame.ready
+                && !on_cooldown
+                && frame.riptide.is_none_or(|riptide| {
+                    riptide.usable && (riptide.level == 0 || riptide.wet)
+                }) =>
+            {
+                active_use = Some(ActiveUse {
+                    selection: selection.clone(),
+                    started_tick: frame.tick,
+                    max_ticks,
+                    slowdown,
+                    crossbow: crossbow::is_crossbow(air_use),
+                    riptide: frame.riptide.is_some_and(|riptide| riptide.level > 0),
+                    last_progress_tick: None,
+                    button_owned: true,
+                });
+            }
+            Some(AirUse::Throw { .. }) if !on_cooldown => {
+                swung = Some(protocol::SwingSource::ThrowItem);
+                if !frame.creative {
+                    let to = selection.item.less_one(legacy_request_id);
+                    predicted_stack = frame.selection.as_ref().map(|server| PredictedStack {
+                        slot: selection.slot,
+                        server: server.item.clone(),
+                        stack: to.clone(),
+                    });
+                    change = Some(PredictedSlotChange {
+                        legacy_request_id,
+                        from: selection.item.clone(),
+                        to,
+                    });
+                }
+            }
+            Some(AirUse::Swing) => {
+                swung = Some(protocol::SwingSource::UseItem);
+            }
+            Some(AirUse::GlideRocket) if frame.ready => {
+                swung = Some(protocol::SwingSource::UseItem);
+            }
+            _ => {}
+        }
+        let inventory_change = change.as_ref().and_then(|change| {
+            frame
+                .inventory_revision
+                .map(|revision| (selection.slot, revision, change.clone()))
+        });
+        if let Ok(packet) = protocol::click_air_packet(held_request(&selection, frame), change) {
+            outcome.packets.push(packet);
+            outcome.used = true;
+            outcome.started = active_use.is_some();
+            if active_use.is_some() {
+                self.reported_using_item = Some(true);
+            }
+            self.active = active_use;
+            outcome.swung = swung;
+            if (outcome.started || swung.is_some())
+                && let Some(Cooldown { category, ticks }) = cooldown
+            {
+                self.start_cooldown(Cooldown { category, ticks }, frame.tick);
+            }
+            self.rocket_boost |= swung.is_some() && matches!(air_use, Some(AirUse::GlideRocket));
+            if predicted_stack.is_some() {
+                self.predicted = predicted_stack;
+            }
+            if inventory_change.is_some() {
+                self.inventory_change = inventory_change;
+            }
+            if matches!(air_use, Some(AirUse::Instant { .. })) {
+                self.crossbows
+                    .predict(&selection, frame.inventory_revision, None);
+            }
+        }
+    }
+
+    /// A pulse cannot admit a second air use from the same slot on one tick.
+    fn use_tick_already_admitted(&self, frame: &UseFrame, pulse: bool) -> bool {
+        pulse
+            && frame
+                .selection
+                .as_ref()
+                .is_some_and(|selection| self.last_air_use == Some((frame.tick, selection.slot)))
+    }
+
+    /// The client's use rearm delay after an air use, which only a pulse skips.
+    fn rearm_pending(&self, frame: &UseFrame, pulse: bool) -> bool {
+        !pulse
+            && self
+                .rearm_millis
+                .is_some_and(|rearm| frame.now_millis <= rearm)
+    }
+
+    /// The selected stack with an unconfirmed throw applied; `None` when nothing is held.
+    fn displayed_selection(&mut self, frame: &UseFrame) -> Option<FrozenMiningSelection> {
+        let server = frame.selection.as_ref()?;
+        let predicted = self
+            .predicted
+            .as_ref()
+            .filter(|predicted| predicted.slot == server.slot && predicted.server == server.item);
+        let selection = match predicted {
+            Some(predicted) => FrozenMiningSelection {
+                slot: server.slot,
+                item: predicted.stack.clone(),
+            },
+            None => {
+                self.predicted = None;
+                server.clone()
+            }
+        };
+        (!selection.item.is_empty()).then_some(selection)
+    }
+
+    fn on_cooldown(&self, category: client_world::UseCooldownCategory) -> bool {
+        self.cooldowns.iter().any(|(active, _)| *active == category)
+    }
+}
+
+impl ActiveUse {
+    /// Unverified inventory preserves a use; a different selected slot or item cancels it.
+    fn selection_changed(&self, selection: Option<&FrozenMiningSelection>) -> bool {
+        selection.is_some_and(|selection| {
+            selection.slot != self.selection.slot
+                || selection.item.network_id() != self.selection.item.network_id()
+        })
+    }
+
+    /// Adds whole-stack admission for a fresh release while retaining held and
+    /// retry policies, as vanilla's release validation compares the stack:
+    /// count, an auxiliary value where neither side is the 0x7fff wildcard,
+    /// typed user data and restrictions (absent equals an empty compound), and
+    /// the block only when the selected stack has one. The stack network id,
+    /// which inventory updates rename, is ignored.
+    fn release_selection_changed(
+        &self,
+        selection: Option<&FrozenMiningSelection>,
+        check_count: bool,
+    ) -> bool {
+        const ANY_AUX: u32 = 0x7fff;
+        let stack_changed = |selection: &FrozenMiningSelection| {
+            let (current, saved) = (&selection.item, &self.selection.item);
+            current.count() != saved.count()
+                || (current.metadata() != saved.metadata()
+                    && current.metadata() != ANY_AUX
+                    && saved.metadata() != ANY_AUX)
+                // Data the typed comparison cannot read compares byte for byte.
+                || !protocol::item_user_data_equal(current.extra_data(), saved.extra_data())
+                    .unwrap_or_else(|| current.extra_data() == saved.extra_data())
+                || (current.block_runtime_id() != 0
+                    && current.block_runtime_id() != saved.block_runtime_id())
+        };
+        self.selection_changed(selection) || (check_count && selection.is_some_and(stack_changed))
+    }
+
+    /// Resolves launch eligibility from this charge and the facts observed at release.
+    fn riptide_launch(
+        &self,
+        tick: u64,
+        riptide: Option<RiptideUse>,
+        selection: Option<&FrozenMiningSelection>,
+    ) -> Option<u8> {
+        riptide
+            .filter(|riptide| {
+                self.riptide
+                    && riptide.level > 0
+                    && riptide.wet
+                    && !riptide.mounted
+                    && riptide.usable
+                    && selection.is_some()
+                    && !self.release_selection_changed(selection, true)
+                    && tick.saturating_sub(self.started_tick) >= RIPTIDE_CHARGE_TICKS
+            })
+            .map(|riptide| riptide.level)
+    }
+}
+
+fn held_request(selection: &FrozenMiningSelection, frame: &UseFrame) -> HeldItemRequest {
+    HeldItemRequest {
+        hand: protocol::ItemUseHand::Mainhand,
+        selected_slot: selection.slot,
+        selected_item: selection.item.clone(),
+        player_position: frame.position,
+    }
+}
+
+/// Commits accepted item use and its exact unsent movement tick in one gameplay phase.
+/// Packet admission precedes the tick flag; rejected admission preserves the existing retry rules.
+pub fn admit_on_tick(
+    runtime: &mut ItemUseRuntime,
+    swings: &mut SwingTracker,
+    movement: &mut crate::movement::MovementTicker,
+    frame: &UseFrame,
+    local_runtime_id: u64,
+    swing_duration: i32,
+    send: impl FnOnce(Vec<protocol::Packet>) -> Result<(), BatchSendError>,
+) {
+    if step_and_send(
+        runtime,
+        swings,
+        frame,
+        local_runtime_id,
+        swing_duration,
+        send,
+    ) {
+        movement.mark_started_using_item(frame.tick);
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
+#[cfg(test)]
+mod tests;
+
+mod cooldown;

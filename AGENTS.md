@@ -1,0 +1,67 @@
+# Repository agent instructions
+
+Cinnabar is a Rust Bedrock client with a Go core. Match version-matched Bedrock behavior and output with original code. Use identified behavior references rather than memory or Java Edition assumptions. Label provisional approximations as incomplete in `plan.md`; they do not close a parity gate. Preserve accurate license notices and attribution.
+
+## Maintainer setup
+
+Before starting agent-assisted work, maintainers must clone [cinnabar-internal](https://github.com/cinnabar-mc/cinnabar-internal#developer-setup) separately and follow its Developer setup for this Cinnabar clone. Read its `AGENTS.md` and `projects/cinnabar/AGENTS.md` alongside this file. The setup installs local agent instructions and publication checks; review hook trust, then restart agent sessions. Register each new clone; linked worktrees share its Git guards.
+
+Keep internal notes and agent reports in the private checkout. Public implementation, tests, and contributor documentation belong here. Contributors without private access can build, test, and contribute using the public instructions below.
+
+| Read | When |
+| --- | --- |
+| [Build workflow](docs/agents/multi-agent-workflow.md) | Worktrees, build limits, and verification |
+| [Live testing](docs/agents/live-testing.md) | Rendered frames, profiling, and acceptance gates |
+| [Client MCP](docs/agents/client-mcp.md) | Scripted client input and recordings |
+
+## Behavior and architecture
+
+- Choose algorithms, CPU/GPU work, data layout, and caching for the best measured performance. Parity constrains observable behavior, not implementation. Attribute every hitch caused by our code, including during joins and chunk loading. CI checks deterministic work; hardware captures check the frame, streaming, and join budgets in the live-testing guide.
+- Render server-restylable in-game screens with JSON-UI and client-owned out-of-game screens with OreUI. The built-in Java-look HUD pack sits below server packs. Bedrock player animations are the default, with Java Edition 1.7 animations as a Video-settings option; Java capes remain an accepted default; the open font, default Bedrock 1.12 combat visuals and Java Edition nametag rendering are also accepted deviations. Shipped art is original; game assets load at runtime from each install's fetched pack.
+- Follow `tools/architecture/policy.toml` for crate boundaries, owned types, and dependency directions. Register new crates and edges. Keep domain crates Bevy-free and put logic in the lowest crate that owns its data. Refactors preserve behavior and tests, without temporary facades or re-export shims. Split production files by cohesive owner before the 1,000-line limit.
+- Keep shared values in one constant, manifest, or generated file, including versions, hosts, carrier names, sizes, and `launcher::PRODUCT_NAME`. Consumers and tests must read that source instead of repeating literals.
+- Never keep a hand-maintained list, mapping, table or duplicated value that can go stale silently; derive it from its source, or check it with a compile-time assertion, test or architecture-gate rule so a missed update fails CI.
+- The mod API exposes generic capabilities only: raw observations such as player state and item facts, input, drawing primitives, settings storage and narrowly scoped requests, each gated by a grant in `ModGrants`. Finished features such as HUD modules, row formatting, layout editors, previews and click policies belong in first-party mods built on those primitives, never in the host, WIT or guest payload schemas. Add a capability only when a first-party feature needs it, and expose only the data that feature requires.
+- Expose input as raw physical state and the player's own bindings, never as resolved game actions. Mods read which keys and buttons are held or pressed and which ones the player bound to each action, and work out themselves whether, for example, attack or jump is held. Do not add fields such as `attack-held` or `jump-held`. The host may still enforce its own gates on mod requests, such as an attack pulse requiring the physical attack control, without reporting the resolved state to mods.
+- Do not add cheat-specific grants. Grants authorize generic capabilities such as interaction, camera control and world observation; feature policy belongs in mods. Keep unmodified client behavior vanilla-correct, and document explicit mod-requested local overrides and their bounds separately.
+- Use Rust for client behavior, updaters, packaging, and shared product policy. Go may own integrations with Go libraries such as Gophertunnel, go-raknet, go-xsapi and Dragonfly, their process-local support, and small standalone tools or test helpers where that keeps dependencies and iteration cheaper. Shared policy gets one implementation, or one schema with generated bindings and cross-language conformance tests; never add IPC only to satisfy a language choice.
+- Reject malformed framing. Skip, count, and log odd but well-formed server data without disconnecting. Match Bedrock's lenient chunk decoding, and tolerate unknown data the client does not use.
+- Never impose stricter observable limits than version-matched Bedrock. Check admission, truncation, recursion, work and timeout limits against identified native behavior. Use deferred work, streaming or recoverable caches when an implementation budget would otherwise discard valid content. Unverified limits remain incomplete parity work.
+- Everything a server can observe follows vanilla timing exactly: picks, hit and interaction positions, and every sent position use vanilla's tick order and remote-actor interpolation steps, even where rendering smooths further. Anticheats reconstruct a vanilla client's view, so earlier state reads as a hitbox or reach cheat. A regression test pins each such value.
+- Require valid, hash-checked atmosphere, entity, HUD, and JSON-UI carriers at startup. Fail from `main` with the path and `make assets` rebuild command. Missing world or font carriers may use their diagnostic textures or font; optional carriers degrade gracefully.
+
+## Tests and documentation
+
+Reproduce bugs in the smallest owning crate and include a regression test that failed before each fix. Assert behavior, not source text, schedule names, wall-clock timing, or exact layout trees. Domain code takes `now` from its caller and only edge code reads the clock; tests never sleep, but wait with `test_time::eventually` (Rust) or `testwait`/`testing/synctest` (Go), which the architecture gate enforces. Tests requiring unavailable local carriers or fixtures skip with a named missing-fixture message, never `#[ignore]`.
+
+Write short, clear documentation and comments. Give helpers documentation comments that explain their contract. Avoid comments that repeat signatures and process notes such as PR numbers or phase names. Keep `plan.md` and the architecture gate's completion ledger consistent with the implementation. Update the existing plan section when remaining work changes; distinguish implemented behavior, confirmed gaps and missing acceptance evidence. Keep detailed behavior with its code or existing reference docs, and do not append per-PR implementation diaries. Change history comes from PR titles and generated release notes linked in `CHANGELOG.md`.
+
+## Branches and verification
+
+`dev` is the default and release branch. Normally open a PR into `dev` after `cargo check --tests -p <touched-crate>`. When many agents work in parallel, they skip even that: they compile and test nothing, locally or on shared build hosts, run only formatters, and open the PR for GitHub CI to verify, leaving extra checks for when build capacity is idle. An agent that delegates work watches every delegated task with a completion notification, acts on each result as it lands (review, fix or merge), and never sits idle or waits to be asked while delegated work is pending. Every change reaches `dev` through a PR whose final head has a clean Codex review (no P0–P2 findings); only trivial changes such as docs, comments or formatting may skip the review or push directly. Merge on that review plus a gate against current `dev`: the PR merged with `origin/dev` passes workspace clippy over all targets (`-D warnings`, which also proves it compiles) and the architecture check. Tests don't gate merges: don't wait for full CI, which runs the test suites on `dev`. A red `dev` is the top priority and is fixed forward within the hour, before more work lands on it. Do not repeat full-workspace checks, clippy, nextest, or `verify-affected` locally for PR work. Before an authorized direct push to `dev` that changes executable code or build configuration, run `cargo run -p devtool --locked -- verify-affected --base origin/dev` once. Changes limited to documentation, comments or formatting use the applicable text, publication and formatting checks without Rust builds.
+
+Keep reviews and landings parallel without a shared landing lock or reservation. Verify the reviewed PR head combined with current `origin/dev`, and confirm `dev` still matches the tested base immediately before merging. If it changed, prepare and verify a new integration candidate. Reuse successful gate results only for identical integration trees, commands, toolchains and relevant inputs. Investigate failures before retrying; repeat checks only when relevant inputs change or a run was incomplete. Do not refresh an otherwise mergeable PR branch solely because it is behind `dev`; check its reviewed head combined with current `dev` in the integration candidate. A review is repeated when the PR head changes.
+
+Do not add Codex or Claude as commit co-authors, including `Co-authored-by` trailers in commits or squash-merge messages.
+
+PR titles become the changelog: use an imperative summary without a `type:` prefix or issue numbers. Apply exactly one label: `new`, `fix`, `performance`, or `internal`. Check the label assigned by `pr-label.yml`. Merge by squash with the final title and body; keep branch commits descriptive. Report pushed, committed, tested but uncommitted, and in-progress work accurately.
+
+## Worktrees, captures, and payloads
+
+Use one worktree per concurrent change; each gets its own Cargo `build-dir` outside the checkout (`.cargo/config.toml`) and its own `target` for final artifacts. Bound concurrent builds to the machine: use the build limiter your setup provides, never holding one build lock while waiting for another; without one, set per-build parallelism to fit available CPU and memory. Stop only processes you started, by PID; never use pattern-based kills. Remove a worktree's target directory after integration.
+
+Every PR that changes visible output attaches before/after screenshots with `gh pr create --attach` (or `gh pr edit --attach`) and a short "How to see it" note: where in the game and which setting or action shows it. Render isolated UI states offline with `cargo run -p ui-snapshot -- --state <name> --out <png>`, which agents may build even when they otherwise build nothing; use a headless client MCP session for in-world changes. Keep real account details and server addresses out of captures. Do not commit game assets, BDS binaries, credentials, recordings, traces, or `.local/` carriers. Delete raw captures and traces after the PR is open.
+
+Cinnabar's Gophertunnel integration uses `HashimTheArab/gophertunnel:lunar`. Pin the module to a commit there, land changes through PRs into `lunar`, and do not push to `lunar` unless explicitly asked. wgpu patches live on `cinnabar-mc/wgpu`'s `cinnabar-v<major>` branch: merge fixes there before `Cargo.toml` pins them; CI rejects a pin that isn't on it.
+
+## Cosmetic asset ownership
+
+The private `cinnabar-mc/cinnabar-cosmetics` repository owns cosmetic and emote
+authoring projects, exports, production catalog assets and export/catalog checks.
+Keep new geometry, texture, animation and embedded preview assets out of public
+repositories. The API owns delivery and database entitlements; account ownership
+belongs in its database rather than code or catalog allowlists. The client owns
+download, validation, caching, rendering and small stable regression fixtures.
+Do not copy new catalog items into the client for tests. Use the external-catalog
+compatibility check documented in `crates/render-model/src/hats/README.md` when
+validating the complete private catalog.

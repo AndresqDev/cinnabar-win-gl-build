@@ -1,0 +1,194 @@
+//! Actual camera-writer proof, invalidated before every scheduled attempt.
+use bevy::prelude::{Entity, ResMut, Resource, Transform};
+use chunk_pipeline::WorldStream;
+use protocol::identity::FifoSequence;
+use render_api::PoseGeneration;
+use semantic_input::PerspectiveMode;
+use sim::WorldCollisionIdentity;
+use simulation_clock::PhysicsTick;
+use simulation_clock::identity::SessionGeneration;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraOwner {
+    pub session: SessionGeneration,
+    pub stream: u64,
+    pub runtime: u64,
+    pub dimension: i32,
+    pub epoch: u64,
+    pub sequence: FifoSequence,
+}
+impl CameraOwner {
+    pub fn current(stream: &WorldStream, session: SessionGeneration) -> Self {
+        Self {
+            session,
+            stream: stream.authority().actor_session_id(),
+            runtime: stream.local_player_runtime_id(),
+            dimension: stream.current_dimension(),
+            epoch: stream.form_dimension_epoch(),
+            sequence: FifoSequence::new(stream.committed_sequence()),
+        }
+    }
+}
+#[derive(Debug)]
+struct Prepared {
+    owner: CameraOwner,
+    entity: Entity,
+    transform: Transform,
+    perspective: PerspectiveMode,
+    tick: PhysicsTick,
+    world: WorldCollisionIdentity,
+}
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedCamera {
+    pub owner: CameraOwner,
+    pub entity: Entity,
+    pub transform: Transform,
+    pub perspective: PerspectiveMode,
+    pub tick: PhysicsTick,
+    pub frame_generation: PoseGeneration,
+}
+#[derive(Debug, Default, Resource)]
+pub struct CameraPublicationAttempt {
+    attempt: u64,
+    exhausted: bool,
+    prepared: Option<Prepared>,
+    published: Option<(u64, PublishedCamera)>,
+}
+impl CameraPublicationAttempt {
+    fn begin(&mut self) {
+        self.prepared = None;
+        self.published = None;
+        match self.attempt.checked_add(1).filter(|_| !self.exhausted) {
+            Some(next) => self.attempt = next,
+            None => self.exhausted = true,
+        }
+    }
+    pub fn prepare(
+        &mut self,
+        owner: CameraOwner,
+        entity: Entity,
+        transform: Transform,
+        perspective: PerspectiveMode,
+        tick: PhysicsTick,
+        world: WorldCollisionIdentity,
+    ) {
+        self.prepared = None;
+        self.published = None;
+        if self.attempt == 0
+            || self.exhausted
+            || !transform.translation.is_finite()
+            || !transform.rotation.is_finite()
+            || !transform.scale.is_finite()
+        {
+            return;
+        }
+        self.prepared = Some(Prepared {
+            owner,
+            entity,
+            transform,
+            perspective,
+            tick,
+            world,
+        });
+    }
+    pub fn take_prepared(
+        &mut self,
+        owner: CameraOwner,
+        transform: Transform,
+        perspective: PerspectiveMode,
+        tick: PhysicsTick,
+        world: &WorldCollisionIdentity,
+    ) -> Option<(PublishedCamera, WorldCollisionIdentity)> {
+        let value = self.prepared.take()?;
+        if self.exhausted
+            || value.owner != owner
+            || value.transform != transform
+            || value.perspective != perspective
+            || value.tick != tick
+            || &value.world != world
+        {
+            return None;
+        }
+        Some((
+            PublishedCamera {
+                owner,
+                entity: value.entity,
+                transform,
+                perspective,
+                tick,
+                frame_generation: PoseGeneration::default(),
+            },
+            value.world,
+        ))
+    }
+    pub fn finish(&mut self, mut value: PublishedCamera, generation: PoseGeneration) {
+        if self.exhausted || self.attempt == 0 || generation.get() == 0 {
+            return;
+        }
+        value.frame_generation = generation;
+        self.published = Some((self.attempt, value));
+    }
+    pub fn published(&self) -> Option<PublishedCamera> {
+        self.published
+            .filter(|(attempt, _)| *attempt == self.attempt && !self.exhausted)
+            .map(|(_, value)| value)
+    }
+}
+pub fn begin_camera_publication_attempt(mut receipt: ResMut<CameraPublicationAttempt>) {
+    receipt.begin();
+}
+
+/// Returns the current first-person camera position only when all publication owners agree.
+#[allow(clippy::too_many_arguments)]
+pub fn published_default_camera(
+    world: crate::observations::WorldObservation<'_>,
+    session: SessionGeneration,
+    receipt: &CameraPublicationAttempt,
+    frame: &crate::local_player::LocalPlayerFrameCarrier,
+    camera_pose: &crate::local_player::CameraPose,
+    physics: &dyn crate::observations::PhysicsObservation,
+    cameras: &bevy::prelude::Query<&Transform, bevy::prelude::With<crate::camera::FlyCamera>>,
+) -> Option<[f32; 3]> {
+    world.stream.as_ref().and_then(|stream| {
+        if !stream.audio_default_camera_eligible() {
+            return None;
+        }
+        let proof = receipt.published()?;
+        let frame = frame.snapshot()?;
+        let state = physics.state()?;
+        let physics_world = physics.last_world_identity()?;
+        if proof.owner != CameraOwner::current(stream, session)
+            || proof.frame_generation != frame.pose_generation()
+            || proof.tick != frame.physics_tick()
+            || state.tick != proof.tick.get()
+            || physics_world != frame.world_collision_identity()
+            || proof.owner.session != frame.session_generation()
+            || proof.transform != *frame.pose()
+            || proof.transform != *camera_pose.transform()
+            || proof.perspective != PerspectiveMode::FirstPerson
+            || frame.perspective() != proof.perspective
+            || cameras.iter().count() != 1
+            || cameras.get(proof.entity).ok() != Some(&proof.transform)
+        {
+            return None;
+        }
+        Some(proof.transform.translation.to_array())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exhaustion_withholds_proof_without_reusing_attempt() {
+        let mut value = CameraPublicationAttempt {
+            attempt: u64::MAX,
+            ..Default::default()
+        };
+        value.begin();
+        assert!(value.exhausted);
+        assert!(value.published().is_none());
+        value.begin();
+        assert_eq!(value.attempt, u64::MAX);
+    }
+}

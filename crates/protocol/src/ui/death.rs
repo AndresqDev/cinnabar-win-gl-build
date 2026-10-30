@@ -1,0 +1,91 @@
+//! The local player's server-authored death reason, independent of chat broadcasts.
+
+use std::sync::Arc;
+
+use bedrock_protocol_1_26_60::packets::DeathInfo;
+
+use super::{MAX_CHAT_PARAMETERS, UiEvent, UiPacketError, bounded_text};
+
+/// Authoritative death-screen rule updates; absent values preserve the current rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeathRules {
+    pub show_messages: Option<bool>,
+    pub immediate_respawn: Option<bool>,
+}
+
+impl DeathRules {
+    pub const DEFAULT_SHOW_MESSAGES: bool = true;
+    pub const DEFAULT_IMMEDIATE_RESPAWN: bool = false;
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.show_messages.is_none() && self.immediate_respawn.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeathInfoEvent {
+    pub message: Arc<str>,
+    pub parameters: Arc<[Arc<str>]>,
+}
+
+/// Bounds the translation key and ordered parameters before retaining them.
+pub(crate) fn normalize_death_info(packet: DeathInfo) -> Result<UiEvent, UiPacketError> {
+    if packet.death_cause_message_list.len() > MAX_CHAT_PARAMETERS {
+        return Err(UiPacketError::TooManyChatParameters {
+            count: packet.death_cause_message_list.len(),
+            max: MAX_CHAT_PARAMETERS,
+        });
+    }
+    Ok(UiEvent::DeathInfo(DeathInfoEvent {
+        message: bounded_text(packet.death_cause_attack_name)?,
+        parameters: packet
+            .death_cause_message_list
+            .into_iter()
+            .map(bounded_text)
+            .collect::<Result<Vec<_>, _>>()?
+            .into(),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ProtocolError, decode_batch, encode};
+
+    #[test]
+    fn death_information_rejects_parameter_overflow_while_decoding() {
+        let packet = crate::Packet::new(DeathInfo {
+            death_cause_attack_name: Default::default(),
+            death_cause_message_list: vec![Default::default(); MAX_CHAT_PARAMETERS + 1],
+        });
+        let wire = encode(&packet).unwrap();
+        assert!(matches!(
+            decode_batch(wire),
+            Err(ProtocolError::Ui(
+                UiPacketError::TooManyChatParameters { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn death_information_rejects_invalid_utf8_in_reason_and_parameter() {
+        let packet = crate::Packet::new(DeathInfo {
+            death_cause_attack_name: "reason".into(),
+            death_cause_message_list: vec!["argument".into()],
+        });
+        let wire = encode(&packet).unwrap();
+        for field in [b"reason".as_slice(), b"argument".as_slice()] {
+            let mut invalid = wire.to_vec();
+            let start = invalid
+                .windows(field.len())
+                .position(|value| value == field)
+                .unwrap();
+            invalid[start] = 0xff;
+            assert!(matches!(
+                decode_batch(invalid.into()),
+                Err(ProtocolError::Ui(UiPacketError::InvalidUtf8 { .. }))
+            ));
+        }
+    }
+}

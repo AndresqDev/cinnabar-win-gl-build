@@ -1,0 +1,282 @@
+[workspace]
+members = [
+    "app",
+    "packaging/android/client",
+    "packaging/ios/client",
+    "crates/acceptance",
+    "crates/actor-animation",
+    "crates/crash-monitor",
+    "crates/crash-report",
+    "crates/diagnostics",
+    "crates/far-terrain",
+    "crates/asset-compiler",
+    "crates/assets",
+    "crates/bridge",
+    "web/transport",
+    "web/client",
+    "crates/block-transform",
+    "crates/bootstrap-ui",
+    "crates/client-world",
+    "crates/client-state",
+    "crates/client-shell",
+    "crates/client-interaction",
+    "crates/client-runtime",
+    "crates/client-extensions",
+    "crates/gameplay",
+    "crates/client-session",
+    "crates/chunk-pipeline",
+    "crates/pack-json",
+    "crates/pack-compiler",
+    "crates/pack-compiler/input",
+    "crates/pack-compiler/entity",
+    "crates/pack-compiler/font",
+    "crates/pack-runtime",
+    "crates/experience-sdk",
+    "crates/experience-macros",
+    "crates/experience-runtime",
+    "examples/experiences/probe",
+    "examples/experiences/terminal-client",
+    "examples/experiences/space-client",
+    "examples/dragonfly-extension/client",
+    "crates/input",
+    "crates/developer-control",
+    "crates/json-ui",
+    "crates/oreui",
+    "crates/meshing",
+    "crates/mod-api",
+    "crates/mod-host",
+    "crates/mod-render",
+    "crates/mod-ui",
+    "crates/particles",
+    "examples/mods/cosmic",
+    "examples/mods/hello",
+    "examples/mods/time-changer",
+    "examples/mods/render-sample",
+    "examples/mods/portal-view",
+    "examples/mods/screen-probe",
+    "crates/protocol",
+    "crates/protocol-ids",
+    "crates/resource-pack",
+    "crates/server-experience",
+    "crates/shaderpack",
+    "crates/zip-footer",
+    "crates/render",
+    "crates/render-api",
+    "crates/cosmetics",
+    "crates/test-alloc",
+    "crates/test-time",
+    "crates/render-model",
+    "crates/render-scene",
+    "crates/inventory",
+    "crates/launcher",
+    "crates/launcher-host",
+    "crates/first-run",
+    "crates/rich-presence",
+    "crates/client-ui",
+    "crates/client-presentation",
+    "crates/client-audio",
+    "crates/player-state",
+    "crates/sim",
+    "crates/ui",
+    "crates/ui-engine",
+    "crates/ui-screens",
+    "crates/world",
+    "crates/simulation-clock",
+    "crates/env-compat",
+    "crates/update-manifest",
+    "crates/update-installer",
+    "tools/architecture",
+    "tools/bedrock-replay",
+    "tools/devtool",
+    "tools/mod-docs",
+    "tools/workspace-declarations",
+    "tools/dist",
+    "tools/jsonui-editor",
+    "tools/jsonui-mcp",
+    "tools/ui-snapshot",
+    "tools/mcp-stdio",
+    "tools/cinnabar-mcp",
+    "tools/cxb",
+    "tools/release-manifest",
+]
+# The vendored codec is generated and linted upstream; only `protocol` builds it.
+exclude = ["crates/protocol/vendor/bedrock-protocol-1-26-60"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.31"
+edition = "2024"
+rust-version = "1.99.0"
+
+[workspace.dependencies]
+glam = { version = "0.33.2", default-features = false, features = ["std", "f64"] }
+# One feature set per heavy dependency: any per-crate difference rebuilds it and every dependent.
+# wayland/x11 only select winit backends on Linux; winit ignores them on other targets.
+bevy = { version = "=0.20.0", default-features = false, features = [
+    "bevy_anti_alias",
+    "smaa_luts",
+    "ktx2",
+    "zstd_rust",
+    "bevy_asset",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_image",
+    "bevy_log",
+    "bevy_mesh",
+    "bevy_post_process",
+    "bevy_render",
+    "bevy_shader",
+    "bevy_window",
+    "bevy_winit",
+    "gamepad",
+    "bevy_gilrs",
+    "keyboard",
+    "mouse",
+    "multi_threaded",
+    "std",
+    "wayland",
+    "x11",
+] }
+# The noop backend only runs when an instance explicitly enables it (render tests).
+# `std` keeps error scopes per thread; without it, concurrent pipeline compiles share one stack.
+wgpu = { version = "30.0.1", default-features = false, features = ["noop", "std", "wgsl"] }
+# Every crate that names naga uses this one feature set, so `-p cinnabar` and `--workspace`
+# builds agree on naga and nothing above it (wgpu, bevy_render) builds twice. `glsl-in` is the
+# Java shader-pack frontend; it adds only naga's GLSL parser and pp-rs.
+naga = { version = "30.0.1", features = ["glsl-in", "wgsl-in"] }
+# The pack loader uses preserved text and Iris recovery. Naga keeps its released token API.
+pp-rs = { git = "https://github.com/cinnabar-mc/glslpp-rs", rev = "949f1178cd660d3bcd1ec70181a10cf70e4b95b6" }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga"] }
+# Native bridge and session composition add OS I/O and the multithreaded runtime.
+tokio = { version = "1.52", features = ["io-util", "macros", "rt", "sync", "time"] }
+tokio-util = "0.7"
+web-time = "1.1"
+bytes = "1"
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-error = "0.2"
+tracing-log = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon = "1.11"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+mimalloc = { version = "=0.1.52", default-features = false }
+sha2 = "=0.10.9"
+# Crates that generate random UUIDs add `v4`; wasm32-unknown-unknown has no source for it.
+uuid = "1"
+wasmtime = { version = "=36.0.16", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
+wit-bindgen = "=0.57.1"
+# WASI for trusted packet mods only, pinned with wasmtime.
+wasmtime-wasi = { version = "=36.0.16", default-features = false, features = ["preview1"] }
+wasi-preview1-component-adapter-provider = "=36.0.16"
+wit-component = "=0.247.0"
+wit-parser = "=0.247.0"
+
+
+# Keep Metal display-link delivery, bounded submissions and indirect validation on wgpu 30.0.1,
+# plus naga GLSL frontend fixes for Java shader packs: constant `?:` and indexing,
+# missing returns, scalar swizzles, atomics and barriers, SPIR-V `fma` NoContraction.
+# A lost device is a `PollError` instead of a poll panic, and queue-write staging OOM is recoverable.
+# FXC (DX12) gets `[loop]` on loops with implicit-derivative operations instead of failing to unroll them.
+# Vulkan keeps logical allocation layouts separate and accepts either native image-robustness feature.
+# Every wgpu crate comes from the same rev so wgpu and the shaderpack crate share one naga.
+[patch.crates-io]
+# Keep Linux crash dumps when a thread's stack cannot be read.
+minidump-writer = { git = "https://github.com/cinnabar-mc/minidump-writer", rev = "389d34092fb3323f2253010615eda402212e534f" }
+naga = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+wgpu = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+wgpu-core = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+wgpu-hal = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+wgpu-types = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+
+wgpu-naga-bridge = { git = "https://github.com/cinnabar-mc/wgpu", rev = "060bd0bdbc5975dc9e48840b391e276d5ccb4355" }
+
+# Keep every Bevy crate on the same renderer fork revision. CI checks the locked graph.
+bevy = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_a11y = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_android = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_anti_alias = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_app = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_asset = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_asset_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_camera = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_clipboard = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_color = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_core_pipeline = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_curve = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_derive = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_diagnostic = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_ecs = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_ecs_macro_logic = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_ecs_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_encase_derive = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_extract = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_extract_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_gilrs = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_gizmos = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_gizmos_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_image = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_input = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_input_focus = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_internal = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_light = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_log = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_macro_utils = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_material = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_material_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_math = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_mesh = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_pbr = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_platform = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_post_process = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_ptr = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_reflect = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_reflect_derive = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_render = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_render_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_shader = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_shape = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_state = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_state_macros = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_tasks = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_time = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_transform = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_utils = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_window = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+bevy_winit = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
+
+[profile.dev]
+opt-level = 1
+# Line tables keep backtraces and panics readable; full debuginfo made local builds 20-45% slower.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Shipped binaries carry no debug info; line tables go to a split file per binary (a PDB on
+# Windows, a `.dSYM` on macOS) that package.yml publishes as a release symbol archive. MSVC writes
+# the PDB whatever `strip` says; macOS runs dsymutil before stripping. Linux packaging overrides
+# split-debuginfo and strip and splits after linking (packaging/release-symbols.py), because the
+# linker's `--strip-debug` would also drop the line tables a packed `.dwp` depends on.
+[profile.release]
+codegen-units = 1
+lto = "thin"
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "debuginfo"
+
+# `make play`: release speed with parallel codegen and incremental rebuilds; shipped builds use release.
+# It skips release debug info, so local and Android CI builds pay no dsymutil, PDB or link cost.
+[profile.play]
+inherits = "release"
+codegen-units = 16
+lto = false
+incremental = true
+debug = false
+
+[workspace.lints.clippy]
+# Diagnostics go through `tracing`; stdout/stderr contracts carry a reasoned `#[expect]`.
+print_stderr = "warn"
+print_stdout = "warn"

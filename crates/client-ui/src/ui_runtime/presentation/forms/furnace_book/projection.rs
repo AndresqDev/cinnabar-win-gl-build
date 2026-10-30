@@ -1,0 +1,135 @@
+use std::sync::Arc;
+
+use super::{UiRuntime, category};
+use ui::IconRef;
+use ui_screens::furnace_book::{Entries, output_stack};
+
+#[derive(Debug, Default)]
+pub(crate) struct ProjectionCache {
+    inputs: Option<Inputs>,
+    positions: Arc<[usize]>,
+    icons: Option<Icons>,
+}
+
+#[derive(Debug)]
+struct Icons {
+    positions: Arc<[usize]>,
+    generation: u64,
+    values: Arc<[Option<IconRef>]>,
+}
+
+#[derive(Debug)]
+struct Inputs {
+    supplied: Arc<[usize]>,
+    tab: i32,
+    query: String,
+    components: Option<Arc<crate::ui_runtime::item_facts::SessionItemComponents>>,
+    base: Option<Arc<assets::RuntimeLangCatalog>>,
+    active: Option<Arc<assets::RuntimeLangCatalog>>,
+    server: Option<Arc<assets::ServerLangOverlay>>,
+}
+
+fn same<T>(left: &Option<Arc<T>>, right: &Option<Arc<T>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Tab and search results share storage until their semantic inputs change.
+pub fn projection(player: &player_state::PlayerState, runtime: &UiRuntime) -> Arc<[usize]> {
+    let supplied = player
+        .inventory
+        .furnace_recipes(runtime.recipe_filtering(player));
+    let state = runtime.screen_state();
+    let tab = runtime
+        .furnace_options(player)
+        .map_or(protocol::FurnaceTab::Search.index(), |options| {
+            options.left_tab.index()
+        });
+    let mut cache = runtime.furnace_projection.lock().unwrap();
+    let reusable = cache.inputs.as_ref().is_some_and(|previous| {
+        Arc::ptr_eq(&previous.supplied, supplied.shared_indices())
+            && previous.tab == tab
+            && previous.query == state.search
+            && same(&previous.components, &runtime.session.session_items)
+            && same(&previous.base, &runtime.lang_catalog)
+            && same(&previous.active, &runtime.active_lang)
+            && same(&previous.server, &runtime.session.server_lang)
+    });
+    if !reusable {
+        let query = state.search.to_lowercase();
+        let catalog = player.inventory.screen_catalog();
+        cache.positions = supplied
+            .shared_indices()
+            .iter()
+            .copied()
+            .filter(|index| {
+                let Some(recipe) =
+                    catalog.and_then(|catalog| catalog.screen_recipe_entries().get(*index))
+                else {
+                    return false;
+                };
+                if tab != protocol::FurnaceTab::Search.index() {
+                    return i32::from(category(player, runtime, recipe)) == tab;
+                }
+                query.is_empty()
+                    || player
+                        .inventory
+                        .ledger()
+                        .negotiated_item_entry(recipe.output.unwrap().network_id)
+                        .is_some_and(|entry| {
+                            runtime
+                                .localized_item_name(&entry.identifier)
+                                .to_lowercase()
+                                .contains(&query)
+                        })
+            })
+            .collect();
+        cache.inputs = Some(Inputs {
+            supplied: Arc::clone(supplied.shared_indices()),
+            tab,
+            query: state.search.clone(),
+            components: runtime.session.session_items.clone(),
+            base: runtime.lang_catalog.clone(),
+            active: runtime.active_lang.clone(),
+            server: runtime.session.server_lang.clone(),
+        });
+    }
+    Arc::clone(&cache.positions)
+}
+
+pub fn icons(
+    player: &player_state::PlayerState,
+    runtime: &UiRuntime,
+    installed_generation: u64,
+    icon: impl Fn(&protocol::NetworkItemStack) -> Option<IconRef>,
+) -> Arc<[Option<IconRef>]> {
+    let entries = entries(player, runtime);
+    let mut cache = runtime.furnace_projection.lock().unwrap();
+    if !cache.icons.as_ref().is_some_and(|cached| {
+        Arc::ptr_eq(&cached.positions, entries.positions())
+            && cached.generation == installed_generation
+    }) {
+        cache.icons = Some(Icons {
+            positions: Arc::clone(entries.positions()),
+            generation: installed_generation,
+            values: entries
+                .iter()
+                .map(|recipe| icon(&output_stack(recipe)))
+                .collect(),
+        });
+    }
+    Arc::clone(&cache.icons.as_ref().unwrap().values)
+}
+
+pub fn entries<'a>(player: &'a player_state::PlayerState, runtime: &UiRuntime) -> Entries<'a> {
+    Entries::new(
+        player
+            .inventory
+            .screen_catalog()
+            .map_or(&[], |catalog| catalog.screen_recipe_entries()),
+        projection(player, runtime),
+    )
+}

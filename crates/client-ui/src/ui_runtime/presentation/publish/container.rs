@@ -1,0 +1,257 @@
+//! Text and artwork projected for the active container screen.
+
+use super::item_icons::ItemResolver;
+use crate::ui_runtime::{
+    UiRuntime,
+    presentation::{self, UiPresentationRuntime},
+};
+use presentation::{
+    hud_layout::{WindowIcons, WindowText},
+    inventory_pointer::InventoryScreen,
+};
+
+/// Resolves the active screen after any lectern observation, then captures its text and artwork.
+pub(super) fn capture(
+    player_runtime: &player_state::PlayerState,
+    items: &ItemResolver<'_>,
+    world: Option<client_world::ui_read::InventoryUi<'_>>,
+    window_icons: &mut WindowIcons,
+) -> WindowText {
+    let runtime = items.runtime;
+    let inventory_screen = InventoryScreen::of_runtime(player_runtime, runtime);
+    let mut window_text = WindowText::default();
+    if items
+        .presentation
+        .inventory_preparation_needed(player_runtime, runtime)
+    {
+        super::recipes::recipe_entries(player_runtime, items, inventory_screen, window_icons);
+    }
+    if runtime.inventory_open() {
+        capture_titles(
+            player_runtime,
+            runtime,
+            world,
+            inventory_screen,
+            &mut window_text,
+        );
+        super::recipes::recipe_entries(player_runtime, items, inventory_screen, window_icons);
+        super::recipes::creative_page(player_runtime, items, inventory_screen, window_icons);
+        super::recipes::screen_outputs(player_runtime, items, window_icons);
+        super::recipes::book_page(
+            player_runtime,
+            items,
+            inventory_screen,
+            &mut window_text,
+            window_icons,
+        );
+        capture_tooltip(player_runtime, items, &mut window_text);
+    }
+    window_text
+}
+
+/// Captures untranslated custom titles and the screen's localized labels.
+fn capture_titles(
+    player_runtime: &player_state::PlayerState,
+    runtime: &UiRuntime,
+    world: Option<client_world::ui_read::InventoryUi<'_>>,
+    inventory_screen: InventoryScreen,
+    window_text: &mut WindowText,
+) {
+    let ledger = runtime.inventory_ledger(player_runtime);
+    // Actor-backed server menus carry their title on the owning actor, preferring its filtered name.
+    // Keep formatting markers intact: resource-pack layouts use them.
+    let stated_title = ledger
+        .trading()
+        .map(|trade| {
+            runtime
+                .translation(&trade.title)
+                .map_or_else(|| trade.title.to_string(), |title| title.to_string())
+        })
+        .or_else(|| {
+            ledger
+                .window_actor()
+                .and_then(|actor| world?.actor_container_name(actor))
+                .map(|name| name.to_string())
+                .or_else(|| {
+                    ledger
+                        .window_position()
+                        .and_then(|position| world?.block_entity_custom_name(position.into()))
+                })
+        });
+    window_text.custom_title.clone_from(&stated_title);
+    window_text.block_entity = runtime
+        .session
+        .storage_block
+        .as_ref()
+        .map(|(_, block_entity)| block_entity.to_string());
+    window_text.inventory_label = runtime
+        .translation("container.inventory")
+        .map(|text| text.to_string());
+    window_text.title = match inventory_screen {
+        InventoryScreen::Window(kind, _) => stated_title.or_else(|| {
+            runtime
+                .translation(presentation::hud_layout::title_key(kind))
+                .map(|text| text.to_string())
+        }),
+        InventoryScreen::Storage(count) => stated_title.or_else(|| {
+            runtime
+                .translation(if count == 54 {
+                    "container.chestDouble"
+                } else {
+                    "container.chest"
+                })
+                .map(|text| text.to_string())
+        }),
+        InventoryScreen::Workbench => stated_title.or_else(|| {
+            runtime
+                .translation("container.crafting")
+                .map(|text| text.to_string())
+        }),
+        InventoryScreen::Creative => {
+            let key = match runtime.creative_tab(player_runtime) {
+                0 => "itemGroup.name.construction",
+                1 => "itemGroup.name.nature",
+                2 => "itemGroup.name.equipment",
+                3 => "itemGroup.name.items",
+                _ => "itemGroup.name.search",
+            };
+            runtime.translation(key).map(|text| text.to_string())
+        }
+        InventoryScreen::Personal | InventoryScreen::Book => None,
+    };
+    if matches!(
+        inventory_screen,
+        InventoryScreen::Window(protocol::WindowKind::Beacon, _)
+    ) {
+        window_text.effect_names = [
+            (1, "effect.moveSpeed"),
+            (3, "effect.digSpeed"),
+            (11, "effect.resistance"),
+            (8, "effect.jump"),
+            (5, "effect.damageBoost"),
+            (10, "effect.regeneration"),
+        ]
+        .iter()
+        .map(|(id, key)| {
+            let name = runtime
+                .translation(key)
+                .map_or_else(|| (*key).to_owned(), |text| text.to_string());
+            (*id, name)
+        })
+        .collect();
+    }
+}
+
+/// Adds the hovered item's tooltip, mod tooltip lines, and bundle contents in display order.
+fn capture_tooltip(
+    player_runtime: &player_state::PlayerState,
+    items: &ItemResolver<'_>,
+    window_text: &mut WindowText,
+) {
+    let runtime = items.runtime;
+    let presentation = items.presentation;
+    // The tooltip follows the hovered cell's stack.
+    let hovered = super::hovered_stack(player_runtime, runtime);
+    if let Some((stack, name)) = hovered {
+        let identifier = items.identifier(&stack);
+        let group_heading = name.is_some()
+            && matches!(
+                runtime.screen_state().hover,
+                Some(ui_screens::container_actions::InventoryCellHit::RecipeBook(
+                    _
+                ))
+            );
+        window_text.tooltip = if group_heading {
+            presentation::inventory_tooltip::tooltip_lines_plain_name(
+                runtime,
+                &stack,
+                identifier.as_deref(),
+                name.as_deref(),
+            )
+        } else {
+            presentation::inventory_tooltip::tooltip_lines(
+                runtime,
+                &stack,
+                identifier.as_deref(),
+                name.as_deref(),
+            )
+        };
+        if let Some(identifier) = identifier.as_deref() {
+            window_text.tooltip.extend(
+                presentation
+                    .mod_ui()
+                    .mod_presentation()
+                    .tooltip_lines(identifier, stack.metadata)
+                    .map(|line| presentation::hud_layout::TooltipLine {
+                        text: line.text.clone(),
+                        color: line.color.map(|channel| (channel * 255.).round() as u8),
+                    }),
+            );
+        }
+        if let Some(contents) = protocol::item_bundle_id(&stack.extra_data)
+            .and_then(|id| runtime.inventory_ledger(player_runtime).bundle_contents(id))
+        {
+            for held in contents.iter().filter(|held| !held.is_empty()).take(8) {
+                let item_name = items
+                    .identifier(held)
+                    .map_or_else(|| "?".to_owned(), |id| runtime.localized_item_name(&id));
+                window_text
+                    .tooltip
+                    .push(presentation::hud_layout::TooltipLine {
+                        text: format!("{}x {item_name}", held.count),
+                        color: [200, 200, 200, 255],
+                    });
+            }
+        }
+    }
+}
+
+/// Resolves empty-slot artwork only while an inventory screen is open.
+pub(super) fn ghost_icons(
+    presentation: &mut UiPresentationRuntime,
+    inventory_open: bool,
+) -> WindowIcons {
+    let mut window_icons = WindowIcons {
+        book_entries: std::mem::take(&mut presentation.hud_frame.window_icons.book_entries),
+        ..WindowIcons::default()
+    };
+    if inventory_open {
+        for (row, name) in ["helmet", "chestplate", "leggings", "boots"]
+            .iter()
+            .enumerate()
+        {
+            window_icons.ghost_armor[row] =
+                presentation.item_icon(&format!("minecraft:empty_armor_slot_{name}"), 0);
+        }
+        window_icons.ghost_shield = presentation.item_icon("minecraft:empty_armor_slot_shield", 0);
+        window_icons.ghost_template =
+            presentation.item_icon("minecraft:empty_slot_smithing_template", 0);
+    }
+    window_icons
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_inventory_capture_retains_prepared_book_artwork() {
+        let mut presentation = crate::test_support::mini_engine_presentation();
+        let icon = ui::IconRef {
+            page: 0,
+            uv: [1; 4],
+            color_mask: None,
+            glint: false,
+        };
+        let expected = vec![Some(icon); 2048];
+        let _ = ghost_icons(&mut presentation, false);
+        presentation.hud_frame_mut().window_icons.book_entries = expected.clone();
+        let (captured, allocations) = test_alloc::count(|| ghost_icons(&mut presentation, false));
+        assert_eq!(captured.book_entries.len(), expected.len());
+        assert_eq!(captured.book_entries, expected);
+        assert!(
+            allocations < 2,
+            "closed capture copied prepared artwork {allocations} times"
+        );
+    }
+}

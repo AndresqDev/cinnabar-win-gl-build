@@ -1,0 +1,280 @@
+use bevy::prelude::DetectChanges;
+use bevy::prelude::IntoScheduleConfigs;
+use render_scene::{
+    UiGlintSettings, UiItemGlintTexture, UiRenderSceneResource, UiRenderStatsResource,
+};
+use std::{
+    mem::size_of,
+    sync::{Arc, Weak},
+};
+
+#[cfg(test)]
+use bevy::prelude::{GlobalTransform, Mat4};
+use bevy::{
+    asset::{load_internal_asset, uuid_handle},
+    core_pipeline::core_3d::CORE_3D_DEPTH_FORMAT,
+    ecs::system::SystemChangeTick,
+    mesh::VertexBufferLayout,
+    prelude::{
+        App, BevyError, Commands, Component, Entity, FromWorld, Handle, Has, Msaa, Plugin, Query,
+        Res, ResMut, Resource, Result, Shader, World, default,
+    },
+    render::{
+        Render, RenderApp, RenderStartup, RenderSystems,
+        extract_resource::ExtractResourcePlugin,
+        render_resource::{
+            AddressMode, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+            BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, BufferBindingType,
+            BufferDescriptor, BufferInitDescriptor, BufferSize, BufferUsages,
+            CachedRenderPipelineId, Canonical, ColorTargetState, ColorWrites, CompareFunction,
+            DepthStencilState, FilterMode, FragmentState, PipelineCache, RenderPipeline,
+            RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+            Specializer, SpecializerKey, TextureFormat, TextureSampleType, TextureViewDimension,
+            Variants, VertexAttribute, VertexFormat, VertexState, VertexStepMode,
+        },
+        renderer::{RenderDevice, RenderQueue},
+        sync_world::MainEntity,
+        view::{ExtractedView, ViewTarget},
+    },
+};
+#[path = "ui_render/filter.rs"]
+pub(crate) mod filter;
+#[path = "ui_render/font_atlas.rs"]
+mod font_atlas;
+#[cfg(test)]
+#[path = "ui_render/font_atlas_tests.rs"]
+mod font_atlas_tests;
+#[path = "ui_render/item_glint.rs"]
+mod item_glint;
+#[cfg(test)]
+#[path = "ui_render/page_uniform_tests.rs"]
+mod page_uniform_tests;
+#[path = "ui_render/target.rs"]
+mod target;
+#[path = "ui_render/textures.rs"]
+mod textures;
+#[path = "ui_render/upscale.rs"]
+mod upscale;
+pub(crate) use textures::DeviceObservation;
+use textures::{UiGpuTextures, prepare_ui_bind_group};
+#[path = "ui_render/backdrop.rs"]
+pub(crate) mod backdrop;
+#[path = "ui_render/backdrop_levels.rs"]
+mod backdrop_levels;
+#[path = "ui_render/batches.rs"]
+mod batches;
+#[path = "ui_render/composite.rs"]
+pub(crate) mod composite;
+#[path = "ui_render/damage.rs"]
+mod damage;
+#[cfg(test)]
+#[path = "ui_render/harness.rs"]
+pub(crate) mod harness;
+#[path = "ui_render/layer.rs"]
+mod layer;
+#[path = "ui_render/model_depth.rs"]
+mod model_depth;
+#[path = "ui_render/models.rs"]
+mod models;
+#[path = "ui_render/overlay.rs"]
+pub(crate) mod overlay;
+#[path = "ui_render/pipeline.rs"]
+pub(crate) mod pipeline;
+#[path = "ui_render/presentation.rs"]
+pub(crate) mod presentation;
+#[path = "ui_render/profile.rs"]
+pub(crate) mod profile;
+#[path = "ui_render/resources.rs"]
+pub(crate) mod resources;
+#[path = "ui_render/segments.rs"]
+mod segments;
+#[path = "ui_render/shader.rs"]
+pub(crate) mod shader;
+#[path = "ui_render/uploads.rs"]
+mod uploads;
+#[path = "ui_render/viewport.rs"]
+mod viewport;
+use batches::resolved_batches;
+
+use overlay::queue_ui_overlay;
+pub(crate) use overlay::{UiHandCoverage, UiOverlayLabel, UiWorldLabel, install_overlay_graph};
+use shader::UiViewportUniform;
+
+use render_model::{
+    FontAtlasVertex, MAX_UI_INDICES, MAX_UI_VERTICES, UI_BLEND_INVERT, UiRenderBatch,
+    UiRenderInput, UiRenderRejectReason, UiRenderStats, UiRenderVertex,
+};
+
+#[cfg(test)]
+use render_model::UiRenderScene;
+
+const UI_SHADER_HANDLE: Handle<Shader> = uuid_handle!("7cfb904c-c8cf-4dd2-9214-7d208ce454e7");
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UiRenderPlugin;
+
+impl Plugin for UiRenderPlugin {
+    fn build(&self, app: &mut App) {
+        install_ui_render(app);
+    }
+
+    fn finish(&self, app: &mut App) {
+        install_ui_render(app);
+    }
+}
+
+#[derive(Resource)]
+struct UiRenderInstalled;
+
+fn install_ui_render(app: &mut App) {
+    crate::upload_staging::install(app);
+    app.init_resource::<UiRenderSceneResource>()
+        .init_resource::<UiGlintSettings>()
+        .init_resource::<UiItemGlintTexture>()
+        .init_resource::<UiRenderStatsResource>();
+    let Some(render_app) = app.get_sub_app(RenderApp) else {
+        return;
+    };
+    if render_app.world().contains_resource::<UiRenderInstalled>() {
+        install_overlay_graph(app.sub_app_mut(RenderApp).world_mut());
+        return;
+    }
+    crate::pipeline_warmup::register::<pipeline::UiPipeline>(app);
+    crate::pipeline_warmup::register::<composite::UiCompositePipeline>(app);
+    crate::pipeline_warmup::register::<backdrop::UiBackdropPipeline>(app);
+    let stats = app.world().resource::<UiRenderStatsResource>().clone();
+    app.add_plugins((
+        ExtractResourcePlugin::<UiRenderSceneResource>::default(),
+        ExtractResourcePlugin::<UiGlintSettings>::default(),
+        ExtractResourcePlugin::<UiItemGlintTexture>::default(),
+    ));
+    upscale::install(app);
+    load_internal_asset!(app, UI_SHADER_HANDLE, "ui.wgsl", shader::from_wgsl);
+    load_internal_asset!(
+        app,
+        composite::UI_COMPOSITE_SHADER_HANDLE,
+        "ui_composite.wgsl",
+        crate::shader_safety::from_wgsl
+    );
+    load_internal_asset!(
+        app,
+        backdrop::UI_BACKDROP_SHADER_HANDLE,
+        "ui_backdrop.wgsl",
+        crate::shader_safety::from_wgsl
+    );
+    load_internal_asset!(
+        app,
+        backdrop::UI_BACKDROP_FILTER_SHADER_HANDLE,
+        "ui_backdrop_filter.wgsl",
+        crate::shader_safety::from_wgsl
+    );
+    app.sub_app_mut(RenderApp)
+        .insert_resource(UiRenderInstalled)
+        .init_resource::<presentation::UiFrameContent>()
+        .add_systems(
+            Render,
+            presentation::observe_ui_frame
+                .after(bevy::render::renderer::render_system)
+                .before(crate::device_poll::FrameSubmissions),
+        )
+        .init_resource::<pipeline::UiPipeline>()
+        .init_resource::<composite::UiCompositePipeline>()
+        .init_resource::<backdrop::UiBackdropPipeline>()
+        .init_resource::<backdrop::UiBackdropStore>()
+        .insert_resource(stats)
+        .init_resource::<UiHandCoverage>()
+        .init_resource::<composite::UiLayerStore>()
+        .init_resource::<model_depth::UiModelDepths>()
+        .add_systems(RenderStartup, resources::init_ui_gpu)
+        .add_systems(Render, ui_systems());
+    profile::install(app.sub_app_mut(RenderApp));
+    install_overlay_graph(app.sub_app_mut(RenderApp).world_mut());
+}
+
+/// Prepares accepted UI resources, attachments, bindings and view pipelines each frame.
+fn ui_systems() -> bevy::ecs::schedule::ScheduleConfigs<bevy::ecs::system::ScheduleSystem> {
+    (
+        resources::prepare_ui_resources.in_set(RenderSystems::PrepareResources),
+        target::prepare_native_ui_targets
+            .in_set(RenderSystems::PrepareResources)
+            .after(bevy::render::view::prepare_view_targets),
+        composite::prepare_ui_layers
+            .in_set(RenderSystems::PrepareResources)
+            .after(bevy::render::view::prepare_view_targets)
+            .after(resources::prepare_ui_resources)
+            .after(target::prepare_native_ui_targets),
+        backdrop::prepare_ui_backdrops
+            .in_set(RenderSystems::PrepareResources)
+            .after(bevy::render::view::prepare_view_targets)
+            .after(resources::prepare_ui_resources)
+            .after(target::prepare_native_ui_targets),
+        prepare_ui_bind_group.in_set(RenderSystems::PrepareBindGroups),
+        queue_ui_overlay
+            .in_set(RenderSystems::PrepareBindGroups)
+            .after(prepare_ui_bind_group),
+    )
+        .into_configs()
+}
+
+#[derive(Resource)]
+pub(crate) struct UiGpu {
+    device: wgpu::Device,
+    device_observation: DeviceObservation,
+    vertex_buffer: Option<Buffer>,
+    index_buffer: Option<Buffer>,
+    vertex_capacity: usize,
+    index_capacity: usize,
+    vertex_arena_id: u64,
+    index_arena_id: u64,
+    viewport_buffer: Buffer,
+    models: models::UiModels,
+    viewport_uploads: viewport::ViewportUploads,
+    #[cfg(test)]
+    geometry_writes: [usize; 2],
+    #[cfg(test)]
+    pub(crate) world_passes: std::sync::atomic::AtomicUsize,
+    viewport_size: [u32; 2],
+    started: web_time::Instant,
+    textures: UiGpuTextures,
+    sampler: Sampler,
+    /// `bilinear` sprites sample through this instead.
+    linear_sampler: Sampler,
+    item_glint: item_glint::GpuItemGlint,
+    pub(crate) batches: Arc<[UiRenderBatch]>,
+    accepted_revision: Option<u64>,
+    /// The accepted revision draws glint, which animates without a new revision.
+    animated: bool,
+    /// Maximum physical-pixel blur in the accepted backdrop geometry.
+    backdrop_blur: f32,
+    /// Conservative glint coverage prepared once per accepted publication batch.
+    animation_damage: Arc<[damage::UiDamage]>,
+    // Admission watermark survives every draw rejection, even after payload drop.
+    last_admitted_revision: Option<u64>,
+    last_admitted_publication: Weak<UiRenderInput>,
+    index_count: usize,
+    uploads: uploads::BufferUploads,
+    view_pipelines:
+        std::collections::BTreeMap<Entity, (CachedRenderPipelineId, CachedRenderPipelineId)>,
+    /// Each view's UI-layer composite pipelines.
+    composite_pipelines: std::collections::BTreeMap<Entity, composite::CompositePipelines>,
+    pub(crate) world_view_pipelines: std::collections::BTreeMap<
+        (Entity, bool, bool, bool),
+        (CachedRenderPipelineId, CachedRenderPipelineId),
+    >,
+    model_view_pipelines: std::collections::BTreeMap<
+        (Entity, bool, bool),
+        (CachedRenderPipelineId, CachedRenderPipelineId),
+    >,
+}
+
+#[cfg(test)]
+#[path = "ui_render/geometry_tests.rs"]
+mod geometry_tests;
+
+#[cfg(test)]
+#[path = "ui_render/ordered_command_tests.rs"]
+mod ordered_command_tests;
+
+#[cfg(test)]
+#[path = "ui_render/retained_tests.rs"]
+mod retained_tests;

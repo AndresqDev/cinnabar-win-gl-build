@@ -1,0 +1,244 @@
+use super::*;
+
+#[test]
+fn actor_pick_trim_keeps_the_pick_range_boundary_and_uses_its_frame_position() {
+    let range = crate::mining::survival_reach(protocol::PlayerInputMode::Mouse);
+    let point = [0.0, 0.0, -(range as f32)];
+    let crosshair = Crosshair::Actor(ActorHit {
+        runtime_id: 7,
+        distance: 2.8,
+        point,
+    });
+    assert_eq!(trim_actor_pick(crosshair, [0.0; 3], range), crosshair);
+    assert_eq!(
+        trim_actor_pick(crosshair, [0.0, 0.0, 0.01], range),
+        Crosshair::Miss
+    );
+    assert_eq!(
+        trim_actor_pick(crosshair, [0.0, 0.0, -0.01], range),
+        crosshair
+    );
+    for other in [Crosshair::Miss, Crosshair::Block] {
+        assert_eq!(trim_actor_pick(other, [0.0; 3], range), other);
+    }
+}
+
+#[test]
+fn shulker_pick_does_not_expand_its_interaction_box() {
+    let actor =
+        super::super::tests::actor(1, "minecraft:shulker", [0.0, 0.0, -2.0], Some((1.0, 1.0)));
+    let hit = pick_actor(
+        [&actor].into_iter(),
+        None,
+        [0.0, 0.5, 0.0],
+        [0.0, 0.0, -1.0],
+        3.0,
+    )
+    .unwrap();
+    assert_eq!(hit.point, [0.0, 0.5, -1.5]);
+    assert!(
+        pick_actor(
+            [&actor].into_iter(),
+            None,
+            [0.55, 0.5, 0.0],
+            [0.0, 0.0, -1.0],
+            3.0
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn block_occlusion_rounds_the_world_intercept_before_measuring() {
+    let origin = [8192.0, 65.62, 4096.0];
+    let block = [8194, 66, 4097];
+    let relative: [f32; 3] = [0.0, 0.084_676_59, 0.143_673_03];
+    let point: [f64; 3] =
+        std::array::from_fn(|axis| f64::from(block[axis]) + f64::from(relative[axis]));
+    let distance = block_pick_distance(origin, point.map(|axis| axis as f32));
+    assert_eq!(distance, f64::from(2.350_242_9_f32));
+    let actor = Some(ActorHit {
+        runtime_id: 1,
+        distance: f64::from(2.250_259_9_f32),
+        point: [0.0; 3],
+    });
+    assert!(matches!(
+        classify(actor, Some(distance), 3.0),
+        Crosshair::Block
+    ));
+    let unrounded = (0..3)
+        .map(|axis| (point[axis] - f64::from(origin[axis])).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!(matches!(
+        classify(actor, Some(unrounded), 3.0),
+        Crosshair::Actor(_)
+    ));
+}
+
+#[test]
+fn segment_endpoint_rounding_controls_the_world_space_hit() {
+    let actor = super::super::tests::actor(1, "minecraft:pig", [0.0; 3], None);
+    let origin = [16_384.0, 1.0, 0.0];
+    let hit = pick_actor_by(
+        [&actor].into_iter(),
+        |_| [([16_385.0, 0.0, 0.0], [16_386.0, 2.0, 3.0])],
+        None,
+        origin,
+        [0.6, 0.0, 0.8],
+        3.0,
+    )
+    .unwrap();
+    let end_x = origin[0] + 0.6_f32 * 3.0;
+    let min_x = 16_385.0_f32 - ACTOR_PICK_RADIUS;
+    let fraction = (min_x - origin[0]) / (end_x - origin[0]);
+    assert_eq!(hit.point, [min_x, 1.0, (0.8_f32 * 3.0) * fraction]);
+    assert_ne!(
+        hit.point[2],
+        ((f64::from(min_x) - f64::from(origin[0])) * 4.0 / 3.0) as f32
+    );
+}
+
+#[test]
+fn actor_use_occlusion_ignores_the_cached_double_distance() {
+    let origin = [8192.0, 65.62, 4096.0];
+    let block = sim::BlockHit {
+        block_pos: [8194, 66, 4097],
+        face: 4,
+        hit_local: sim::Vec3::new(
+            0.0,
+            f64::from(0.084_676_59_f32),
+            f64::from(0.143_673_03_f32),
+        ),
+        hit_world: sim::Vec3::new(
+            8194.0,
+            66.0 + f64::from(0.084_676_59_f32),
+            4097.0 + f64::from(0.143_673_03_f32),
+        ),
+        runtime_id: 7,
+        distance: 10.0,
+        identity: sim::CollisionQuery::synthetic(()).identity,
+        overlay: None,
+    };
+    let actor = Some(ActorHit {
+        runtime_id: 1,
+        distance: f64::from(2.250_259_9_f32),
+        point: [0.0; 3],
+    });
+    assert_eq!(
+        classify_block_hit(actor, origin, Some(&block), 3.0),
+        Crosshair::Block
+    );
+    assert!(matches!(
+        classify(actor, Some(block.distance), 3.0),
+        Crosshair::Actor(_)
+    ));
+}
+
+#[test]
+fn block_occlusion_uses_the_intercept_outside_the_block_cell() {
+    let origin = [3.0, 0.5, 0.5];
+    let block = sim::BlockHit {
+        block_pos: [0, 0, 0],
+        face: 5,
+        hit_local: sim::Vec3::new(1.0, 0.5, 0.5),
+        hit_world: sim::Vec3::new(1.5, 0.5, 0.5),
+        runtime_id: 7,
+        distance: 1.5,
+        identity: sim::CollisionQuery::synthetic(()).identity,
+        overlay: None,
+    };
+    let actor = Some(ActorHit {
+        runtime_id: 1,
+        distance: 1.7,
+        point: [1.3, 0.5, 0.5],
+    });
+    assert_eq!(
+        classify_block_hit(actor, origin, Some(&block), 3.0),
+        Crosshair::Block
+    );
+
+    let stack = protocol::NetworkItemStack::empty();
+    let item =
+        protocol::VerifiedNetworkItemStack::try_new(stack.clone(), stack.nbt_digest).unwrap();
+    let mut observed = crate::interaction_authority::FrozenBlockObservation::fixture(
+        block.block_pos,
+        block.face,
+        item,
+    );
+    observed.ray.origin = origin;
+    observed.target.relative_hit = [1.0, 0.5, 0.5];
+    observed.target.hit_world = [1.5, 0.5, 0.5];
+    assert_eq!(observed.hit_distance(), 1.5);
+    assert_eq!(
+        classify(actor, Some(observed.hit_distance()), 3.0),
+        Crosshair::Block
+    );
+}
+
+#[test]
+fn captured_box_uses_the_same_order_and_inflation_as_the_actor_pick() {
+    let actor =
+        super::super::tests::actor(7, "minecraft:player", [0.0, 0.0, -2.0], Some((0.6, 1.8)));
+    let boxes = [
+        ([-0.5, 0.0, -4.0], [0.5, 2.0, -3.0]),
+        ([-0.5, 0.0, -2.0], [0.5, 2.0, -1.0]),
+    ];
+    let origin = [0.0, 1.0, 0.0];
+    let direction = [0.0, 0.0, -2.0];
+    let picked = pick_actor_by(
+        std::iter::once(&actor),
+        |_| boxes,
+        None,
+        origin,
+        direction,
+        5.0,
+    )
+    .unwrap();
+    let (point, bounds) =
+        pick_box(boxes, actor.entity_fact.pick_radius, origin, direction, 5.0).unwrap();
+    assert_eq!(point, picked.point);
+    assert_eq!(
+        bounds,
+        (
+            boxes[0].0.map(|axis| axis - actor.entity_fact.pick_radius),
+            boxes[0].1.map(|axis| axis + actor.entity_fact.pick_radius)
+        )
+    );
+}
+
+#[test]
+fn captured_press_keeps_its_original_input_boundary_through_retries() {
+    let mut runtime = super::super::MeleeRuntime::default();
+    assert!(runtime.observe_input_with_capture(true, true, Some([1, 10])));
+    assert!(runtime.observe_input_with_capture(false, true, Some([1, 11])));
+    assert_eq!(runtime.pending_capture_frame(0), Some([1, 10]));
+    assert!(runtime.observe_input_with_capture(true, true, Some([1, 12])));
+    runtime.resolve(
+        Crosshair::Miss,
+        &super::super::tests::press(protocol::PlayerInputMode::Mouse),
+        &mut super::super::SwingTracker::default(),
+    );
+    assert_eq!(runtime.pending_capture_frame(0), Some([1, 12]));
+    runtime.cancel();
+    assert_eq!(runtime.pending_capture_frame(0), None);
+    assert!(runtime.observe_input(true, true));
+    assert_eq!(runtime.pending_capture_frame(0), None);
+}
+
+#[test]
+fn capture_identity_follows_the_press_remaining_after_expiration() {
+    let mut runtime = super::super::MeleeRuntime::default();
+    runtime.observe_input_with_capture(true, true, Some([1, 10]));
+    runtime.defer(0);
+    runtime.observe_input_with_capture(true, true, Some([1, 12]));
+    runtime.defer(1);
+    let now = crate::interaction_authority::MAX_PENDING_INTERACTION_MILLIS + 1;
+    assert_eq!(runtime.pending_capture_frame(now), Some([1, 12]));
+    runtime.resolve(
+        Crosshair::Miss,
+        &super::super::tests::press(protocol::PlayerInputMode::Mouse),
+        &mut super::super::SwingTracker::default(),
+    );
+    assert_eq!(runtime.pending_capture_frame(now), None);
+}

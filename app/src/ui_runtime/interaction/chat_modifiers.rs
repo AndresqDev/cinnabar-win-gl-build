@@ -1,0 +1,101 @@
+//! Physical modifiers survive gameplay-button resets while chat or mod screens own input.
+use super::*;
+
+use launcher::menu::settings_options::BindingId;
+const MODIFIERS: [KeyCode; 8] = [
+    KeyCode::ControlLeft,
+    KeyCode::ControlRight,
+    KeyCode::SuperLeft,
+    KeyCode::SuperRight,
+    KeyCode::AltLeft,
+    KeyCode::AltRight,
+    KeyCode::ShiftLeft,
+    KeyCode::ShiftRight,
+];
+
+/// Seeds held keys without applying a frame's later modifier edges before earlier presses.
+pub(crate) fn capture_before_events(
+    held: &mut ButtonInput<KeyCode>,
+    gameplay: &ButtonInput<KeyCode>,
+    events: &[KeyboardInput],
+) {
+    for key in MODIFIERS {
+        if gameplay.pressed(key) && !events.iter().any(|event| event.key_code == key) {
+            held.press(key);
+        }
+    }
+}
+
+/// Applies one physical modifier edge, retaining the other side independently.
+pub(crate) fn track(held: &mut ButtonInput<KeyCode>, input: &KeyboardInput) {
+    if !MODIFIERS.contains(&input.key_code) {
+        return;
+    }
+    match input.state {
+        ButtonState::Pressed => held.press(input.key_code),
+        ButtonState::Released => held.release(input.key_code),
+    }
+}
+
+/// Whether held modifiers turn a press into an edit shortcut rather than typed text.
+///
+/// Alt is excluded because AltGr and Option, alone or reported as Ctrl+Alt on Windows,
+/// are how many keyboard layouts produce characters such as `@`, `{` and `ą`.
+pub(super) fn text_modified(held: &ButtonInput<KeyCode>) -> bool {
+    let held = held
+        .get_pressed()
+        .map(|key| keyboard_key(*key))
+        .collect::<Vec<_>>();
+    is_chat_edit_shortcut(&held)
+}
+
+/// Samples both physical sides of each modifier for keyboard and mouse shortcuts.
+pub(crate) fn held_chord(held: &ButtonInput<KeyCode>) -> semantic_input::ModifierChord {
+    semantic_input::ModifierChord {
+        alt: held.pressed(KeyCode::AltLeft) || held.pressed(KeyCode::AltRight),
+        control: held.pressed(KeyCode::ControlLeft) || held.pressed(KeyCode::ControlRight),
+        shift: held.pressed(KeyCode::ShiftLeft) || held.pressed(KeyCode::ShiftRight),
+        super_key: held.pressed(KeyCode::SuperLeft) || held.pressed(KeyCode::SuperRight),
+    }
+}
+
+/// Matches the command binding, also accepting a typed slash on other layouts
+/// while the default command control is selected.
+pub(crate) fn command_key(
+    menu: Option<&client_shell::menu::MenuRuntime>,
+    input: &KeyboardInput,
+) -> bool {
+    use client_shell::menu::settings_options::control_bindings::named_control;
+    binding_key(menu, BindingId::Command, input.key_code)
+        || (input.text.as_deref() == Some("/")
+            && named_control(menu, BindingId::Command) == named_control(None, BindingId::Command))
+}
+
+/// Recognizes hardware Enter and UIKit's Return text without a physical key code.
+pub(super) fn submit_key(input: &KeyboardInput) -> bool {
+    matches!(input.key_code, KeyCode::Enter | KeyCode::NumpadEnter)
+        || (matches!(input.key_code, KeyCode::Unidentified(_))
+            && matches!(input.text.as_deref(), Some("\n" | "\r")))
+}
+
+/// Whether `key` edits chat by whole words when the word-edit modifier is held.
+pub(crate) fn is_word_edit(key: KeyCode) -> bool {
+    matches!(
+        key,
+        KeyCode::Backspace | KeyCode::Delete | KeyCode::ArrowLeft | KeyCode::ArrowRight
+    )
+}
+
+/// Applies the word edit for `key`; `selecting` extends the selection instead of moving the caret.
+pub(crate) fn word_edit(editor: &mut ui::ChatEditor, key: KeyCode, selecting: bool) {
+    match key {
+        KeyCode::Backspace => editor.backspace_word(),
+        KeyCode::Delete => editor.delete_word(),
+        KeyCode::ArrowLeft => editor.move_word_left(selecting),
+        KeyCode::ArrowRight => editor.move_word_right(selecting),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests;

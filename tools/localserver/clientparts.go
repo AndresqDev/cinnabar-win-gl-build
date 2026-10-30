@@ -1,0 +1,115 @@
+package main
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/df-mc/dragonfly/server/world"
+	"github.com/google/uuid"
+
+	extension "github.com/cinnabar-mc/cinnabar/tools/localserver/cinnabarext"
+	"github.com/cinnabar-mc/cinnabar/tools/localserver/experience"
+)
+
+var _ experience.ClientChannels = (*extension.Server)(nil)
+
+// startClientParts sets up the server half of client parts for the -extension flags: it reads
+// the server key and the bundles, takes the next revision, signs the offer and writes it as an
+// optional resource pack, so it must run before server.UserConfig.Config loads the packs.
+func startClientParts(cfg settings, log *slog.Logger) (*extension.Server, error) {
+	seed, err := os.ReadFile(cfg.extensionKey)
+	if err != nil {
+		return nil, fmt.Errorf("read -extension-key: %w", err)
+	}
+	key, err := extension.ParseSeed(string(seed))
+	if err != nil {
+		return nil, fmt.Errorf("-extension-key %s: %w", cfg.extensionKey, err)
+	}
+	var bundles []extension.Bundle
+	if cfg.extensionCXB != "" {
+		bundles, err = extension.ReadBundles(cfg.extensionCXB)
+		if err != nil {
+			return nil, fmt.Errorf("-extension-cxb: %w", err)
+		}
+	}
+	for _, path := range cfg.modClients {
+		bundle, err := extension.ReadBundle(path)
+		if err != nil {
+			return nil, err
+		}
+		bundles = append(bundles, bundle)
+	}
+	revision, err := extension.NextRevision(offerRevisionPath(cfg.extensionKey), filepath.Join(cfg.dir, extension.RevisionFile))
+	if err != nil {
+		return nil, err
+	}
+	var mediaOrigins []string
+	if cfg.extensionMedia != "" {
+		origin, err := extension.MediaOrigin(cfg.extensionMediaAddr)
+		if err != nil {
+			return nil, err
+		}
+		mediaOrigins = []string{origin}
+	}
+	ext, err := extension.New(extension.Config{
+		Key:          key,
+		Audience:     cfg.extensionAudience,
+		Revision:     revision,
+		Bundles:      bundles,
+		MediaOrigins: mediaOrigins,
+		Log:          log,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("-extension-audience or -extension-cxb: %w", err)
+	}
+	if err := ext.WriteMarkerPack(cfg.resourcesDir()); err != nil {
+		return nil, fmt.Errorf("write the client part offer: %w", err)
+	}
+	offer := ext.Offer()
+	ids := make([]string, len(offer.Packages))
+	for i, p := range offer.Packages {
+		ids[i] = p.ID
+	}
+	log.Info("client parts offered", "audience", offer.Audience, "revision", offer.Revision,
+		"expires", time.Unix(int64(offer.ExpiresUnix), 0).UTC(), "packages", ids)
+	return ext, nil
+}
+
+// offerRevisionPath is where the last revision offered under the server key in keyFile is kept:
+// beside the key rather than in the world, so a reset world continues the key's revisions instead
+// of offering returning clients a rollback. Earlier starts kept it in the world directory.
+func offerRevisionPath(keyFile string) string {
+	return keyFile + "." + extension.RevisionFile
+}
+
+// startMedia serves -extension-media on loopback HTTPS, writing its CA into the world directory.
+func startMedia(cfg settings, log *slog.Logger) (*extension.MediaServer, error) {
+	caPath := filepath.Join(cfg.dir, extension.MediaCAFile)
+	media, err := extension.ServeMedia(cfg.extensionMedia, cfg.extensionMediaAddr, caPath, log)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("client part media served", "addr", cfg.extensionMediaAddr, "ca", caPath)
+	return media, nil
+}
+
+// deliverClientPartEvents passes each client part message, and each world epoch change that a
+// client part kept running through, to the Experience whose id is the bundle id, as that
+// player's callback; a player who has left, or a server without that Experience, drops it.
+func deliverClientPartEvents(ext *extension.Server, players func(uuid.UUID) (*world.EntityHandle, bool), host *experience.Host, log *slog.Logger) {
+	ext.OnClientMessage(func(player uuid.UUID, source extension.PlayerSession, exp, channel string, schema uint16, payload []extension.Scalar) {
+		handle, ok := players(player)
+		if !ok || host == nil || host.PlayerSession(handle) != source || !host.DeliverClientMessage(handle, exp, channel, schema, payload) {
+			log.Debug("client part message dropped", "experience", exp, "channel", channel, "schema", schema)
+		}
+	})
+	ext.OnEpoch(func(player uuid.UUID, source extension.PlayerSession, exp string) {
+		handle, ok := players(player)
+		if !ok || host == nil || host.PlayerSession(handle) != source || !host.DeliverEpoch(handle, exp) {
+			log.Debug("client part epoch dropped", "experience", exp)
+		}
+	})
+}

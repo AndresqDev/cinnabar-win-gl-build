@@ -1,0 +1,78 @@
+//! Vendor-independent user-interface primitives.
+
+mod action;
+mod chat;
+mod geometry;
+mod hud;
+mod icon;
+pub mod mod_hud;
+pub mod mod_metadata;
+pub mod mod_panel;
+pub mod mod_presentation;
+pub mod mod_touch;
+mod model;
+pub mod oreui_theme;
+mod scoreboard;
+mod settings;
+pub mod settings_state;
+mod text;
+
+pub use action::{PointerPhase, TOUCH_DRAG_DISTANCE, UiAction, UiLimits};
+pub use chat::{
+    ChatApplyResult, ChatAutocompleteAction, ChatAutocompleteApply, ChatAutocompleteDelta,
+    ChatAutocompleteError, ChatAutocompleteRequest, ChatAutocompleteResponse,
+    ChatAutocompleteState, ChatClipboard, ChatEditor, ChatEditorError, ChatHistory, ChatMessage,
+    ChatMessageKind, ChatPasteError, ChatRateLimit, ChatSendError, ChatSendQueue, ChatSendRequest,
+    ChatStore, ChatViewNode, MAX_CHAT_AUTOCOMPLETE, MAX_CHAT_AUTOCOMPLETE_BYTES, MAX_CHAT_HISTORY,
+    MAX_CHAT_INPUT_BYTES, MAX_CHAT_MESSAGES, MAX_CHAT_RETAINED_BYTES, MAX_PENDING_CHAT_SENDS,
+    validate_chat_message,
+};
+pub use geometry::{
+    DesktopGuiScale, DesktopGuiScaleChoice, DpiScale, GeometryError, MIN_WINDOW_LOGICAL_SIZE,
+    SafeArea, UiPoint, UiRect, UiScale, gui_scale,
+};
+pub use hud::{
+    BoundedStat, HudExperience, HudPlayerStatus, HudStore, HudViewNode, HudViewRole, LoadingStage,
+    MAX_TOAST_RETAINED_BYTES, MAX_TOASTS, ShownToast, StandingToast, TOAST_DISPLAY_MILLIS,
+    TOAST_SLIDE_IN_MILLIS, TOAST_SLIDE_OUT_MILLIS, TimedText, TitleDurations, Toast, ToastPress,
+};
+pub use icon::IconRef;
+pub use model::{
+    DrawUpdate, FocusState, FocusTransition, RetainedDraw, TextEffects, TextShadow,
+    UI_STYLE_BILINEAR, UI_STYLE_GLINT, UI_STYLE_GRAYSCALE, UiBlendMode, UiDrawBatch, UiDrawList,
+    UiError, UiFrame, UiMesh, UiMeshBatch, UiMeshError, UiMeshVertex, UiNode, UiNodeId,
+    UiTransform, UiTree, UiVertex, UiVisual, UiWorldProjection,
+};
+pub use scoreboard::{
+    BossAction, BossBarDiagnostics, BossBarEvent, BossBarStore, BossBarView, BossColor,
+    BossOverlay, BossStyle, DisplaySlot, MAX_BOSS_BARS, MAX_BOSS_RETAINED_TEXT_BYTES,
+    MAX_OBJECTIVES, MAX_RETAINED_UI_TEXT_FIELD_BYTES, MAX_SCOREBOARD_RETAINED_TEXT_BYTES,
+    MAX_SCORES, RetainedUiApply, RetainedUiSequenceError, ScoreAction, ScoreEntry, ScoreIdentity,
+    ScoreOwner, ScoreRenderType, ScoreRow, ScoreSortOrder, ScoreboardDiagnostics, ScoreboardEvent,
+    ScoreboardProjection, ScoreboardStore,
+};
+pub use settings::{
+    ANTI_ALIASING_SAMPLE_COUNTS, AntiAliasingSupport, CURRENT_SETTINGS_SCHEMA,
+    DEFAULT_ANTI_ALIASING_SAMPLES, DEFAULT_FOV_DEGREES, DEFAULT_OUTLINE_SELECTION,
+    DEFAULT_RENDER_SCALE_PERCENT, DEFAULT_RENDER_SCALE_SHARPEN, DEFAULT_SHOW_CUSTOM_ITEM_MODELS,
+    DEFAULT_SHOW_OTHER_PLAYER_COSMETICS, DEFAULT_SMAA_MODE, FSR_SHARPNESS_STOPS, GameplaySettings,
+    MAX_FOV_DEGREES, MAX_RENDER_SCALE_PERCENT, MIN_FOV_DEGREES, MIN_RENDER_DISTANCE_CHUNKS,
+    MIN_RENDER_SCALE_PERCENT, MOTION_BLUR_REFERENCE_FPS, MotionBlurQuality, RenderDistanceDefaults,
+    RenderDistanceDevice, RenderMode, SmaaMode, UserSettings, VideoSettings, ViewBobbing,
+};
+pub use text::{
+    BedrockColor, ColorDescriptor, FONT_ASCENT_TEXELS, FONT_DESIGN_PIXEL_TEXELS, FONT_INK_TEXELS,
+    FORMATTING_COLORS, FormattingPalette, GlyphQuad, MAX_GLYPHS_PER_LAYOUT, MAX_TEXT_SPANS,
+    MAX_WRAP_LINES, ObfuscationGlyphs, TEXT_BASELINE_64, TEXT_BOLD_OFFSET_64, TEXT_ITALIC_SHEAR_PX,
+    TEXT_LINE_HEIGHT_64, TEXT_SHADOW_OFFSET_64, TextError, TextLayout, TextLayoutCache,
+    TextLayoutKey, TextLayoutRequest, TextLineAlign, TextSpan, TextSpans, TextStyle, TextWrap,
+    WordChop, parse_bedrock_text,
+};
+
+// Ties the action limits to the model types they size; tests include `action.rs` without the model.
+const _: () = assert!(
+    UiLimits::MAX_UI_VERTICES * std::mem::size_of::<UiVertex>()
+        + UiLimits::MAX_UI_INDICES * std::mem::size_of::<u32>()
+        + UiLimits::MAX_DRAW_BATCHES * std::mem::size_of::<UiDrawBatch>()
+        <= UiLimits::MAX_DRAW_LIST_BYTES
+);

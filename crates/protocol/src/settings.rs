@@ -1,0 +1,44 @@
+//! Client settings that need a live Bedrock request.
+
+use crate::Packet;
+use bedrock_protocol_1_26_60::packets::RequestChunkRadius;
+use bedrock_protocol_1_26_60::wire;
+
+// Vanilla advertises a supported chunk radius within these bounds.
+const MIN_ADVERTISED_CHUNK_RADIUS: u8 = 5;
+const MAX_ADVERTISED_CHUNK_RADIUS: u8 = 28;
+
+/// Requests a live view radius, advertising the client's supported upper bound.
+#[must_use]
+pub fn request_chunk_radius_packet(chunks: u8, supported_chunks: u8) -> Packet {
+    crate::Packet::new(RequestChunkRadius {
+        chunk_radius: wire::ZigZag32(i32::from(chunks.min(supported_chunks))),
+        max_chunk_radius: wire::U8(
+            supported_chunks.clamp(MIN_ADVERTISED_CHUNK_RADIUS, MAX_ADVERTISED_CHUNK_RADIUS),
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_protocol_1_26_60::packets;
+
+    #[test]
+    fn live_radius_requests_encode_both_requested_and_supported_distance() {
+        let packet = request_chunk_radius_packet(8, 16);
+        let encoded = crate::encode(&packet).unwrap();
+        let decoded = crate::decode_batch(encoded).unwrap();
+        let packets::Packet::RequestChunkRadius(request) = &*decoded[0].data else {
+            panic!("wrong packet");
+        };
+        assert_eq!(request.chunk_radius.0, 8);
+        assert_eq!(request.max_chunk_radius.0, 16);
+        let packet = request_chunk_radius_packet(100, 40);
+        let packets::Packet::RequestChunkRadius(request) = *packet.data else {
+            panic!("wrong packet");
+        };
+        assert_eq!(request.chunk_radius.0, 40);
+        assert_eq!(request.max_chunk_radius.0, MAX_ADVERTISED_CHUNK_RADIUS);
+    }
+}

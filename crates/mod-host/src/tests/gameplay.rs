@@ -1,0 +1,603 @@
+use super::*;
+
+fn source(init: &str, frame: &str) -> String {
+    let package = include_str!("../../../mod-api/wit/extension.wit")
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("package ")
+        .trim_end_matches(';');
+    let (name, version) = package.split_once('@').unwrap();
+    include_str!("gameplay.wat")
+        .replace("$GAMEPLAY", &format!("{name}/gameplay@{version}"))
+        .replace("$INIT", init)
+        .replace("$FRAME", frame)
+}
+
+fn load(init: &str, frame: &str, grants: ModGrants) -> (tempfile::TempDir, ModHost) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gameplay.wat");
+    std::fs::write(&path, source(init, frame)).unwrap();
+    let host = ModHost::load_with_grants(&path, grants).unwrap();
+    (directory, host)
+}
+
+fn grants() -> ModGrants {
+    ModGrants {
+        players: true,
+        camera: true,
+        ..Default::default()
+    }
+}
+
+fn delay(value: u32, error: bool) -> String {
+    format!(
+        "i32.const {value} i32.const 256 call $delay i32.const 256 i32.load8_u i32.const {} i32.ne if unreachable end",
+        u8::from(error)
+    )
+}
+
+#[test]
+fn packet_delay_is_denied_by_default_and_bounded_without_a_gameplay_frame() {
+    let (_directory, mut denied) = load("", &delay(200, true), ModGrants::default());
+    denied.frame(false).unwrap();
+    assert_eq!(denied.packet_delay_ms(), 0);
+    let granted = ModGrants {
+        packet_delay: true,
+        ..Default::default()
+    };
+    let (_directory, mut invalid) = load(
+        "",
+        &delay(mod_api::MAX_PACKET_DELAY_MS + 1, true),
+        granted.clone(),
+    );
+    invalid.frame(false).unwrap();
+    assert_eq!(invalid.packet_delay_ms(), 0);
+    let (_directory, mut enabled) = load(&delay(mod_api::MAX_PACKET_DELAY_MS, false), "", granted);
+    assert_eq!(enabled.packet_delay_ms(), mod_api::MAX_PACKET_DELAY_MS);
+    enabled.frame(false).unwrap();
+    assert_eq!(enabled.packet_delay_ms(), mod_api::MAX_PACKET_DELAY_MS);
+}
+
+#[test]
+fn packet_delay_commits_on_success_and_clears_after_a_guest_trap() {
+    let granted = ModGrants {
+        packet_delay: true,
+        ..Default::default()
+    };
+    let (_directory, mut disabled) = load(&delay(200, false), &delay(0, false), granted.clone());
+    assert_eq!(disabled.packet_delay_ms(), 200);
+    disabled.frame(false).unwrap();
+    assert_eq!(disabled.packet_delay_ms(), 0);
+    let (_directory, mut trapped) = load(
+        &delay(200, false),
+        &format!("{} unreachable", delay(500, false)),
+        granted,
+    );
+    assert_eq!(trapped.packet_delay_ms(), 200);
+    assert!(trapped.frame(false).is_err());
+    assert!(!trapped.is_active());
+    assert_eq!(trapped.packet_delay_ms(), 0);
+    trapped.frame(false).unwrap();
+    assert_eq!(trapped.packet_delay_ms(), 0);
+}
+
+fn snapshot() -> GameplaySnapshot {
+    GameplaySnapshot {
+        session: 42,
+        dimension: -1,
+        eye: GameplayVector3 {
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        },
+        yaw: 0.4,
+        pitch: 0.2,
+        attack_held: true,
+        frame_seconds: 0.016,
+        players: vec![GameplayPlayer {
+            runtime_id: 99,
+            position: GameplayVector3 {
+                x: 4.0,
+                y: 5.0,
+                z: 6.0,
+            },
+        }],
+    }
+}
+
+fn rotate(yaw: f32, pitch: f32, error: bool) -> String {
+    let yaw = yaw.to_string().to_lowercase();
+    let pitch = pitch.to_string().to_lowercase();
+    format!(
+        "f32.const {yaw} f32.const {pitch} i32.const 256 call $rotate \
+        i32.const 256 i32.load8_u i32.const {} i32.ne if unreachable end",
+        u8::from(error)
+    )
+}
+
+fn read(error: bool, present: bool) -> String {
+    let result = format!(
+        "i32.const 128 call $read i32.const 128 i32.load8_u \
+        i32.const {} i32.ne if unreachable end",
+        u8::from(error)
+    );
+    if error {
+        return result;
+    }
+    format!(
+        "{result} i32.const 136 i32.load8_u i32.const {} i32.ne if unreachable end",
+        u8::from(present)
+    )
+}
+
+#[test]
+fn current_frame_crosses_real_component_boundary_and_rotation_is_consumed_once() {
+    let frame = format!(
+        "{} i32.const 144 i64.load i64.const 42 i64.ne if unreachable end \
+        i32.const 152 i32.load i32.const -1 i32.ne if unreachable end \
+        i32.const 156 f32.load f32.const 1 f32.ne if unreachable end \
+        i32.const 168 f32.load f32.const 0.4 f32.ne if unreachable end \
+        i32.const 172 f32.load f32.const 0.2 f32.ne if unreachable end \
+        i32.const 176 f32.load f32.const 0.016 f32.ne if unreachable end \
+        i32.const 184 i32.load i32.const 1 i32.ne if unreachable end \
+        i32.const 180 i32.load i64.load i64.const 99 i64.ne if unreachable end {}",
+        read(false, true),
+        rotate(0.1, -0.1, false)
+    );
+    let (_dir, mut host) = load("", &frame, grants());
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    assert_eq!(
+        host.take_camera_delta(),
+        Some(CameraDelta {
+            yaw: 0.1,
+            pitch: -0.1
+        })
+    );
+    assert_eq!(host.take_camera_delta(), None);
+}
+
+#[test]
+fn capabilities_are_independent_and_denied_by_default() {
+    for permissions in [
+        ModGrants::default(),
+        ModGrants {
+            players: true,
+            ..Default::default()
+        },
+        ModGrants {
+            camera: true,
+            ..Default::default()
+        },
+    ] {
+        let frame = format!(
+            "{} {}",
+            read(!permissions.players, true),
+            rotate(0.1, 0.0, !permissions.camera)
+        );
+        let (_dir, mut host) = load("", &frame, permissions.clone());
+        host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+        assert_eq!(host.take_camera_delta().is_some(), permissions.camera);
+        assert!(host.is_active());
+    }
+}
+
+#[test]
+fn remote_session_preserves_independently_consented_player_poses_and_camera() {
+    use mod_api::drawing::{DrawingPermissions, DrawingSession};
+
+    for players in [false, true] {
+        for camera in [false, true] {
+            let frame = format!(
+                "{} {} {}",
+                read(!players, true),
+                if players {
+                    "i32.const 184 i32.load i32.const 1 i32.ne if unreachable end \
+                     i32.const 180 i32.load i64.load i64.const 99 i64.ne if unreachable end"
+                } else {
+                    ""
+                },
+                rotate(0.1, 0.0, !camera),
+            );
+            let (_directory, mut host) = load(
+                "",
+                &frame,
+                ModGrants {
+                    players,
+                    camera,
+                    ..Default::default()
+                },
+            );
+            host.bind_drawing_session(DrawingSession {
+                connection: snapshot().session,
+                dimension: snapshot().dimension,
+                permissions: DrawingPermissions {
+                    world_draw: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            assert!(host.reload_if_changed().unwrap());
+            host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+            assert_eq!(host.take_camera_delta().is_some(), camera);
+            assert!(host.is_active());
+            assert!(!host.grants().entity_observe && !host.grants().render_through_walls);
+        }
+    }
+}
+
+#[test]
+fn init_and_frames_without_gameplay_cannot_rotate_or_read_stale_data() {
+    let no_frame = format!("{} {}", read(false, false), rotate(0.1, 0.0, true));
+    let (_dir, mut host) = load(&no_frame, &no_frame, grants());
+    host.frame(false).unwrap();
+    assert_eq!(host.take_camera_delta(), None);
+}
+
+#[test]
+fn trap_discards_staged_and_previous_camera_delta() {
+    let (_dir, mut host) = load(
+        "",
+        &format!("{} unreachable", rotate(0.1, 0.0, false)),
+        grants(),
+    );
+    assert!(host.frame_with_gameplay(false, Some(snapshot())).is_err());
+    assert_eq!(host.take_camera_delta(), None);
+    assert!(!host.is_active());
+}
+
+#[test]
+fn next_frame_revokes_unconsumed_delta_and_snapshot() {
+    let frame = format!(
+        "i32.const 128 call $read i32.const 136 i32.load8_u \
+        if {} else {} end",
+        rotate(0.1, 0.0, false),
+        rotate(0.1, 0.0, true)
+    );
+    let (_dir, mut host) = load("", &frame, grants());
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    host.frame(false).unwrap();
+    assert_eq!(host.take_camera_delta(), None);
+}
+
+#[test]
+fn malformed_snapshots_fail_before_callback_and_revoke_previous_delta() {
+    let (_dir, mut host) = load("", &rotate(0.1, 0.0, false), grants());
+    for invalid in [0, 1, 2] {
+        host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+        let mut frame = snapshot();
+        match invalid {
+            0 => frame.eye.x = f32::NAN,
+            1 => frame.players = vec![frame.players[0]; mod_api::MAX_GAMEPLAY_PLAYERS + 1],
+            _ => frame.frame_seconds = f32::INFINITY,
+        }
+        assert!(host.frame_with_gameplay(false, Some(frame)).is_err());
+        assert_eq!(host.take_camera_delta(), None);
+        assert!(host.is_active());
+    }
+}
+
+#[test]
+fn camera_requires_finite_and_cumulatively_bounded_deltas() {
+    let limit = mod_api::MAX_CAMERA_DELTA_RADIANS;
+    let frame = format!(
+        "{} {} {} {}",
+        rotate(limit, -limit, false),
+        rotate(0.01, 0.0, true),
+        rotate(f32::INFINITY, 0.0, true),
+        rotate(f32::NAN, 0.0, true)
+    );
+    let (_dir, mut host) = load("", &frame, grants());
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    assert_eq!(
+        host.take_camera_delta(),
+        Some(CameraDelta {
+            yaw: limit,
+            pitch: -limit
+        })
+    );
+}
+
+#[test]
+fn import_budgets_quarantine_before_commit() {
+    for (call, expected) in [
+        (read(false, true), "gameplay read budget exhausted"),
+        (rotate(0.0, 0.0, false), "camera import budget exhausted"),
+    ] {
+        let (_dir, mut host) = load("", &format!("{call} ").repeat(9), grants());
+        let error = host
+            .frame_with_gameplay(false, Some(snapshot()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected));
+        assert_eq!(host.take_camera_delta(), None);
+    }
+}
+
+#[test]
+fn reload_retains_grants_but_clears_pending_motion() {
+    let (directory, mut host) = load("", &rotate(0.1, 0.0, false), grants());
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    let path = directory.path().join("gameplay.wat");
+    std::fs::write(
+        path,
+        source(&rotate(0.1, 0.0, true), &rotate(0.2, 0.0, false)),
+    )
+    .unwrap();
+    assert!(host.reload_if_changed().unwrap());
+    assert_eq!(host.take_camera_delta(), None);
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    assert_eq!(
+        host.take_camera_delta(),
+        Some(CameraDelta {
+            yaw: 0.2,
+            pitch: 0.0
+        })
+    );
+}
+
+#[test]
+fn jump_pulses_commit_once_and_are_revoked_after_guest_trap() {
+    let grants = ModGrants {
+        movement: true,
+        ..Default::default()
+    };
+    let movement = mod_host_movement();
+    let jump = "i32.const 0 call $jump i32.const 0 i32.load if unreachable end";
+    let (_directory, mut host) = load("", jump, grants.clone());
+    host.frame_with_movement(
+        false,
+        Some(snapshot()),
+        Vec::new(),
+        None,
+        Some(movement),
+        crate::empty_controls(),
+    )
+    .unwrap();
+    assert!(host.take_jump_pulse());
+    assert!(!host.take_jump_pulse());
+    host.frame_with_movement(
+        false,
+        Some(snapshot()),
+        Vec::new(),
+        None,
+        Some(movement),
+        crate::empty_controls(),
+    )
+    .unwrap();
+    host.frame(false).unwrap_err();
+    assert!(!host.take_jump_pulse());
+    assert!(!host.is_active());
+    let (_directory, mut trapped) = load("", &format!("{jump} unreachable"), grants);
+    assert!(
+        trapped
+            .frame_with_movement(
+                false,
+                Some(snapshot()),
+                Vec::new(),
+                None,
+                Some(movement),
+                crate::empty_controls()
+            )
+            .is_err()
+    );
+    assert!(!trapped.take_jump_pulse());
+    trapped.frame(false).unwrap();
+    assert!(!trapped.take_jump_pulse());
+}
+
+/// Builds a grounded movement snapshot in the gameplay fixture authority.
+fn mod_host_movement() -> crate::GameplayMovementSnapshot {
+    crate::GameplayMovementSnapshot {
+        session: 42,
+        dimension: -1,
+        tick: 20,
+        velocity: crate::GameplayVector3 {
+            x: 0.1,
+            y: -0.08,
+            z: 0.1,
+        },
+        on_ground: true,
+        jump_held: false,
+        sprint_held: false,
+        sneak_held: false,
+        eligible: true,
+        knockback_sequence: 1,
+    }
+}
+
+#[test]
+fn explicit_jump_cancellation_commits_once_without_gameplay_and_wins_over_pulse() {
+    let grants = ModGrants {
+        movement: true,
+        ..Default::default()
+    };
+    let cancel = "i32.const 0 call $cancel-jump i32.const 0 i32.load if unreachable end";
+    let (_directory, mut host) = load("", cancel, grants.clone());
+    host.frame(false).unwrap();
+    assert!(host.take_jump_cancel());
+    assert!(!host.take_jump_cancel());
+    let (_directory, mut denied) = load("", cancel, ModGrants::default());
+    assert!(denied.frame(false).is_err());
+    assert!(!denied.take_jump_cancel());
+    let (_directory, mut both) = load(
+        "",
+        &format!("i32.const 0 call $jump {cancel}"),
+        grants.clone(),
+    );
+    both.frame_with_movement(
+        false,
+        Some(snapshot()),
+        Vec::new(),
+        None,
+        Some(mod_host_movement()),
+        crate::empty_controls(),
+    )
+    .unwrap();
+    assert!(both.take_jump_cancel());
+    assert!(!both.take_jump_pulse());
+    let (_directory, mut trapped) = load("", &format!("{cancel} unreachable"), grants);
+    assert!(trapped.frame(false).is_err());
+    assert!(!trapped.take_jump_cancel());
+}
+
+/// Stages toggle-sprint and always-sprint control modes, whatever the host answers.
+const CONTROL_MODES: &str =
+    "i32.const 1 i32.const 1 i32.const 0 i32.const 1 i32.const 256 call $modes";
+
+/// The control modes `CONTROL_MODES` stages.
+fn staged_modes() -> crate::GameplayControlModes {
+    crate::GameplayControlModes {
+        toggle_sprint: true,
+        toggle_sneak: false,
+        always_sprint: true,
+    }
+}
+
+/// A focused gameplay controls frame, in which a mod may set control modes.
+fn focused_controls() -> crate::ControlFrame {
+    crate::ControlFrame {
+        focused: true,
+        gameplay: true,
+        ..crate::empty_controls()
+    }
+}
+
+/// Control modes cross the component boundary, need movement authority, last only while renewed
+/// in focused gameplay and are cleared by a trap.
+#[test]
+fn control_modes_commit_per_renewed_frame_and_clear_after_a_trap() {
+    let grants = ModGrants {
+        movement: true,
+        ..Default::default()
+    };
+    let (_directory, mut host) = load("", CONTROL_MODES, grants.clone());
+    host.frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(host.control_modes(), Some(staged_modes()));
+    host.frame_with_controls(false, Some(snapshot()), crate::empty_controls())
+        .unwrap();
+    assert_eq!(
+        host.control_modes(),
+        None,
+        "outside focused gameplay the modes cannot be renewed"
+    );
+    host.frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(host.control_modes(), Some(staged_modes()));
+    assert!(host.is_active());
+
+    let once = format!(
+        "i32.const 1024 i32.load i32.eqz if {CONTROL_MODES} end \
+         i32.const 1024 i32.const 1 i32.store"
+    );
+    let (_directory, mut once) = load("", &once, grants.clone());
+    once.frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(once.control_modes(), Some(staged_modes()));
+    once.frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(once.control_modes(), None, "omission expires renewed modes");
+
+    let (_directory, mut denied) = load("", CONTROL_MODES, ModGrants::default());
+    denied
+        .frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(denied.control_modes(), None);
+
+    let (_directory, mut omitted) = load(CONTROL_MODES, "", grants.clone());
+    omitted
+        .frame_with_controls(false, Some(snapshot()), focused_controls())
+        .unwrap();
+    assert_eq!(
+        omitted.control_modes(),
+        None,
+        "init does not set frame modes"
+    );
+
+    let (_directory, mut trapped) = load("", &format!("{CONTROL_MODES} unreachable"), grants);
+    assert!(
+        trapped
+            .frame_with_controls(false, Some(snapshot()), focused_controls())
+            .is_err()
+    );
+    assert!(!trapped.is_active());
+    assert_eq!(trapped.control_modes(), None);
+}
+
+/// Components compiled against the original gameplay interface still instantiate unchanged.
+#[test]
+fn legacy_gameplay_component_keeps_its_original_import_type() {
+    let directory = tempfile::tempdir().unwrap();
+    let package = include_str!("../../../mod-api/wit/extension.wit")
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("package ")
+        .trim_end_matches(';');
+    let (name, version) = package.split_once('@').unwrap();
+    let source = include_str!("gameplay_0_1.wat")
+        .replace("$GAMEPLAY", &format!("{name}/gameplay@{version}"))
+        .replace("$INIT", "")
+        .replace("$FRAME", "i32.const 128 call $read i32.const 176 i32.load8_u i32.const 1 i32.ne if unreachable end");
+    let mut host = ModHost::load_snapshot_with_grants(
+        &directory.path().join("legacy-gameplay.wat"),
+        source.as_bytes(),
+        grants(),
+    )
+    .unwrap();
+    host.frame_with_gameplay(false, Some(snapshot())).unwrap();
+    assert!(host.is_active());
+}
+
+/// Both canonical record layouts run, including legacy physical holds, without changing gates.
+#[test]
+fn movement_records_keep_built_guests_and_current_imports_running() {
+    for fixture in [
+        include_str!("movement.wat"),
+        include_str!("movement_0_1.wat"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut host = ModHost::load_snapshot_with_grants(
+            &directory.path().join("movement.wat"),
+            fixture.as_bytes(),
+            ModGrants {
+                movement: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let movement = GameplayMovementSnapshot {
+            session: 1,
+            dimension: 0,
+            tick: 5,
+            velocity: GameplayVector3 {
+                x: 0.,
+                y: 0.,
+                z: 0.,
+            },
+            on_ground: true,
+            eligible: true,
+            jump_held: true,
+            sprint_held: true,
+            sneak_held: true,
+            knockback_sequence: 2,
+        };
+        let mut controls = crate::empty_controls();
+        controls.focused = true;
+        controls.gameplay = true;
+        host.frame_with_movement(
+            false,
+            Some(GameplaySnapshot {
+                session: 1,
+                dimension: 0,
+                ..snapshot()
+            }),
+            Vec::new(),
+            None,
+            Some(movement),
+            controls,
+        )
+        .unwrap();
+        assert!(host.is_active());
+    }
+}

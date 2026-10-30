@@ -1,0 +1,185 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+mod artifacts;
+#[cfg(test)]
+mod completion_plan;
+mod conditions;
+mod contracts;
+mod dependencies;
+mod identifiers;
+mod markers;
+mod modules;
+mod paths;
+mod platforms;
+mod policy;
+mod reads;
+mod reexports;
+mod rust_scope;
+mod sources;
+mod timing;
+mod workspace_docs;
+
+use dependencies::check_dependencies;
+use markers::check_markers;
+use paths::{ignored_directory, is_vendored, relative_slash};
+use policy::Policy;
+use sources::{check_artifacts, check_sources};
+use timing::check_timing;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArchitectureError {
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to parse {path}: {source}")]
+    Policy {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+}
+
+pub fn check_repository(root: &Path, policy_path: &Path) -> Result<Vec<String>, ArchitectureError> {
+    let policy_text = read(policy_path)?;
+    let policy =
+        toml::from_str::<Policy>(&policy_text).map_err(|source| ArchitectureError::Policy {
+            path: policy_path.to_path_buf(),
+            source,
+        })?;
+    let mut files = match git_visible_files(root) {
+        Some(files) => files
+            .into_iter()
+            .filter(|path| {
+                let relative = relative_slash(root, path);
+                !ignored_directory(&relative) && !is_vendored(&relative, &policy)
+            })
+            .collect(),
+        None => {
+            let mut files = Vec::new();
+            collect_files(root, root, &policy, &mut files)?;
+            files
+        }
+    };
+    files.sort();
+
+    let mut diagnostics = Vec::new();
+    check_vendor_records(root, &policy, &mut diagnostics);
+    check_artifacts(root, &policy, &files, &mut diagnostics);
+    artifacts::check_binary_artifacts(root, &policy, &files, &mut diagnostics)?;
+    check_sources(root, &policy, &files, &mut diagnostics)?;
+    contracts::check_contracts(root, &policy, &files, &mut diagnostics)?;
+    reexports::check_reexports(root, &policy, &files, &mut diagnostics)?;
+    check_dependencies(root, &policy, &mut diagnostics)?;
+    workspace_docs::check_workspace_docs(root, &policy, &mut diagnostics)?;
+    modules::check_modules(root, &policy, &files, &mut diagnostics)?;
+    check_markers(root, &policy, &files, &mut diagnostics)?;
+    platforms::check_platforms(root, &policy, &files, &mut diagnostics)?;
+    reads::check_reads(root, &policy, &files, &mut diagnostics)?;
+    check_timing(root, &policy, &files, &mut diagnostics)?;
+    identifiers::check_identifiers(root, &policy, &files, &mut diagnostics)?;
+    diagnostics.sort();
+    diagnostics.dedup();
+    Ok(diagnostics)
+}
+
+fn check_vendor_records(root: &Path, policy: &Policy, diagnostics: &mut Vec<String>) {
+    for rule in &policy.vendored {
+        let record = root.join(&rule.ownership_record);
+        if !record.is_file() {
+            diagnostics.push(format!(
+                "vendored path `{}` has missing ownership record `{}`",
+                rule.path, rule.ownership_record
+            ));
+        }
+    }
+    for rule in &policy.owned_artifacts {
+        let named = fs::read_to_string(root.join(&rule.ownership_record))
+            .is_ok_and(|record| record.contains(&rule.path));
+        if !named {
+            diagnostics.push(format!(
+                "owned artifact path `{}` is not named by ownership record `{}`",
+                rule.path, rule.ownership_record
+            ));
+        }
+    }
+}
+
+pub(crate) fn read(path: &Path) -> Result<String, ArchitectureError> {
+    fs::read_to_string(path).map_err(|source| ArchitectureError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Files git tracks or would add, so ignored trees such as nested worktrees are never scanned.
+/// `None` outside a git checkout, where the directory walk applies.
+fn git_visible_files(root: &Path) -> Option<Vec<PathBuf>> {
+    if !root.join(".git").exists() {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| root.join(String::from_utf8_lossy(name).as_ref()))
+            .filter(|path| path.is_file())
+            .collect(),
+    )
+}
+
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    policy: &Policy,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), ArchitectureError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|source| ArchitectureError::Read {
+            path: directory.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ArchitectureError::Read {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let relative = relative_slash(root, &path);
+        if entry
+            .file_type()
+            .map_err(|source| ArchitectureError::Read {
+                path: path.clone(),
+                source,
+            })?
+            .is_dir()
+        {
+            if ignored_directory(&relative) || is_vendored(&relative, policy) {
+                continue;
+            }
+            collect_files(root, &path, policy, files)?;
+        } else {
+            files.push(path);
+        }
+    }
+    Ok(())
+}

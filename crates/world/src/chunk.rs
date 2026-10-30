@@ -1,0 +1,231 @@
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
+
+use crate::{
+    BiomeStorage, BlockEntityKey, BlockEntityNbt, DecodedBiomeColumn, SubChunk,
+    mesh_neighbourhood::LIQUID_SAMPLE_OFFSETS,
+};
+
+/// Key for one horizontal chunk column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ChunkKey {
+    pub dimension: i32,
+    pub x: i32,
+    pub z: i32,
+}
+
+impl ChunkKey {
+    #[must_use]
+    pub const fn new(dimension: i32, x: i32, z: i32) -> Self {
+        Self { dimension, x, z }
+    }
+}
+
+/// Key for one vertical sub-chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubChunkKey {
+    pub dimension: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl SubChunkKey {
+    #[must_use]
+    pub const fn new(dimension: i32, x: i32, y: i32, z: i32) -> Self {
+        Self { dimension, x, y, z }
+    }
+
+    #[must_use]
+    pub const fn from_chunk(chunk: ChunkKey, y: i32) -> Self {
+        Self::new(chunk.dimension, chunk.x, y, chunk.z)
+    }
+
+    #[must_use]
+    pub const fn chunk(self) -> ChunkKey {
+        ChunkKey::new(self.dimension, self.x, self.z)
+    }
+
+    /// Meshes invalidated when this sub-chunk's block data changes.
+    ///
+    /// Face culling crosses sub-chunk boundaries, so the changed key and all
+    /// six face-adjacent keys must be considered for remeshing. Coordinates at
+    /// the `i32` edge omit the overflowing neighbour.
+    pub fn mesh_dependents(self) -> impl Iterator<Item = Self> {
+        let x_minus = self
+            .x
+            .checked_sub(1)
+            .map(|x| Self::new(self.dimension, x, self.y, self.z));
+        let x_plus = self
+            .x
+            .checked_add(1)
+            .map(|x| Self::new(self.dimension, x, self.y, self.z));
+        let y_minus = self
+            .y
+            .checked_sub(1)
+            .map(|y| Self::new(self.dimension, self.x, y, self.z));
+        let y_plus = self
+            .y
+            .checked_add(1)
+            .map(|y| Self::new(self.dimension, self.x, y, self.z));
+        let z_minus = self
+            .z
+            .checked_sub(1)
+            .map(|z| Self::new(self.dimension, self.x, self.y, z));
+        let z_plus = self
+            .z
+            .checked_add(1)
+            .map(|z| Self::new(self.dimension, self.x, self.y, z));
+        [
+            Some(self),
+            x_minus,
+            x_plus,
+            y_minus,
+            y_plus,
+            z_minus,
+            z_plus,
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Every bounded sub-chunk whose AO or liquid geometry can sample this
+    /// sub-chunk, including face, edge, and corner offsets.
+    pub fn mesh_neighbourhood_dependents(self) -> impl Iterator<Item = Self> {
+        (-1_i32..=1).flat_map(move |dx| {
+            (-1_i32..=1).flat_map(move |dy| {
+                (-1_i32..=1).filter_map(move |dz| {
+                    Some(Self::new(
+                        self.dimension,
+                        self.x.checked_add(dx)?,
+                        self.y.checked_add(dy)?,
+                        self.z.checked_add(dz)?,
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Every mesh whose 3D biome lattice can sample this source.
+    pub fn biome_mesh_dependents(self) -> impl Iterator<Item = Self> {
+        self.mesh_neighbourhood_dependents()
+    }
+
+    /// Every mesh whose bounded liquid sample set can reference this source.
+    ///
+    /// This is the checked inverse of `MeshNeighbourhood::liquid_sample_offsets`:
+    /// two horizontal 3x3 target layers plus the inverse lower-center/cardinal
+    /// flow samples. It does
+    /// not widen ordinary face-only cube invalidation.
+    pub fn liquid_mesh_dependents(self) -> impl Iterator<Item = Self> {
+        LIQUID_SAMPLE_OFFSETS
+            .into_iter()
+            .filter_map(move |[dx, dy, dz]| {
+                Some(Self::new(
+                    self.dimension,
+                    self.x.checked_sub(i32::from(dx))?,
+                    self.y.checked_sub(i32::from(dy))?,
+                    self.z.checked_sub(i32::from(dz))?,
+                ))
+            })
+    }
+}
+
+/// Sparse block data for one chunk column.
+#[derive(Debug, Default)]
+pub struct Chunk {
+    pub(crate) sub_chunks: Arc<BTreeMap<i32, Arc<SubChunk>>>,
+    pub(crate) biomes: Option<DecodedBiomeColumn>,
+    pub(crate) block_entities: Arc<BTreeMap<BlockEntityKey, Arc<BlockEntityNbt>>>,
+    pub(crate) block_entity_bytes: usize,
+}
+
+impl Chunk {
+    #[must_use]
+    pub fn sub_chunk(&self, y: i32) -> Option<Arc<SubChunk>> {
+        self.sub_chunks.get(&y).cloned()
+    }
+
+    pub fn sub_chunks(&self) -> impl ExactSizeIterator<Item = (i32, Arc<SubChunk>)> + '_ {
+        self.sub_chunks
+            .iter()
+            .map(|(&y, sub_chunk)| (y, Arc::clone(sub_chunk)))
+    }
+
+    /// Retains the immutable section index; edits copy the index only while a job holds it.
+    pub fn shared_sub_chunks(&self) -> Arc<BTreeMap<i32, Arc<SubChunk>>> {
+        Arc::clone(&self.sub_chunks)
+    }
+
+    /// Returns the packed biome storage for one absolute sub-chunk Y.
+    #[must_use]
+    pub fn biome_storage(&self, y: i32) -> Option<Arc<BiomeStorage>> {
+        self.biomes.as_ref()?.storage(y)
+    }
+
+    #[must_use]
+    pub fn block_entity(&self, key: BlockEntityKey) -> Option<Arc<BlockEntityNbt>> {
+        self.block_entities.get(&key).cloned()
+    }
+
+    pub fn block_entities(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (BlockEntityKey, Arc<BlockEntityNbt>)> + '_ {
+        self.block_entities
+            .iter()
+            .map(|(&key, value)| (key, Arc::clone(value)))
+    }
+
+    /// The block entities of this column inside the sub-chunk `key`, found by one key range per
+    /// x column rather than by visiting the column's every block entity.
+    pub fn sub_chunk_block_entities(
+        &self,
+        key: SubChunkKey,
+    ) -> impl Iterator<Item = (BlockEntityKey, &Arc<BlockEntityNbt>)> + '_ {
+        let side = crate::SUB_CHUNK_SIDE as i32;
+        // Each block coordinate fits an i32, so a sub-chunk whose span does not holds nothing.
+        let span = |axis: i32| {
+            let low = axis.checked_mul(side)?;
+            Some((low, low.checked_add(side - 1)?))
+        };
+        let columns = span(key.x).zip(span(key.y));
+        columns
+            .into_iter()
+            .flat_map(move |((west, east), (bottom, top))| {
+                (west..=east).flat_map(move |x| {
+                    self.block_entities
+                        .range(
+                            BlockEntityKey::new(key.dimension, x, bottom, i32::MIN)
+                                ..=BlockEntityKey::new(key.dimension, x, top, i32::MAX),
+                        )
+                        .filter(move |(entity, _)| entity.sub_chunk() == key)
+                        .map(|(&entity, nbt)| (entity, nbt))
+                })
+            })
+    }
+
+    /// Retains the immutable block entity index; any edit replaces it or detaches its weak
+    /// references, so a held `Weak` shows whether the column's block entities changed.
+    pub fn shared_block_entities(&self) -> Arc<BTreeMap<BlockEntityKey, Arc<BlockEntityNbt>>> {
+        Arc::clone(&self.block_entities)
+    }
+
+    /// Whether `index`, taken from [`Self::shared_sub_chunks`], still names this column's
+    /// section index, without touching reference counts: a held `Weak` keeps its allocation
+    /// alive, and every edit after it was taken moves the index to another allocation.
+    #[must_use]
+    pub fn holds_sub_chunks(&self, index: &Weak<BTreeMap<i32, Arc<SubChunk>>>) -> bool {
+        std::ptr::eq(index.as_ptr(), Arc::as_ptr(&self.sub_chunks))
+    }
+
+    /// [`Self::holds_sub_chunks`] for the index from [`Self::shared_block_entities`].
+    #[must_use]
+    pub fn holds_block_entities(
+        &self,
+        index: &Weak<BTreeMap<BlockEntityKey, Arc<BlockEntityNbt>>>,
+    ) -> bool {
+        std::ptr::eq(index.as_ptr(), Arc::as_ptr(&self.block_entities))
+    }
+}

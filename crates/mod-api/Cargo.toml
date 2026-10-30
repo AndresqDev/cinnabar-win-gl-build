@@ -1,0 +1,22 @@
+[package]
+name = "mod-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+reads = [
+    "crates/experience-sdk/wit/client/deps/server-experience",
+    "crates/experience-sdk/wit/session",
+]
+
+[dependencies]
+wit-bindgen.workspace = true
+serde = { version = "=1.0.228", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "=1.0.150"
+
+[lints]
+workspace = true

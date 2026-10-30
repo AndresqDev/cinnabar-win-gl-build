@@ -1,0 +1,105 @@
+use super::*;
+use protocol::identity::FifoSequence;
+use render_api::PoseGeneration;
+use semantic_input::identity::InputAuthorityGeneration;
+use simulation_clock::PhysicsTick;
+use simulation_clock::identity::SessionGeneration;
+use std::num::NonZeroU64;
+
+use crate::semantic_controls::{
+    SemanticInputAuthorityFrame, SemanticInputRuntime, SemanticTouchTargets,
+};
+use bevy::math::Mat4;
+use client_presentation::camera::{CameraSettingsAuthority, perspective_pose};
+use client_presentation::local_player::{
+    CameraPose, InteractionOriginSnapshot, LocalAvatarPresentation, LocalAvatarVisibilityCarrier,
+    LocalPlayerFrameCarrier, LocalPlayerFrameReset, LocalPlayerFrameSample, LocalViewPose,
+};
+use client_ui::ui_runtime::UiRuntime;
+use render_model::MAX_RENDERED_PLAYERS;
+use semantic_input::{
+    Action, ControlSettings, ControllerFrame, DeviceFrame, InputContext, KeyboardMouseFrame,
+    ReleaseReason, TouchContact,
+};
+use {
+    crate::runtime::movement_evidence::MovementEvidenceEmitter,
+    acceptance::movement_evidence::{
+        MAX_MOVEMENT_EVENT_RECORDS, MAX_MOVEMENT_FAULT_RECORDS, MAX_MOVEMENT_FRAME_RECORDS,
+        MovementEvidenceEventKind, MovementEvidenceFrame, MovementEvidenceIdentity,
+        validate_movement_build_source,
+    },
+};
+use {
+    client_interaction::movement::fault_observation::PhysicsAuthorityFaultRecord,
+    gameplay::movement::{
+        MovementOutboxReconciliation, MovementSource, PhysicsAuthorityFault,
+        PhysicsCorrectionOutcome, PhysicsTickEvidence, PhysicsTickEvidenceContext,
+    },
+    render_model::ActorCullView,
+    render_scene::{ActorRenderScene, ActorRenderSource},
+};
+
+fn frozen_collision_identity() -> sim::WorldCollisionIdentity {
+    sim::WorldCollisionIdentity::new(
+        sim::CollisionRegistryIdentity {
+            protocol: 1001,
+            id_space: sim::CollisionIdSpace::Sequential,
+            preg_sha256: [0x3a; 32],
+        },
+        [
+            world::ChunkCollisionRevision {
+                chunk: world::ChunkKey::new(0, -2, 7),
+                revision: 19,
+            },
+            world::ChunkCollisionRevision {
+                chunk: world::ChunkKey::new(0, -1, 7),
+                revision: 23,
+            },
+        ],
+    )
+    .unwrap()
+}
+
+fn frozen_local_player_sample_for(
+    perspective: semantic_input::PerspectiveMode,
+) -> LocalPlayerFrameSample {
+    let eye = Vec3::new(8.0, 72.62, -4.0);
+    let rotation = Quat::from_euler(bevy::math::EulerRot::YXZ, 0.8, -0.25, 0.0);
+    LocalPlayerFrameSample {
+        session_generation: SessionGeneration::new(7),
+        actor_session_id: 3,
+        fifo_sequence: FifoSequence::new(41),
+        physics_tick: PhysicsTick::new(900),
+        perspective,
+        world_collision_identity: frozen_collision_identity(),
+        pose: perspective_pose(eye, rotation, perspective),
+        eye,
+        feet: eye - Vec3::Y * protocol::PLAYER_NETWORK_OFFSET,
+        rotation,
+    }
+}
+
+fn frozen_local_player_sample() -> LocalPlayerFrameSample {
+    frozen_local_player_sample_for(semantic_input::PerspectiveMode::ThirdPersonBack)
+}
+
+include!("camera/correction_and_evidence.rs");
+include!("camera/presentation_and_input.rs");
+include!("camera/crouch.rs");
+
+#[test]
+fn review_overflowing_quaternion_norm_is_rejected_without_publication() {
+    let mut carrier = LocalPlayerFrameCarrier::default();
+    let original = frozen_local_player_sample();
+    carrier.publish(original.clone()).unwrap();
+    let before = carrier.clone();
+    let invalid = Quat::from_xyzw(f32::MAX, f32::MAX, f32::MAX, f32::MAX);
+    let mut sample = original;
+    sample.rotation = invalid;
+    assert!(carrier.publish(sample).is_err());
+    assert_eq!(carrier, before);
+    let mut pose = LocalViewPose::default();
+    let before = pose;
+    pose.set_rotation(invalid);
+    assert_eq!(pose, before);
+}

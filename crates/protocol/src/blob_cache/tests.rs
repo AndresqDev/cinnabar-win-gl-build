@@ -1,0 +1,617 @@
+use bedrock_protocol_1_26_60::types;
+
+use super::*;
+
+#[test]
+fn private_level_chunk_ready_lane_aliases_bytes_while_public_pop_returns_independent_vec() {
+    let event = crate::LevelChunkEvent {
+        dimension: 0,
+        x: 1,
+        z: 2,
+        mode: crate::LevelChunkMode::Inline { count: 0 },
+        payload: Vec::new(),
+    };
+    let payload = bytes::Bytes::from(vec![0x7c; 1024 * 1024]);
+    let pointer = payload.as_ptr();
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    resolver
+        .accept_level_chunk_bytes(event.clone(), payload, 1024 * 1024)
+        .expect("admit private LevelChunk bytes");
+    let Some(ResolverReady::LevelChunkBytes(_, payload)) = resolver.pop_ready_ingress() else {
+        panic!("private pop must retain the byte-bearing variant")
+    };
+    assert_eq!(payload.as_ptr(), pointer);
+
+    resolver
+        .accept_level_chunk_bytes(event, payload, 1024 * 1024)
+        .expect("readmit private LevelChunk bytes");
+    let Some(BlobCacheReady::WorldEvent(WorldEvent::LevelChunk(legacy))) = resolver.pop_ready()
+    else {
+        panic!("public pop must preserve the legacy WorldEvent surface")
+    };
+    assert_ne!(legacy.payload.as_ptr(), pointer);
+    assert_eq!(legacy.payload, vec![0x7c; 1024 * 1024]);
+}
+
+/// Builds a cache-enabled LevelChunk for one column referencing `hashes`.
+///
+/// 1.26.40 writes the blob hashes unconditionally and states cache
+/// participation with `cache_enabled`, so the protocol-1001 `blobs: Some(..)`
+/// literal has no direct equivalent. `sub_chunks_count` is 0 because
+/// gophertunnel's packet/level_chunk.go expects SubChunkCount + 1 hashes and
+/// these fixtures carry exactly one; the old -1 request-mode sentinel is gone.
+pub(super) fn cached_level_chunk(x: i32, hashes: Vec<u64>) -> LevelChunk {
+    let sub_chunks_count = u32::try_from(hashes.len().saturating_sub(1)).expect("fixture count");
+    LevelChunk {
+        chunk_position: types::ChunkPos {
+            x: wire::ZigZag32(x),
+            z: wire::ZigZag32(0),
+        },
+        sub_chunks_count: wire::VarUInt(sub_chunks_count),
+        cache_enabled: true,
+        cache_metadata: hashes.into_iter().map(types::SubChunkMetadata).collect(),
+        ..Default::default()
+    }
+}
+
+/// Builds one sub-chunk entry at the given offset.
+fn sub_chunk_entry(
+    dx: i8,
+    dy: i8,
+    dz: i8,
+    result: SubChunkRequestResult,
+    payload: Option<Vec<u8>>,
+    blob_id: Option<u64>,
+) -> SubChunkData {
+    SubChunkData {
+        sub_chunk_pos_offset: types::SubChunkPosOffset {
+            subchunk_offset_x: wire::I8(dx),
+            subchunk_offset_y: wire::I8(dy),
+            subchunk_offset_z: wire::I8(dz),
+        },
+        sub_chunk_request_result: result,
+        serialized_sub_chunk: payload.map(bytes::Bytes::from),
+        blob_id: blob_id.map(wire::U64LE),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn ready_subchunk_accounting_uses_retained_entry_capacity_and_payload_bytes() {
+    let mut payload = Vec::with_capacity(4_096);
+    payload.push(0x5a);
+    let mut entries = Vec::with_capacity(16);
+    entries.push(sub_chunk_entry(
+        0,
+        0,
+        0,
+        SubChunkRequestResult::Success,
+        Some(payload),
+        None,
+    ));
+    let expected = size_of::<SubChunk>()
+        + entries.capacity() * size_of::<SubChunkData>()
+        + entries[0]
+            .serialized_sub_chunk
+            .as_ref()
+            .expect("fixture payload")
+            .len();
+    let value = BlobCacheReady::Packet(crate::Packet::new(SubChunk {
+        cache_enabled: false,
+        sub_chunk_data: entries,
+        ..Default::default()
+    }));
+
+    assert_eq!(
+        ready_value_accounted_bytes(&ResolverReady::from(value)),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn pending_queue_high_water_is_exact_and_reset_releases_backing_allocations() {
+    let cache = ClientBlobCache::default();
+    let mut resolver = BlobCacheResolver::new(cache);
+    for x in 0..8 {
+        let payload = [x as u8];
+        let hash = client_blob_hash(&payload);
+        resolver
+            .accept_cached_packet(crate::Packet::new(cached_level_chunk(x, vec![hash])))
+            .expect("grow unresolved pending queue");
+    }
+    assert!(resolver.pending.capacity() >= 8);
+    assert_eq!(
+        resolver.stats.pending_bytes,
+        resolver
+            .retained_cached_bytes()
+            .expect("exact retained bytes")
+    );
+
+    resolver.reset_pending();
+
+    assert_eq!(resolver.pending.capacity(), 0);
+    assert!(resolver.ready.is_empty());
+    assert_eq!(resolver.pending_by_hash.capacity(), 0);
+    assert_eq!(resolver.stats.pending_bytes, 0);
+}
+
+#[test]
+fn pending_accounting_includes_owned_hash_capacity() {
+    let hashes = vec![
+        client_blob_hash(b"owned-0"),
+        client_blob_hash(b"owned-1"),
+        client_blob_hash(b"owned-2"),
+    ];
+    let packet = LevelChunk {
+        serialized_chunk_data: bytes::Bytes::from_static(b"retained-payload"),
+        ..cached_level_chunk(0, hashes.clone())
+    };
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    resolver
+        .accept_cached_packet(crate::Packet::new(packet))
+        .expect("retain the unresolved transaction");
+
+    let transaction = resolver
+        .pending
+        .values()
+        .next()
+        .expect("the missing hashes remain pending");
+    let PendingPacket::LevelChunk(packet) = &transaction.packet else {
+        panic!("expected a pending LevelChunk");
+    };
+    let packet_bytes = size_of::<LevelChunk>()
+        + packet.serialized_chunk_data.len()
+        + packet.cache_metadata.capacity() * size_of::<u64>();
+    let expected = packet_bytes
+        + transaction.hashes.capacity() * size_of::<u64>()
+        + transaction.unique_hashes.capacity() * size_of::<u64>()
+        + transaction.owned_hashes.capacity() * size_of::<u64>();
+    assert_eq!(transaction.accounted_bytes, expected);
+    assert_eq!(transaction.owned_hashes, hashes);
+}
+
+#[test]
+fn recovery_index_has_deterministically_bounded_ordering_work() {
+    const RECOVERY_COUNT: usize = 4_096;
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    RECOVERY_ORDER_COMPARISONS.store(0, AtomicOrdering::Relaxed);
+
+    for x in 0..RECOVERY_COUNT {
+        resolver.enqueue_recovery(ChunkResyncEvent {
+            dimension: 0,
+            x: i32::try_from(x).expect("test coordinate fits"),
+            z: 0,
+            requested_sub_chunks: None,
+            requested_sub_chunk_ys: None,
+        });
+    }
+
+    let comparisons = RECOVERY_ORDER_COMPARISONS.load(AtomicOrdering::Relaxed);
+    assert_eq!(resolver.recovery_ready.len(), RECOVERY_COUNT);
+    assert!(
+        comparisons < RECOVERY_COUNT * 64,
+        "recovery index ordering work grew unexpectedly: {comparisons} comparisons"
+    );
+}
+
+#[test]
+fn classify_and_pin_is_one_cache_operation() {
+    let limits = BlobCacheLimits {
+        trim_trigger_bytes: 4,
+        trim_floor_bytes: 3,
+    };
+    let cache = ClientBlobCache::with_limits(limits);
+    let hit = cache.insert(b"hit").expect("seed hit");
+    let miss = client_blob_hash(b"miss");
+
+    let (have, missing, staged_bytes) = cache.classify(&[hit, miss], true);
+
+    assert_eq!(have, vec![hit]);
+    assert_eq!(missing, vec![miss]);
+    assert_eq!(staged_bytes, 3);
+    let new = cache
+        .insert(b"new")
+        .expect("cache pressure never refuses an insert");
+    assert!(cache.contains(hit), "reported hit is already pinned");
+    assert!(
+        cache.contains(new),
+        "the triggering insert remains admitted"
+    );
+    cache.unpin_all(&[hit, miss]);
+}
+
+#[test]
+fn arriving_blob_visits_only_transactions_in_its_hash_index_bucket() {
+    let shared_payload = b"shared-index";
+    let shared = client_blob_hash(shared_payload);
+    let other = client_blob_hash(b"other-index");
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    for (x, hash) in [(1, shared), (2, shared), (3, other)] {
+        resolver
+            .accept_cached_packet(crate::Packet::new(cached_level_chunk(x, vec![hash])))
+            .expect("index pending transaction by its missing hash");
+    }
+    assert_eq!(resolver.pending_by_hash[&shared].transactions.len(), 2);
+    assert_eq!(resolver.pending_by_hash[&other].transactions.len(), 1);
+
+    resolver
+        .accept_miss_response(ClientCacheMissResponse {
+            missing_blobs: vec![MissingBlobData {
+                blob_id: wire::U64LE(shared),
+                blob_data: shared_payload.to_vec().into(),
+            }],
+        })
+        .expect("resolve only the shared index bucket");
+
+    assert!(!resolver.pending_by_hash.contains_key(&shared));
+    assert_eq!(resolver.pending_by_hash[&other].transactions.len(), 1);
+    assert_eq!(resolver.pending.len(), 1);
+    assert_eq!(resolver.ready.len(), 2);
+}
+
+/// A repeated resolved blob must not discard a different column's outstanding payload.
+#[test]
+fn late_duplicate_blob_does_not_abandon_another_column() {
+    let old_payload = b"previously resolved column";
+    let new_payload = b"new outstanding column";
+    let old_hash = client_blob_hash(old_payload);
+    let new_hash = client_blob_hash(new_payload);
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    resolver
+        .accept_cached_packet(crate::Packet::new(cached_level_chunk(1, vec![old_hash])))
+        .unwrap();
+    resolver
+        .accept_miss_response(ClientCacheMissResponse {
+            missing_blobs: vec![MissingBlobData {
+                blob_id: wire::U64LE(old_hash),
+                blob_data: old_payload.to_vec().into(),
+            }],
+        })
+        .unwrap();
+    assert!(matches!(
+        resolver.pop_ready(),
+        Some(BlobCacheReady::Packet(_))
+    ));
+
+    resolver
+        .accept_cached_packet(crate::Packet::new(cached_level_chunk(2, vec![new_hash])))
+        .unwrap();
+    resolver
+        .accept_miss_response(ClientCacheMissResponse {
+            missing_blobs: vec![
+                MissingBlobData {
+                    blob_id: wire::U64LE(old_hash),
+                    blob_data: old_payload.to_vec().into(),
+                },
+                MissingBlobData {
+                    blob_id: wire::U64LE(new_hash),
+                    blob_data: new_payload.to_vec().into(),
+                },
+            ],
+        })
+        .unwrap();
+
+    let ready = resolver.pop_ready();
+    let Some(BlobCacheReady::Packet(packet)) = ready else {
+        panic!("a valid current column must reconstruct without recovery: {ready:?}");
+    };
+    let packets::Packet::LevelChunk(packet) = *packet.data else {
+        panic!("expected the current column");
+    };
+    assert_eq!(packet.chunk_position.x.0, 2);
+    assert_eq!(&packet.serialized_chunk_data[..], new_payload);
+    assert_eq!(resolver.stats().abandoned_cached_transactions, 0);
+    assert_eq!(
+        resolver.cache().get(old_hash).unwrap().as_ref(),
+        old_payload
+    );
+}
+
+/// An invalid repeated payload cannot admit an earlier valid entry in the same response.
+#[test]
+fn late_duplicate_response_still_validates_entire_batch() {
+    let old_payload = b"previously verified column";
+    let new_payload = b"new outstanding column";
+    let cache = ClientBlobCache::default();
+    let old_hash = cache.insert(old_payload).unwrap();
+    let new_hash = client_blob_hash(new_payload);
+    let mut resolver = BlobCacheResolver::new(cache);
+    resolver
+        .accept_cached_packet(crate::Packet::new(cached_level_chunk(2, vec![new_hash])))
+        .unwrap();
+    resolver
+        .accept_miss_response(ClientCacheMissResponse {
+            missing_blobs: vec![
+                MissingBlobData {
+                    blob_id: wire::U64LE(new_hash),
+                    blob_data: new_payload.to_vec().into(),
+                },
+                MissingBlobData {
+                    blob_id: wire::U64LE(old_hash),
+                    blob_data: b"changed repeated payload".to_vec().into(),
+                },
+            ],
+        })
+        .unwrap();
+
+    assert!(!resolver.cache().contains(new_hash));
+    assert_eq!(
+        resolver.cache().get(old_hash).unwrap().as_ref(),
+        old_payload
+    );
+    assert!(matches!(
+        resolver.pop_ready(),
+        Some(BlobCacheReady::WorldEvent(WorldEvent::ChunkResync(_)))
+    ));
+    assert_eq!(resolver.stats().miss_response_integrity_rejection, 1);
+}
+
+/// Unneeded payloads are ignored without losing the requested part of their batch.
+#[test]
+fn unsolicited_blob_does_not_discard_a_needed_reply() {
+    let requested_payload = b"requested column";
+    let unknown_payload = b"never requested column";
+    let requested_hash = client_blob_hash(requested_payload);
+    let unknown_hash = client_blob_hash(unknown_payload);
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    resolver
+        .accept_cached_packet(crate::Packet::new(cached_level_chunk(
+            2,
+            vec![requested_hash],
+        )))
+        .unwrap();
+    resolver
+        .accept_miss_response(ClientCacheMissResponse {
+            missing_blobs: vec![
+                MissingBlobData {
+                    blob_id: wire::U64LE(requested_hash),
+                    blob_data: requested_payload.to_vec().into(),
+                },
+                MissingBlobData {
+                    blob_id: wire::U64LE(unknown_hash),
+                    blob_data: unknown_payload.to_vec().into(),
+                },
+            ],
+        })
+        .unwrap();
+
+    assert!(resolver.cache().contains(requested_hash));
+    assert!(!resolver.cache().contains(unknown_hash));
+    assert!(matches!(
+        resolver.pop_ready(),
+        Some(BlobCacheReady::Packet(packet))
+            if matches!(*packet.data, packets::Packet::LevelChunk(_))
+    ));
+    assert!(resolver.pop_ready().is_none());
+    assert_eq!(resolver.stats().miss_response_unsolicited, 1);
+    assert_eq!(resolver.stats().recovery_requests, 0);
+}
+
+#[test]
+fn retained_cached_subchunk_emits_admission_before_reconstruction() {
+    let payload = b"admitted-subchunk";
+    let hash = client_blob_hash(payload);
+    let packet = crate::Packet::new(SubChunk {
+        cache_enabled: true,
+        dimension_type: DimensionType(2),
+        center_pos: types::SubChunkPos {
+            subchunk_position_x: wire::I32LE(4),
+            subchunk_position_y: wire::I32LE(-4),
+            subchunk_position_z: wire::I32LE(9),
+        },
+        sub_chunk_data: vec![
+            sub_chunk_entry(
+                0,
+                1,
+                -1,
+                SubChunkRequestResult::Success,
+                Some(payload.to_vec()),
+                Some(hash),
+            ),
+            sub_chunk_entry(1, 2, 0, SubChunkRequestResult::SuccessAllAir, None, None),
+        ],
+    });
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    let mut status = resolver
+        .accept_cached_packet(packet)
+        .expect("retain cached SubChunk while waiting for its miss");
+
+    assert_eq!(
+        status.take_admission(),
+        Some(crate::SubChunkReplyAdmissionEvent {
+            dimension: 2,
+            positions: vec![[4, -3, 8], [5, -2, 9]],
+        })
+    );
+    assert!(
+        resolver.pop_ready().is_none(),
+        "reconstructed SubChunks remain behind the unresolved miss"
+    );
+}
+
+#[test]
+fn pressure_rotated_cached_subchunk_has_recovery_without_admission() {
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    for x in 0..MAX_CLIENT_BLOB_PENDING_TRANSACTIONS {
+        let payload = format!("pressure-{x}");
+        let hash = client_blob_hash(payload.as_bytes());
+        resolver
+            .accept_cached_packet(crate::Packet::new(cached_level_chunk(
+                i32::try_from(x).expect("test coordinate fits"),
+                vec![hash],
+            )))
+            .expect("fill the bounded cached transaction window");
+    }
+
+    let payload = b"pressure-subchunk";
+    let hash = client_blob_hash(payload);
+    let packet = crate::Packet::new(SubChunk {
+        cache_enabled: true,
+        sub_chunk_data: vec![sub_chunk_entry(
+            0,
+            0,
+            0,
+            SubChunkRequestResult::Success,
+            Some(payload.to_vec()),
+            Some(hash),
+        )],
+        ..Default::default()
+    });
+    let mut status = resolver
+        .accept_cached_packet(packet)
+        .expect("pressure rotation remains non-fatal");
+
+    assert!(status.take_admission().is_none());
+    assert!(status.take_recovery().is_some());
+    assert_eq!(
+        resolver.stats().pending_transactions,
+        MAX_CLIENT_BLOB_PENDING_TRANSACTIONS - 1
+    );
+}
+
+#[test]
+fn precounted_secondary_recovery_coalesces_without_double_counting() {
+    let mut resolver = BlobCacheResolver::new(ClientBlobCache::default());
+    resolver.enqueue_recovery(ChunkResyncEvent {
+        dimension: 0,
+        x: 999,
+        z: 0,
+        requested_sub_chunks: None,
+        requested_sub_chunk_ys: None,
+    });
+    for x in 0..MAX_CLIENT_BLOB_PENDING_TRANSACTIONS - 1 {
+        let payload = format!("coalesced-pressure-{x}");
+        resolver
+            .accept_cached_packet(crate::Packet::new(cached_level_chunk(
+                i32::try_from(x).expect("test coordinate fits"),
+                vec![client_blob_hash(payload.as_bytes())],
+            )))
+            .expect("fill every recovery slot except the queued event");
+    }
+
+    let mut status = resolver
+        .accept_cached_packet_with_size(
+            crate::Packet::new(cached_level_chunk(
+                999,
+                vec![client_blob_hash(b"oversized-current")],
+            )),
+            MAX_CLIENT_BLOB_PENDING_BYTES,
+        )
+        .expect("pending-byte rejection after rotation remains non-fatal");
+
+    assert_eq!(status.take_recovery().map(|recovery| recovery.x), Some(0));
+    assert_eq!(resolver.stats().recovery_ready_events, 1);
+    assert_eq!(
+        resolver.stats().recovery_requests,
+        2,
+        "one inline recovery plus one coalesced queued recovery are observable"
+    );
+}
+
+/// One trim examines each entry once instead of rescanning the cache per victim.
+#[test]
+fn trimming_many_small_blobs_examines_each_entry_once() {
+    const ENTRIES: usize = 4_096;
+    let limits = BlobCacheLimits {
+        trim_trigger_bytes: ENTRIES * 8,
+        trim_floor_bytes: ENTRIES * 4,
+    };
+    let mut store = CacheStore {
+        entries: HashMap::new(),
+        pins: HashMap::new(),
+        total_bytes: 0,
+        clock: 0,
+        ..Default::default()
+    };
+    for index in 0..ENTRIES as u64 {
+        store.clock += 1;
+        store.entries.insert(
+            index,
+            CacheEntry {
+                payload: Arc::from([0_u8; 8].as_slice()),
+                last_used: store.clock,
+            },
+        );
+        store.total_bytes += 8;
+    }
+    store.pins.insert(0, 1);
+    store.total_bytes += 1;
+
+    let examined = trim_if_needed(&mut store, limits, u64::MAX);
+
+    assert_eq!(examined, ENTRIES);
+    assert!(store.total_bytes <= limits.trim_floor_bytes);
+    assert!(store.entries.contains_key(&0), "pinned entries survive");
+    assert!(
+        !store.entries.contains_key(&1),
+        "the least recently used goes first"
+    );
+    assert!(store.entries.contains_key(&(ENTRIES as u64 - 1)));
+}
+
+/// Run: `cargo test -p protocol --lib blob_trim_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "benchmark"]
+fn blob_trim_cost_for_small_blobs() {
+    const ENTRIES: usize = 32_768;
+    let limits = BlobCacheLimits {
+        trim_trigger_bytes: ENTRIES * 64,
+        trim_floor_bytes: ENTRIES * 32,
+    };
+    let fill = || {
+        let mut store = CacheStore {
+            entries: HashMap::new(),
+            pins: HashMap::new(),
+            total_bytes: 1,
+            clock: 0,
+            ..Default::default()
+        };
+        for index in 0..ENTRIES as u64 {
+            store.clock += 1;
+            store.entries.insert(
+                index,
+                CacheEntry {
+                    payload: Arc::from([0_u8; 64].as_slice()),
+                    last_used: store.clock,
+                },
+            );
+            store.total_bytes += 64;
+        }
+        store
+    };
+    let mut store = fill();
+    let started = std::time::Instant::now();
+    while store.total_bytes > limits.trim_floor_bytes {
+        let Some((&evict, _)) = store
+            .entries
+            .iter()
+            .min_by_key(|(candidate, entry)| (entry.last_used, **candidate))
+        else {
+            break;
+        };
+        let removed = store.entries.remove(&evict).unwrap();
+        store.total_bytes -= removed.payload.len();
+    }
+    let old = started.elapsed();
+    let mut store = fill();
+    let started = std::time::Instant::now();
+    trim_if_needed(&mut store, limits, u64::MAX);
+    let new = started.elapsed();
+    eprintln!(
+        "FRAME_COST blob_trim_{ENTRIES}_entries: old={:.3}ms new={:.3}ms",
+        old.as_secs_f64() * 1e3,
+        new.as_secs_f64() * 1e3
+    );
+}
+
+#[test]
+fn review_tiny_blob_entries_have_a_metadata_bound() {
+    let cache = ClientBlobCache::with_limits(BlobCacheLimits {
+        trim_trigger_bytes: 1024 * 1024,
+        trim_floor_bytes: 1024 * 1024,
+    });
+    for value in 0..=MAX_CLIENT_BLOB_CACHE_ENTRIES as u32 {
+        cache.insert(&value.to_le_bytes()).unwrap();
+    }
+    assert!(cache.entry_count() <= MAX_CLIENT_BLOB_CACHE_ENTRIES);
+}

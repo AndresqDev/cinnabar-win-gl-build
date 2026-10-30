@@ -1,0 +1,375 @@
+//! Normalization coverage for the HUD-facing actor-state packets: mob effects,
+//! armor equipment, runtime game-mode changes, and rider links.
+
+use bedrock_protocol_1_26_60::enums::{
+    ActorLinkType as VendorActorLinkType, LevelGameType, MobEffectEvent as MobEffectPacketEventId,
+};
+use bedrock_protocol_1_26_60::packets::{
+    MobArmorEquipment, MobEffect, SetActorLink, SetDefaultGameType, SetPlayerGameType, StartGame,
+};
+use bedrock_protocol_1_26_60::types::{
+    ActorRuntimeID, ActorUniqueID, EntityLink, NetworkItemStackDescriptorSerializedData,
+    PlayerInputTick,
+};
+use bedrock_protocol_1_26_60::wire;
+use protocol::{
+    ActorEffectAction, ActorLinkType, PlayerGameMode, UiEvent, WorldEvent, into_world_event,
+};
+
+fn runtime_id(value: u64) -> ActorRuntimeID {
+    ActorRuntimeID(value)
+}
+
+#[test]
+fn mob_effect_normalizes_to_a_bounded_actor_effect_event() {
+    let packet = protocol::Packet::new(MobEffect {
+        target_runtime_id: runtime_id(42),
+        event_id: MobEffectPacketEventId::Add,
+        effect_id: wire::ZigZag32(19),
+        effect_amplifier: wire::ZigZag32(1),
+        show_particles: true,
+        effect_duration_ticks: wire::ZigZag32(600),
+        tick: PlayerInputTick(100),
+        ambient: false,
+    });
+
+    let Some(WorldEvent::ActorEffect(effect)) =
+        into_world_event(packet, 0).expect("normalize mob effect")
+    else {
+        panic!("expected an actor effect event")
+    };
+    assert_eq!(effect.dimension, 0);
+    assert_eq!(effect.actor_runtime_id, 42);
+    assert_eq!(effect.action, ActorEffectAction::Add);
+    assert_eq!(effect.effect_id, 19);
+    assert_eq!(effect.amplifier, 1);
+    assert!(effect.particles);
+    assert!(!effect.ambient);
+    assert_eq!(effect.duration_ticks, 600);
+    assert_eq!(effect.tick, 100);
+}
+
+#[test]
+fn mob_effect_update_remove_and_unknown_actions_stay_typed() {
+    for (wire, expected) in [
+        (MobEffectPacketEventId::Update, ActorEffectAction::Update),
+        (MobEffectPacketEventId::Remove, ActorEffectAction::Remove),
+        (
+            MobEffectPacketEventId::Unknown(9),
+            ActorEffectAction::Unknown(9),
+        ),
+    ] {
+        let packet = protocol::Packet::new(MobEffect {
+            target_runtime_id: runtime_id(7),
+            event_id: wire,
+            effect_id: wire::ZigZag32(20),
+            effect_amplifier: wire::ZigZag32(0),
+            show_particles: false,
+            effect_duration_ticks: wire::ZigZag32(-1),
+            tick: PlayerInputTick(0),
+            ambient: true,
+        });
+        let Some(WorldEvent::ActorEffect(effect)) =
+            into_world_event(packet, 1).expect("normalize mob effect action")
+        else {
+            panic!("expected an actor effect event")
+        };
+        assert_eq!(effect.action, expected);
+        assert_eq!(effect.duration_ticks, -1);
+        assert!(effect.ambient);
+    }
+}
+
+#[test]
+fn mob_effect_preserves_the_full_unsigned_tick_domain() {
+    let packet = protocol::Packet::new(MobEffect {
+        target_runtime_id: runtime_id(42),
+        event_id: MobEffectPacketEventId::Add,
+        effect_id: wire::ZigZag32(1),
+        effect_amplifier: wire::ZigZag32(0),
+        show_particles: false,
+        effect_duration_ticks: wire::ZigZag32(20),
+        tick: PlayerInputTick(u64::MAX),
+        ambient: false,
+    });
+    let Some(WorldEvent::ActorEffect(effect)) =
+        into_world_event(packet, 0).expect("normalize maximum unsigned tick")
+    else {
+        panic!("expected an actor effect event")
+    };
+    assert_eq!(effect.tick, u64::MAX);
+}
+
+#[test]
+fn mob_armor_equipment_normalizes_all_five_stacks() {
+    // 1.26.40 carries one item descriptor everywhere and names the slots
+    // head/torso/legs/feet/body.
+    let piece = |id: i16| NetworkItemStackDescriptorSerializedData {
+        id: wire::I16LE(id),
+        stack_size: wire::U16LE(1),
+        aux_value: wire::VarUInt(0),
+        ..Default::default()
+    };
+    let packet = protocol::Packet::new(MobArmorEquipment {
+        target_runtime_id: runtime_id(9),
+        head: piece(100),
+        torso: piece(101),
+        legs: piece(102),
+        feet: NetworkItemStackDescriptorSerializedData::default(),
+        body: NetworkItemStackDescriptorSerializedData::default(),
+    });
+
+    let Some(WorldEvent::ArmorEquipment(armor)) =
+        into_world_event(packet, 0).expect("normalize armor equipment")
+    else {
+        panic!("expected an armor equipment event")
+    };
+    assert_eq!(armor.actor_runtime_id, 9);
+    assert_eq!(armor.helmet.network_id, 100);
+    assert_eq!(armor.chestplate.network_id, 101);
+    assert_eq!(armor.leggings.network_id, 102);
+    assert!(armor.boots.is_empty());
+    assert!(armor.body.is_empty());
+}
+
+#[test]
+fn mob_armor_equipment_zero_runtime_id_fails_closed() {
+    let packet = protocol::Packet::new(MobArmorEquipment {
+        target_runtime_id: runtime_id(0),
+        head: NetworkItemStackDescriptorSerializedData::default(),
+        torso: NetworkItemStackDescriptorSerializedData::default(),
+        legs: NetworkItemStackDescriptorSerializedData::default(),
+        feet: NetworkItemStackDescriptorSerializedData::default(),
+        body: NetworkItemStackDescriptorSerializedData::default(),
+    });
+    assert!(into_world_event(packet, 0).is_err());
+}
+
+#[test]
+fn set_player_game_type_normalizes_explicit_modes() {
+    // 1.26.40's generated enum names only the modes Mojang still spells out:
+    // Undefined(-1), Survival(0), Creative(1), Adventure(2), Default(5),
+    // Spectator(6). gophertunnel's `GameTypeSurvivalSpectator` (3) and
+    // `GameTypeCreativeSpectator` (4) have no named variant here and arrive as
+    // `Unknown(3)` / `Unknown(4)`.
+    for (wire, expected) in [
+        (LevelGameType::Survival, PlayerGameMode::Survival),
+        (LevelGameType::Creative, PlayerGameMode::Creative),
+        (LevelGameType::Adventure, PlayerGameMode::Adventure),
+        (LevelGameType::Spectator, PlayerGameMode::Spectator),
+    ] {
+        let packet = protocol::Packet::new(SetPlayerGameType {
+            player_game_type: wire,
+        });
+        let Some(WorldEvent::Ui(UiEvent::GameMode(event))) =
+            into_world_event(packet, 0).expect("normalize game type")
+        else {
+            panic!("expected a game mode event")
+        };
+        assert_eq!(event.update, protocol::GameModeUpdate::Explicit(expected));
+    }
+}
+
+#[test]
+fn set_player_game_type_fallback_and_unknown_stay_typed_without_a_guess() {
+    // `Default` is wire value 5, the level-default sentinel gophertunnel calls
+    // `GameTypeDefault`.
+    for (wire, expected) in [
+        (
+            LevelGameType::Default,
+            protocol::GameModeUpdate::WorldDefault,
+        ),
+        (
+            LevelGameType::Unknown(77),
+            protocol::GameModeUpdate::Unknown(77),
+        ),
+    ] {
+        let packet = protocol::Packet::new(SetPlayerGameType {
+            player_game_type: wire,
+        });
+        let Some(WorldEvent::Ui(UiEvent::GameMode(event))) =
+            into_world_event(packet, 0).expect("normalize odd game type")
+        else {
+            panic!("expected a game mode event")
+        };
+        assert_eq!(event.update, expected);
+    }
+}
+
+#[test]
+fn set_default_game_type_dispatches_as_a_default_mode_event() {
+    let packet = protocol::Packet::new(SetDefaultGameType {
+        default_game_type: bedrock_protocol_1_26_60::enums::GameType::Adventure,
+    });
+    let Some(WorldEvent::Ui(UiEvent::DefaultGameMode(event))) =
+        into_world_event(packet, 0).expect("normalize default game type")
+    else {
+        panic!("expected a default game mode event")
+    };
+    assert_eq!(
+        event.update,
+        protocol::GameModeUpdate::Explicit(PlayerGameMode::Adventure)
+    );
+}
+
+#[test]
+fn set_entity_link_normalizes_typed_rider_links() {
+    // 1.26.40 types the link verb: None(0) / Riding(1) / Passenger(2), with
+    // `target_a` the ridden actor and `target_b` the rider.
+    for (wire, expected) in [
+        (VendorActorLinkType::None, ActorLinkType::Remove),
+        (VendorActorLinkType::Riding, ActorLinkType::Rider),
+        (VendorActorLinkType::Passenger, ActorLinkType::Passenger),
+        (VendorActorLinkType::Unknown(9), ActorLinkType::Unknown(9)),
+    ] {
+        let packet = protocol::Packet::new(SetActorLink {
+            link: EntityLink {
+                target_a: ActorUniqueID(-55),
+                target_b: ActorUniqueID(-7),
+                type_: wire,
+                immediate: true,
+                passenger_initiated: false,
+                vehicle_angular_velocity: wire::F32LE(0.25),
+            },
+        });
+        let Some(WorldEvent::ActorLink(link)) =
+            into_world_event(packet, 0).expect("normalize entity link")
+        else {
+            panic!("expected an actor link event")
+        };
+        assert_eq!(link.ridden_unique_id, -55);
+        assert_eq!(link.rider_unique_id, -7);
+        assert_eq!(link.link_type, expected);
+        assert!(link.immediate);
+        assert!(!link.rider_initiated);
+    }
+}
+
+#[test]
+fn item_stack_damage_reads_the_root_damage_tag_and_fails_closed_on_junk() {
+    // 1.26.40 hands the item user data over as an opaque buffer instead of
+    // modelling its interior, so the header is written by hand here. It is the
+    // shape gophertunnel's `Writer.itemUserData` (`minecraft/protocol/writer.go`)
+    // emits: an int16 of -1 when a compound follows, a uint8 version of 1, then
+    // the compound in fixed little-endian NBT.
+    let mut encoded = vec![0xff, 0xff, 0x01];
+
+    // Root compound { "other": byte 1, "Damage": int 37, "deep": {..} }.
+    encoded.extend_from_slice(&[0x0a, 0x00, 0x00]);
+    encoded.extend_from_slice(&[0x01, 0x05, 0x00]);
+    encoded.extend_from_slice(b"other");
+    encoded.push(0x01);
+    encoded.extend_from_slice(&[0x03, 0x06, 0x00]);
+    encoded.extend_from_slice(b"Damage");
+    encoded.extend_from_slice(&37i32.to_le_bytes());
+    encoded.extend_from_slice(&[0x0a, 0x04, 0x00]);
+    encoded.extend_from_slice(b"deep");
+    encoded.push(0x00);
+    encoded.push(0x00);
+
+    let stack = protocol::NetworkItemStack {
+        network_id: 5,
+        metadata: 0,
+        stack_network_id: -1,
+        count: 1,
+        nbt_digest: [0; 32],
+        block_runtime_id: 0,
+        extra_data: encoded.into(),
+    };
+    assert_eq!(protocol::item_stack_damage(&stack), Some(37));
+
+    let empty = protocol::NetworkItemStack::empty();
+    assert_eq!(protocol::item_stack_damage(&empty), None);
+
+    let junk = protocol::NetworkItemStack {
+        extra_data: vec![0xff, 0x13, 0x37].into(),
+        ..stack
+    };
+    assert_eq!(protocol::item_stack_damage(&junk), None);
+}
+
+#[test]
+fn world_bootstrap_carries_the_local_player_unique_id() {
+    let start_game = StartGame {
+        entity_id: ActorUniqueID(-3),
+        runtime_id: runtime_id(3),
+        ..StartGame::default()
+    };
+    let bootstrap = protocol::WorldBootstrap::from_start_game(&start_game);
+    assert_eq!(bootstrap.local_player_unique_id, -3);
+    assert_eq!(bootstrap.local_player_runtime_id, 3);
+}
+
+#[test]
+fn item_stack_enchantment_level_reads_the_root_ench_list() {
+    fn named(tag: u8, name: &[u8], out: &mut Vec<u8>) {
+        out.push(tag);
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(name);
+    }
+    let mut encoded = vec![0xff, 0xff, 0x01, 0x0a, 0x00, 0x00];
+    named(0x03, b"Damage", &mut encoded);
+    encoded.extend_from_slice(&4i32.to_le_bytes());
+    // ench: [ { id: short 15, lvl: short 3 }, { lvl: short 1, id: short 8 } ]
+    named(0x09, b"ench", &mut encoded);
+    encoded.push(0x0a);
+    encoded.extend_from_slice(&2i32.to_le_bytes());
+    for entry in [
+        [(&b"id"[..], 15i16), (b"lvl", 3)],
+        [(b"lvl", 1), (b"id", 8)],
+    ] {
+        for (name, value) in entry {
+            named(0x02, name, &mut encoded);
+            encoded.extend_from_slice(&value.to_le_bytes());
+        }
+        encoded.push(0x00);
+    }
+    encoded.push(0x00);
+    let stack = protocol::NetworkItemStack {
+        network_id: 5,
+        metadata: 0,
+        stack_network_id: -1,
+        count: 1,
+        nbt_digest: [0; 32],
+        block_runtime_id: 0,
+        extra_data: encoded.into(),
+    };
+    assert_eq!(
+        protocol::item_enchantment_level(&stack.extra_data, 15),
+        Some(3)
+    );
+    assert_eq!(
+        protocol::item_enchantment_level(&stack.extra_data, 8),
+        Some(1)
+    );
+    assert_eq!(
+        protocol::item_enchantment_level(&stack.extra_data, 17),
+        None
+    );
+    assert_eq!(protocol::item_stack_damage(&stack), Some(4));
+    assert!(!protocol::item_extra_unbreakable(&stack.extra_data));
+    let mut unbreakable = vec![0xff, 0xff, 0x01, 0x0a, 0x00, 0x00];
+    named(0x01, b"Unbreakable", &mut unbreakable);
+    unbreakable.extend_from_slice(&[0x01, 0x00]);
+    assert!(protocol::item_extra_unbreakable(&unbreakable));
+    let empty = protocol::NetworkItemStack::empty();
+    assert_eq!(
+        protocol::item_enchantment_level(&empty.extra_data, 15),
+        None
+    );
+}
+
+#[test]
+fn item_custom_color_reads_the_root_dye_int_masked_to_rgb() {
+    let mut encoded = vec![0xff, 0xff, 0x01, 0x0a, 0x00, 0x00, 0x03];
+    encoded.extend_from_slice(&11u16.to_le_bytes());
+    encoded.extend_from_slice(b"customColor");
+    encoded.extend_from_slice(&(0xff11_2233u32 as i32).to_le_bytes());
+    encoded.push(0x00);
+    assert_eq!(protocol::item_custom_color(&encoded), Some(0x0011_2233));
+    assert_eq!(protocol::item_custom_color(&[]), None);
+    assert_eq!(
+        protocol::item_custom_color(&[0xff, 0xff, 0x01, 0x0a, 0x00, 0x00, 0x00]),
+        None
+    );
+}

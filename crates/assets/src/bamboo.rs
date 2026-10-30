@@ -1,0 +1,184 @@
+//! Admission shared by bamboo geometry and position-dependent interaction shapes.
+use crate::{BlockFlags, ContributorRole, RegistryRecord};
+use serde::Deserialize;
+
+/// Registered identifier of the built-in stalk block.
+pub const BLOCK_NAME: &str = crate::facts::VanillaBlock::Bamboo.identifier();
+
+/// Leaf geometry selected by an admitted stalk state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeafSize {
+    None,
+    Small,
+    Large,
+}
+
+/// Built-in state whose model and shapes receive the bamboo column transform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BambooState {
+    pub thick: bool,
+    pub leaves: LeafSize,
+}
+
+/// Canonical registry atoms preserve their NBT type as well as their value.
+#[derive(Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum Atom {
+    Byte(u8),
+    String(String),
+}
+
+/// Only the three built-in properties admit the default stalk component.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct State {
+    age_bit: Atom,
+    bamboo_stalk_thickness: Atom,
+    bamboo_leaf_size: Atom,
+}
+
+impl BambooState {
+    /// Admits primary, non-air stalk records with the complete typed vanilla state.
+    /// Malformed records and other block names do not inherit displacement.
+    pub fn from_record(record: &RegistryRecord) -> Option<Self> {
+        if record.name.as_ref() != BLOCK_NAME
+            || record.contributor_role != ContributorRole::Primary
+            || record.flags.contains(BlockFlags::AIR)
+        {
+            return None;
+        }
+        let state: State = serde_json::from_str(&record.canonical_state).ok()?;
+        if !matches!(state.age_bit, Atom::Byte(0 | 1)) {
+            return None;
+        }
+        let Atom::String(thickness) = state.bamboo_stalk_thickness else {
+            return None;
+        };
+        let thick = match thickness.as_str() {
+            "thin" => false,
+            "thick" => true,
+            _ => return None,
+        };
+        let Atom::String(leaves) = state.bamboo_leaf_size else {
+            return None;
+        };
+        let leaves = match leaves.as_str() {
+            "no_leaves" => LeafSize::None,
+            "small_leaves" => LeafSize::Small,
+            "large_leaves" => LeafSize::Large,
+            _ => return None,
+        };
+        Some(Self { thick, leaves })
+    }
+}
+
+pub const STEM_SIDE_QUAD_MASK: u32 = (1 << crate::BlockFace::West as u32)
+    | (1 << crate::BlockFace::East as u32)
+    | (1 << crate::BlockFace::North as u32)
+    | (1 << crate::BlockFace::South as u32);
+pub const STEM_UV_STRIDE: f32 = 3.0 / 16.0;
+pub const LEAF_PLANE_INSET: f32 = 0.01;
+pub const POSITIVE_X_LEAF_QUAD: u32 = crate::BlockFace::ALL.len() as u32;
+pub const POSITIVE_Z_LEAF_QUAD: u32 = POSITIVE_X_LEAF_QUAD + 2;
+
+/// Resolves the packed variant shared by terrain and position-dependent overlays. Outside bamboo
+/// that is the variant's quarter turns about y; its higher semantic bits are no model turn.
+pub fn transform_for_template(flags: u32, variant: u32, position: [i32; 3]) -> u32 {
+    if flags & crate::MODEL_TEMPLATE_FLAG_BAMBOO != 0 {
+        block_transform::bamboo::column_transform(position[0], position[2])
+    } else {
+        variant & 3
+    }
+}
+
+/// Column-dependent U displacement retained when the stem uses a texture override.
+pub fn stem_uv_offset(transform: u32, quad: u32) -> f32 {
+    if quad < crate::BlockFace::ALL.len() as u32 && (STEM_SIDE_QUAD_MASK >> quad) & 1 != 0 {
+        ((transform >> 8) & 3) as f32 * STEM_UV_STRIDE
+    } else {
+        0.0
+    }
+}
+
+/// Block-local displacement for a bamboo model quad, including its leaf plane inset.
+pub fn quad_offset(transform: u32, quad: u32) -> [f32; 3] {
+    let mut offset = block_transform::bamboo::offset_from_transform(transform);
+    if quad == POSITIVE_X_LEAF_QUAD {
+        offset[2] += LEAF_PLANE_INSET;
+    }
+    if quad == POSITIVE_Z_LEAF_QUAD {
+        offset[0] += LEAF_PLANE_INSET;
+    }
+    offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads the public pinned registry using its manifest's protocol authority.
+    fn records() -> Box<[RegistryRecord]> {
+        let target: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../assets/bedrock-target.json")).unwrap();
+        crate::read_registry_for_protocol(
+            include_bytes!("../data/block-registry-v2225.bin"),
+            target["wire_protocol"].as_u64().unwrap() as u32,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn admission_covers_every_stalk_state_and_rejects_other_registered_blocks() {
+        let records = records();
+        let mut seen = [[false; 3]; 2];
+        for record in &records {
+            let state = BambooState::from_record(record);
+            assert_eq!(state.is_some(), record.name.as_ref() == BLOCK_NAME);
+            if let Some(state) = state {
+                let leaf = match state.leaves {
+                    LeafSize::None => 0,
+                    LeafSize::Small => 1,
+                    LeafSize::Large => 2,
+                };
+                seen[usize::from(state.thick)][leaf] = true;
+            }
+        }
+        assert_eq!(seen, [[true; 3]; 2]);
+    }
+
+    #[test]
+    fn malformed_or_extended_states_do_not_acquire_the_default_component() {
+        let mut record = records()
+            .into_vec()
+            .into_iter()
+            .find(|record| record.name.as_ref() == BLOCK_NAME)
+            .unwrap();
+        let original: serde_json::Value = serde_json::from_str(&record.canonical_state).unwrap();
+        for (property, atom) in [
+            ("age_bit", serde_json::json!({"type":"int","value":0})),
+            ("age_bit", serde_json::json!({"type":"byte","value":2})),
+            (
+                "bamboo_leaf_size",
+                serde_json::json!({"type":"string","value":"unknown"}),
+            ),
+            (
+                "bamboo_stalk_thickness",
+                serde_json::json!({"type":"string","value":"thin","extra":0}),
+            ),
+            (
+                "random_offset",
+                serde_json::json!({"type":"byte","value":0}),
+            ),
+        ] {
+            let mut state = original.clone();
+            state[property] = atom;
+            record.canonical_state = serde_json::to_string(&state).unwrap().into();
+            assert_eq!(BambooState::from_record(&record), None, "{property}");
+        }
+    }
+}

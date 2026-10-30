@@ -1,0 +1,66 @@
+[package]
+name = "protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+# Wire tests share one explicit integration target.
+autotests = false
+
+[package.metadata.cinnabar]
+platform-specific = ["windows"]
+reads = [
+    "assets/bedrock-target.json",
+    "assets/block-projection-v2225.json",
+    "crates/protocol-ids/data/protocol-ids.json",
+    "crates/protocol-ids/data/actor-data-extensions.json",
+    "crates/protocol-ids/data/movement-contract.json",
+    "tools/localserver/experience/testdata/protocol/limits.json",
+]
+
+[features]
+# Adds on-demand metadata attribution to client Tracy captures.
+tracy = []
+# Fixture builders and semantic observations for other crates' tests.
+test-support = []
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[dependencies]
+protocol-ids = { path = "../protocol-ids" }
+simulation-clock = { path = "../simulation-clock" }
+zeroize = "1"
+block-transform = { path = "../block-transform" }
+render-api = { path = "../render-api" }
+anyhow.workspace = true
+base64 = "0.22"
+bridge = { path = "../bridge" }
+bytes.workspace = true
+futures.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+web-time.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
+bedrock-protocol-1-26-60 = { path = "vendor/bedrock-protocol-1-26-60" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cap-std = "3.4.5"
+cap-fs-ext = "3.4.5"
+
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+tempfile = "3"
+test-time = { path = "../test-time" }
+
+[lints]
+workspace = true

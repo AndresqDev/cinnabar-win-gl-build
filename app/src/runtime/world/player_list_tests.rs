@@ -1,0 +1,77 @@
+use std::sync::Arc;
+
+use chunk_pipeline::WorldStream;
+use client_world::CommittedControlEvent;
+use protocol::{
+    ActorEvent, PlayerListEntry, PlayerListUpdateEvent, PlayerSkin, PlayerSkinUnavailable,
+    WorldBootstrap, WorldEvent,
+};
+
+use super::refresh_player_list_cache_for_controls;
+use client_ui::ui_runtime::UiRuntime;
+
+#[test]
+fn player_list_marker_refreshes_known_names_without_a_ui_event() {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        local_player_unique_id: 1,
+        dimension: 0,
+        local_player_runtime_id: 1,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    stream
+        .submit(
+            1,
+            WorldEvent::Actor(ActorEvent::PlayerList(PlayerListUpdateEvent {
+                entries: Arc::from([PlayerListEntry::Add {
+                    uuid: [7; 16],
+                    unique_id: 7,
+                    username: Arc::from("Alex"),
+                    verified: true,
+                    xuid: "2535400000000007".into(),
+                    skin: PlayerSkin::Unavailable(PlayerSkinUnavailable::InvalidDimensions),
+                }]),
+            })),
+        )
+        .unwrap();
+    let controls = stream.take_committed_controls();
+    assert_eq!(
+        controls,
+        vec![CommittedControlEvent::PlayerListChanged { sequence: 1 }]
+    );
+    assert!(stream.take_committed_ui().is_empty());
+
+    let mut ui = UiRuntime::new(1);
+    refresh_player_list_cache_for_controls(&stream, &mut ui, &controls);
+    assert_eq!(ui.known_player_names(), [Arc::<str>::from("Alex")]);
+    assert_eq!(
+        ui.session.player_roster.xuids().collect::<Vec<_>>(),
+        ["2535400000000007"]
+    );
+    assert!(ui.session.player_roster.rows()[0].skin.is_none());
+    let skin = render_api::StandardSkin {
+        width: 64,
+        height: 64,
+        rgba8: vec![255; 64 * 64 * 4].into(),
+        cape: None,
+        geometry: None,
+    };
+    stream
+        .submit(
+            2,
+            WorldEvent::Actor(ActorEvent::Skin {
+                uuid: [7; 16],
+                skin: PlayerSkin::Standard(skin.clone()),
+            }),
+        )
+        .unwrap();
+    let controls = stream.take_committed_controls();
+    assert_eq!(
+        controls,
+        vec![CommittedControlEvent::PlayerListChanged { sequence: 2 }]
+    );
+    refresh_player_list_cache_for_controls(&stream, &mut ui, &controls);
+    assert_eq!(ui.session.player_roster.rows()[0].skin, Some(skin));
+}

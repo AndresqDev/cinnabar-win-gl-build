@@ -1,0 +1,314 @@
+//! The client part: a component of the `server-bundle` world, which Cinnabar runs from the
+//! Experience's `.cxb`, generated from `../mod-api/wit/client.wit`.
+//!
+//! Implement [`ClientPart`] on a type and export it with
+//! [`export_client_part!`](crate::export_client_part). Paired projects use `#[entry::client]`
+//! and one `#[on_message]` method per reply. [`send`] accepts only to-server messages.
+//! Dispatch silently drops unknown channels and records that fail to decode.
+//! The host's imports include [`ui`], [`input`], [`scene`], [`media`], [`items`],
+//! [`drawing`], [`render`] and [`environment`]; each checks the bundle's grants.
+
+/// Bindings generated from `../mod-api/wit/client.wit`.
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: ["wit/client/deps/server-experience", "wit/session", "../mod-api/wit"],
+        world: "cinnabar:extension/server-bundle@0.1.0",
+        generate_all,
+        pub_export_macro: true,
+    });
+}
+
+pub use bindings::cinnabar::extension::{environment, render};
+pub use bindings::cinnabar::server_experience::{input, media, scene, ui};
+pub use bindings::cinnabar::session::items;
+pub use bindings::cinnabar::world_draw::{assets, drawing, masks};
+
+use crate::Value;
+use bindings::cinnabar::server_experience::messaging;
+
+/// ABI adapters for generated entry points and low-level protocol fixtures.
+#[doc(hidden)]
+pub mod __private;
+
+/// One client part, mirroring the exports of the `server-bundle` world.
+///
+/// Only [`ClientPart::init`] is required; the callbacks default to doing nothing.
+pub trait ClientPart {
+    /// The generated registry to confirm before any authored callback runs. Existing client
+    /// parts without source-generated messages keep their current initialization behavior.
+    fn registry() -> Option<&'static crate::message::Registry> {
+        None
+    }
+
+    /// Runs once, when the client part starts.
+    fn init();
+
+    /// Runs on an admitted presentation frame, coalesced while a callback is busy.
+    fn frame() {}
+
+    /// Handles `action`: the declared action `id` fired from a modal screen control while the
+    /// modal has focus; `collection_index` is the control's row in its nearest collection.
+    fn action(_id: String, _collection_index: Option<u32>) {}
+
+    /// Handles `epoch`: the world epoch changed, after a server world notice or dimension change, and the client
+    /// part and its state live on. The server half resends what it needs to.
+    fn epoch() {}
+
+    /// Handles `modal-resized`: the open modal was first drawn, or its size changed (a window
+    /// resize or a GUI scale change). `size` is what [`ui::modal_size`] now returns: the width
+    /// and height the vanilla screen root lays out in, in GUI units, and the GUI scale.
+    fn modal_resized(_size: ui::GuiSize) {}
+
+    /// Handles `text-changed`: the user edited the modal's edit box whose `text_box_name` is
+    /// `control`, a declared action, while the modal had focus; `text` is its whole text. Edits
+    /// are coalesced, so this is the latest text, not each keystroke. [`ui::set_text`] sets a
+    /// box's text without calling this.
+    fn text_changed(_control: String, _text: String) {}
+
+    /// Handles `secondary-action`: a secondary press (a right click) fired the declared action
+    /// `id` from a modal screen control mapping `button.menu_secondary_select` to it, while the
+    /// modal had focus; `collection_index` is as in [`ClientPart::action`].
+    fn secondary_action(_id: String, _collection_index: Option<u32>) {}
+
+    /// Handles `scroll-changed`: the open modal's scroll view whose `scroll_view_name` is
+    /// `view`, a declared action, now shows `range`, because it scrolled or its viewport or
+    /// content changed length. Changes are coalesced, so this is the latest range. A client part
+    /// can bind only the rows a scroll view shows, and lay a fixed grid over it.
+    fn scroll_changed(_view: String, _range: ui::ScrollRange) {}
+
+    /// Handles `shift-changed`: Shift is now `held`, or not, while the modal has focus.
+    fn shift_changed(_held: bool) {}
+}
+
+thread_local! {
+    static REGISTRY_STATE: std::cell::Cell<crate::message::RegistryState> = const {
+        std::cell::Cell::new(crate::message::RegistryState::Waiting)
+    };
+}
+
+/// Initializes legacy parts immediately; generated projects defer callbacks until confirmation.
+#[doc(hidden)]
+pub fn initialize<T: ClientPart>() {
+    initialize_with::<T>(|registry| {
+        messaging::negotiate(
+            registry.channel.id,
+            registry.request.id,
+            registry.request.schema,
+            registry.fingerprint,
+        );
+        Ok(())
+    });
+}
+
+/// Requests host-owned negotiation before authored initialization.
+#[doc(hidden)]
+pub fn initialize_with<T: ClientPart>(
+    negotiate: impl FnOnce(&crate::message::Registry) -> Result<(), String>,
+) {
+    REGISTRY_STATE.set(crate::message::RegistryState::Waiting);
+    if let Some(registry) = T::registry() {
+        negotiate(registry).expect("registry request must be admitted before client code starts");
+    } else {
+        T::init();
+    }
+}
+
+/// Whether authored callbacks may run for this component instance.
+#[doc(hidden)]
+pub fn active<T: ClientPart>() -> bool {
+    T::registry().is_none() || REGISTRY_STATE.get() == crate::message::RegistryState::Active
+}
+
+/// Sends a to-server message after validating every declared field bound.
+pub fn send<M: crate::message::ToServer>(message: &M) -> Result<(), String> {
+    messaging::send(
+        M::CHANNEL.id,
+        M::CHANNEL.schema,
+        &record_json(&message.encode()?),
+    )
+}
+
+/// `record` in the wire's JSON form, as `messaging.send` takes it.
+fn record_json(record: &[Value]) -> Vec<u8> {
+    serde_json::to_vec(record).expect("values always serialize")
+}
+
+/// The record that `dispatch` delivers in the wire's JSON form; `None` for anything else.
+#[doc(hidden)]
+pub fn record(json: &[u8]) -> Option<Vec<Value>> {
+    serde_json::from_slice(json).ok()
+}
+
+/// Implements the generated [`bindings::Guest`] for `$ty` by delegating to its [`ClientPart`]
+/// impl, then exports `$ty` as the component's `server-bundle` world.
+#[macro_export]
+macro_rules! export_client_part {
+    ($ty:ident) => {
+        impl $crate::client::bindings::Guest for $ty {
+            fn init() {
+                $crate::client::initialize::<$ty>()
+            }
+
+            fn frame() {
+                <$ty as $crate::client::ClientPart>::frame()
+            }
+
+            fn dispatch(channel: ::std::string::String, record_json: ::std::vec::Vec<u8>) {
+                $crate::client::__private::receive::<$ty>(channel, record_json);
+            }
+
+            fn action(id: ::std::string::String, collection_index: ::core::option::Option<u32>) {
+                <$ty as $crate::client::ClientPart>::action(id, collection_index)
+            }
+
+            fn epoch() {
+                <$ty as $crate::client::ClientPart>::epoch()
+            }
+
+            fn modal_resized(size: $crate::client::ui::GuiSize) {
+                <$ty as $crate::client::ClientPart>::modal_resized(size)
+            }
+
+            fn text_changed(control: ::std::string::String, text: ::std::string::String) {
+                <$ty as $crate::client::ClientPart>::text_changed(control, text)
+            }
+
+            fn secondary_action(
+                id: ::std::string::String,
+                collection_index: ::core::option::Option<u32>,
+            ) {
+                <$ty as $crate::client::ClientPart>::secondary_action(id, collection_index)
+            }
+
+            fn scroll_changed(view: ::std::string::String, range: $crate::client::ui::ScrollRange) {
+                <$ty as $crate::client::ClientPart>::scroll_changed(view, range)
+            }
+
+            fn shift_changed(held: bool) {
+                <$ty as $crate::client::ClientPart>::shift_changed(held)
+            }
+        }
+
+        $crate::client::bindings::export!($ty with_types_in $crate::client::bindings);
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientPart, active, initialize, initialize_with, record, record_json};
+    use crate::{Channel, Direction, Field, Value, message::Registry};
+
+    thread_local! { static INITIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    use super::__private;
+
+    struct Legacy;
+    impl ClientPart for Legacy {
+        /// Counts initialization without invoking any host imports.
+        fn init() {
+            INITIALIZATIONS.set(INITIALIZATIONS.get() + 1);
+        }
+    }
+
+    struct Guarded;
+    impl ClientPart for Guarded {
+        /// Requires the generated confirmation before any authored callback runs.
+        fn registry() -> Option<&'static Registry> {
+            Some(&REGISTRY)
+        }
+        /// Counts initialization without invoking any host imports.
+        fn init() {
+            INITIALIZATIONS.set(INITIALIZATIONS.get() + 1);
+        }
+    }
+
+    impl __private::Dispatch for Guarded {
+        /// No application messages are declared by this initialization fixture.
+        fn dispatch(_: String, _: Vec<Value>) -> Result<(), String> {
+            Err("unknown message".into())
+        }
+    }
+
+    static REGISTRY: Registry = Registry {
+        channel: Channel {
+            id: "test.registry",
+            schema: 1,
+            direction: Direction::ToClient,
+            fields: &[Field::Text { max_bytes: 64 }],
+        },
+        request: Channel {
+            id: "test.registry_request",
+            schema: 1,
+            direction: Direction::ToServer,
+            fields: &[Field::Text { max_bytes: 64 }],
+        },
+        fingerprint: "expected",
+    };
+
+    #[test]
+    fn legacy_client_parts_keep_immediate_initialization() {
+        INITIALIZATIONS.set(0);
+        initialize::<Legacy>();
+        assert!(active::<Legacy>());
+        assert_eq!(INITIALIZATIONS.get(), 1);
+    }
+
+    #[test]
+    fn generated_parts_wait_for_exactly_one_confirmation() {
+        INITIALIZATIONS.set(0);
+        initialize_with::<Guarded>(|registry| {
+            assert_eq!(registry.channel, REGISTRY.channel);
+            assert_eq!(registry.request, REGISTRY.request);
+            assert_eq!(registry.fingerprint, REGISTRY.fingerprint);
+            Ok(())
+        });
+        assert!(!active::<Guarded>());
+        assert_eq!(INITIALIZATIONS.get(), 0);
+        for _ in 0..2 {
+            __private::receive::<Guarded>(
+                "test.registry".into(),
+                record_json(&[Value::Text("expected".into())]),
+            );
+        }
+        assert!(active::<Guarded>());
+        assert_eq!(INITIALIZATIONS.get(), 1);
+    }
+
+    /// Every kind of value in the wire's JSON form, as the host dispatches and parses records.
+    const RECORD: &str = concat!(
+        r#"[{"type":"bool","value":true},{"type":"integer","value":-7},"#,
+        r#"{"type":"text","value":"cell"},{"type":"choice","value":2},"#,
+        r#"{"type":"list","value":[{"type":"record","value":[{"type":"integer","value":1}]}]},"#,
+        r#"{"type":"record","value":[]}]"#,
+    );
+
+    fn values() -> Vec<Value> {
+        vec![
+            Value::Bool(true),
+            Value::Integer(-7),
+            Value::Text("cell".to_owned()),
+            Value::Choice(2),
+            Value::List(vec![Value::Record(vec![Value::Integer(1)])]),
+            Value::Record(Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn records_travel_in_the_wire_json_form() {
+        assert_eq!(record_json(&values()), RECORD.as_bytes());
+        assert_eq!(record(RECORD.as_bytes()), Some(values()));
+    }
+
+    #[test]
+    fn anything_but_a_record_is_none() {
+        for json in [
+            r#"{"type":"bool","value":true}"#,
+            r#"[{"type":"float","value":1.5}]"#,
+            r#"[{"type":"integer","value":1,"extra":0}]"#,
+            r#"[{"type":"choice","value":-1}]"#,
+            "not json",
+        ] {
+            assert_eq!(record(json.as_bytes()), None, "{json}");
+        }
+    }
+}

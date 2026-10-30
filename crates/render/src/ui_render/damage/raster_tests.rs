@@ -1,0 +1,972 @@
+//! Exact pixel comparisons for damage replay through the production UI shader.
+
+mod color_mask_tests;
+#[path = "raster_fixture.rs"]
+mod fixture;
+mod repeat_tests;
+mod shadow_tests;
+
+use super::*;
+use fixture::{Raster, SIDE, buffer, target};
+
+#[path = "outline_raster.rs"]
+mod outline_raster;
+use render_model::{UiRenderBatch, UiTextureCatalog, UiTexturePage};
+
+impl Raster {
+    /// Clears the whole layer or its damage rectangle, then replays every overlapping batch in order.
+    fn draw(&self, input: &UiRenderInput, output: &wgpu::Texture, damage: Option<UiScissor>) {
+        let bones: Vec<_> = input
+            .models
+            .iter()
+            .flat_map(|model| model.bones.iter().copied())
+            .collect();
+        if !bones.is_empty() {
+            self.gpu
+                .queue
+                .write_buffer(&self.models, 0, bytemuck::cast_slice(&bones));
+        }
+        let resident: Vec<_> = input
+            .vertices
+            .iter()
+            .map(|&source| render_model::FontAtlasVertex {
+                source,
+                atlas_offset: [0.; 2],
+            })
+            .collect();
+        let vertices = buffer(
+            &self.gpu,
+            bytemuck::cast_slice(&resident),
+            wgpu::BufferUsages::VERTEX,
+        );
+        let indices = buffer(
+            &self.gpu,
+            bytemuck::cast_slice(&input.indices),
+            wgpu::BufferUsages::INDEX,
+        );
+        let color = output.create_view(&Default::default());
+        let depth = target(&self.gpu, true).create_view(&Default::default());
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        if let Some(rect) = damage
+            .and_then(|rect| crate::render_bounds::scissor(rect, [output.width(), output.height()]))
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("UI damage parity clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.clear);
+            pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+            pass.draw(0..3, 0..1);
+        }
+        let mut start = 0;
+        let mut lifetime = super::super::model_depth::ModelDepthLifetime::default();
+        while let Some(first) = input.batches.get(start) {
+            let mode = (
+                first.isolated_depth_scope,
+                first.depth_test,
+                first.depth_write,
+            );
+            let length = input.batches[start..]
+                .iter()
+                .take_while(|batch| {
+                    (
+                        batch.isolated_depth_scope,
+                        batch.depth_test,
+                        batch.depth_write,
+                    ) == mode
+                })
+                .count();
+            lifetime.enter(mode.0);
+            let needs_depth = mode.1 != 0 || mode.2 != 0;
+            let initial = start == 0;
+            let batches = &input.batches[start..start + length];
+            start += length;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("UI damage parity draw"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if initial && damage.is_none() {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: needs_depth.then_some(
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: if lifetime.cleared() {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(0.0)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    },
+                ),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_bind_group(0, &self.binding, &[]);
+            for batch in batches {
+                pass.set_pipeline(if batch.blend_mode == render_model::UI_BLEND_INVERT {
+                    assert!(!needs_depth, "inverse fixture uses depth-free HUD masks");
+                    &self.invert
+                } else {
+                    &self.materials[usize::from(mode.1 != 0) * 2 + usize::from(mode.2 != 0)]
+                });
+                let Some(rect) = super::super::layer::clipped_scissor(batch.scissor, damage)
+                    .and_then(|rect| {
+                        crate::render_bounds::scissor(rect, [output.width(), output.height()])
+                    })
+                else {
+                    continue;
+                };
+                pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+                let instance = render_model::ui_model_instance(
+                    &input.models,
+                    batch.isolated_depth_scope,
+                    batch.texture_page,
+                );
+                pass.draw_indexed(
+                    batch.first_index..batch.first_index + batch.index_count,
+                    0,
+                    instance..instance + 1,
+                );
+            }
+            if needs_depth {
+                lifetime.encoded();
+            }
+        }
+        self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    /// Reads all RGBA bytes without image conversion or comparison tolerances.
+    fn pixels(&self, texture: &wgpu::Texture) -> Vec<u8> {
+        let (width, height) = (texture.width(), texture.height());
+        let stride = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(stride) * u64::from(height),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(height),
+                },
+            },
+            texture.size(),
+        );
+        self.gpu.queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+        self.gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        readback
+            .slice(..)
+            .get_mapped_range()
+            .expect("readback buffer is mapped")
+            .chunks_exact(stride as usize)
+            .flat_map(|row| row[..width as usize * 4].iter().copied())
+            .collect()
+    }
+
+    /// Writes optional native offscreen frames without opening a window.
+    fn snapshot(&self, texture: &wgpu::Texture) {
+        let Some(directory) = std::env::var_os("CINNABAR_UI_RASTER_SNAPSHOT_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let image =
+            image::RgbaImage::from_raw(texture.width(), texture.height(), self.pixels(texture))
+                .unwrap();
+        image
+            .save(directory.join(format!(
+                "native-ui-{}x{}.png",
+                texture.width(),
+                texture.height()
+            )))
+            .unwrap();
+    }
+}
+
+/// Adds a textured quad; depth-enabled quads share one isolated model lifetime.
+fn quad(
+    input: &mut UiRenderInput,
+    bounds: [f32; 4],
+    color: [u8; 4],
+    page: u32,
+    depth: Option<f32>,
+) {
+    let base = input.vertices.len() as u32;
+    let first = input.indices.len() as u32;
+    let mut vertices = input.vertices.to_vec();
+    for ([x, y], uv) in [
+        [bounds[0], bounds[1]],
+        [bounds[2], bounds[1]],
+        [bounds[2], bounds[3]],
+        [bounds[0], bounds[3]],
+    ]
+    .into_iter()
+    .zip([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]])
+    {
+        vertices.push(UiRenderVertex {
+            position: [x, y],
+            clip_z: depth.unwrap_or_default(),
+            clip_w: 1.0,
+            uv,
+            color,
+            style_flags: 0,
+            alpha_cutoff: -1.0,
+            model_light: 1.0,
+            overlay_color: [0.0; 4],
+        });
+    }
+    input.vertices = vertices.into();
+    let mut indices = input.indices.to_vec();
+    indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+    input.indices = indices.into();
+    let mut batches = input.batches.to_vec();
+    let scissor = if depth.is_some() {
+        UiScissor::new(16, 14, 30, 30)
+    } else {
+        UiScissor::new(0, 0, SIDE, SIDE)
+    };
+    batches.push(
+        UiRenderBatch::new(page, scissor, first, 6, UI_BLEND_ALPHA)
+            .with_depth_test(depth.is_some())
+            .with_depth_write(depth.is_some())
+            .with_isolated_depth_scope(depth.map(|_| 1)),
+    );
+    input.batches = batches.into();
+}
+
+/// Combines transparent texture pixels, stable overlays and overlapping clipped model quads.
+fn scene() -> UiRenderInput {
+    let mut input = UiRenderInput {
+        models: Default::default(),
+        revision: 1,
+        viewport_size: [SIDE; 2],
+        safe_area: [0; 4],
+        vertices: Arc::from([]),
+        indices: Arc::from([]),
+        batches: Arc::from([]),
+        textures: Arc::new(
+            UiTextureCatalog::new(
+                vec![
+                    UiTexturePage::owned([2, 2], Arc::from([255; 16])).unwrap(),
+                    UiTexturePage::owned(
+                        [2, 2],
+                        Arc::from([
+                            250, 20, 80, 255, 30, 200, 120, 128, 70, 90, 255, 0, 180, 140, 10, 210,
+                        ]),
+                    )
+                    .unwrap(),
+                ],
+                2,
+            )
+            .unwrap(),
+        ),
+    };
+    quad(
+        &mut input,
+        [0.0, 0.0, SIDE as f32, SIDE as f32],
+        [35, 55, 75, 255],
+        0,
+        None,
+    );
+    quad(
+        &mut input,
+        [8.5, 12.25, 50.5, 49.5],
+        [190, 60, 150, 120],
+        1,
+        None,
+    );
+    quad(
+        &mut input,
+        [18.0, 16.0, 44.0, 44.0],
+        [100, 170, 200, 255],
+        0,
+        Some(0.4),
+    );
+    quad(
+        &mut input,
+        [20.25, 18.75, 38.25, 38.75],
+        [180, 210, 140, 205],
+        1,
+        Some(0.7),
+    );
+    quad(
+        &mut input,
+        [12.0, 25.0, 52.0, 31.0],
+        [180, 90, 20, 105],
+        1,
+        None,
+    );
+    for vertex in &mut Arc::make_mut(&mut input.vertices)[16..20] {
+        vertex.style_flags = u32::from(assets::FONT_STYLE_SDF | assets::FONT_STYLE_COVERAGE_GAMMA);
+    }
+    input
+}
+
+#[test]
+fn retained_damage_replay_matches_full_ui_raster_byte_for_byte() {
+    let initial = scene();
+    let Some(raster) = Raster::new(&initial) else {
+        return;
+    };
+    for change in 0..7 {
+        let mut previous = initial.clone();
+        if change == 4 {
+            for batch in &mut Arc::make_mut(&mut previous.batches)[..2] {
+                batch.scissor = UiScissor::new(0, 0, SIDE, 8);
+            }
+        }
+        if change == 5 {
+            Arc::make_mut(&mut previous.batches)[3].depth_write = 0;
+        }
+        if change == 6 {
+            Arc::make_mut(&mut previous.batches)[2].depth_test = 0;
+        }
+        let mut current = previous.clone();
+        current.revision += 1;
+        for vertex in &mut Arc::make_mut(&mut current.vertices)[12..16] {
+            match change {
+                0 | 4 => {
+                    vertex.position[0] += 12.625;
+                    vertex.position[1] -= 8.375;
+                }
+                1 | 5 | 6 => vertex.clip_z = 0.2,
+                2 => {
+                    vertex.color[3] = 90;
+                    vertex.uv[0] += 0.5;
+                }
+                3 => vertex.position[0] -= 25.25,
+                _ => unreachable!(),
+            }
+        }
+        let UiDamage::Rect(damage) = plan(&previous, &current) else {
+            panic!("expected bounded damage");
+        };
+        assert!(damage.width < SIDE && damage.height < SIDE);
+        let full = target(&raster.gpu, false);
+        let retained = target(&raster.gpu, false);
+        raster.draw(&previous, &retained, None);
+        let old_pixels = raster.pixels(&retained);
+        raster.draw(&current, &full, None);
+        raster.draw(&current, &retained, Some(damage));
+        let expected = raster.pixels(&full);
+        let actual = raster.pixels(&retained);
+        assert_ne!(
+            expected, old_pixels,
+            "fixture change {change} must change pixels"
+        );
+        assert_eq!(
+            actual, expected,
+            "partial replay must match full redraw for change {change}"
+        );
+    }
+}
+
+/// The production shader combines border coverage without leaking invisible fill RGB.
+#[test]
+fn coverage_paint_keeps_invisible_fill_rgb_out_of_the_border() {
+    let mut input = scene();
+    input.vertices = Arc::from([]);
+    input.indices = Arc::from([]);
+    input.batches = Arc::from([]);
+    quad(
+        &mut input,
+        [0.0, 0.0, SIDE as f32, SIDE as f32],
+        [255, 0, 0, 64],
+        0,
+        None,
+    );
+    let paint = render_api::UiCoveragePaint {
+        fill: [[0, 0, 255, 0]; 2],
+        border: [255, 0, 0, 255],
+    };
+    let (tint, overlay) = paint.vertex_colors();
+    for vertex in Arc::make_mut(&mut input.vertices) {
+        vertex.color = tint;
+        vertex.overlay_color = overlay;
+        vertex.uv = [0.0; 2];
+        vertex.style_flags = u32::from(render_api::UI_STYLE_COVERAGE_PAINT);
+        vertex.model_light = 64.0 / 255.0 * (1.0 - vertex.position[0] / SIDE as f32);
+    }
+    let Some(raster) = Raster::new(&input) else {
+        return;
+    };
+    let output = target(&raster.gpu, false);
+    raster.draw(&input, &output, None);
+    let pixels = raster.pixels(&output);
+    for x in [8, 24, 40, 56] {
+        let offset = ((32 * SIDE + x) * 4) as usize;
+        let color = &pixels[offset..offset + 4];
+        let expected = 64.0 * (1.0 - (x as f32 + 0.5) / SIDE as f32);
+        assert!(color[3] > 0);
+        assert_eq!(
+            color[0], color[3],
+            "red contribution must equal alpha: {color:?}"
+        );
+        assert_eq!(color[1], 0);
+        assert_eq!(
+            color[2], 0,
+            "transparent blue must not contribute: {color:?}"
+        );
+        assert!((f32::from(color[3]) - expected).abs() <= 1.0);
+    }
+}
+
+/// Constant paint colors and an affine gradient coordinate agree with the CPU across both diagonals.
+#[test]
+fn coverage_paint_gradient_matches_the_cpu_contract_across_triangulations() {
+    for (paint, coverage) in [
+        (
+            render_api::UiCoveragePaint {
+                fill: [[255, 0, 0, 255], [0, 0, 255, 0]],
+                border: [0, 255, 0, 128],
+            },
+            [1.0, 0.0],
+        ),
+        (
+            render_api::UiCoveragePaint {
+                fill: [[17, 73, 201, 160], [199, 31, 113, 47]],
+                border: [91, 209, 33, 83],
+            },
+            [0.625, 0.375],
+        ),
+    ] {
+        let (tint, overlay) = paint.vertex_colors();
+        for horizontal in [false, true] {
+            let mut input = scene();
+            input.vertices = Arc::from([]);
+            input.indices = Arc::from([]);
+            input.batches = Arc::from([]);
+            quad(
+                &mut input,
+                [0.0, 0.0, SIDE as f32, SIDE as f32],
+                tint,
+                0,
+                None,
+            );
+            for vertex in Arc::make_mut(&mut input.vertices) {
+                vertex.uv = [
+                    vertex.position[usize::from(!horizontal)] / SIDE as f32,
+                    coverage[0],
+                ];
+                vertex.overlay_color = overlay;
+                vertex.style_flags = u32::from(render_api::UI_STYLE_COVERAGE_PAINT);
+                vertex.model_light = coverage[1];
+            }
+            let Some(raster) = Raster::new(&input) else {
+                return;
+            };
+            let output = target(&raster.gpu, false);
+            for indices in [[0, 1, 2, 0, 2, 3], [0, 1, 3, 1, 2, 3]] {
+                input.indices = Arc::from(indices);
+                raster.draw(&input, &output, None);
+                let pixels = raster.pixels(&output);
+                let expected = paint.sample(48.5 / SIDE as f32, coverage);
+                let mut first = None;
+                for across in [5, 32, 58] {
+                    let [x, y] = if horizontal {
+                        [48, across]
+                    } else {
+                        [across, 48]
+                    };
+                    let offset = ((y * SIDE + x) * 4) as usize;
+                    let color = &pixels[offset..offset + 4];
+                    for (actual, expected) in color.iter().zip(expected) {
+                        assert!((f32::from(*actual) - expected * 255.0).abs() <= 1.0);
+                    }
+                    assert_eq!(
+                        *first.get_or_insert(color),
+                        color,
+                        "tint must be constant across the gradient axis"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn analytic_radial_gradient_interpolates_premultiplied_stops_and_extent() {
+    let mut input = scene();
+    input.vertices = Arc::from([]);
+    input.indices = Arc::from([]);
+    input.batches = Arc::from([]);
+    quad(
+        &mut input,
+        [0.0, 0.0, SIDE as f32, SIDE as f32],
+        [0, 0, 0, 102],
+        0,
+        None,
+    );
+    for vertex in Arc::make_mut(&mut input.vertices) {
+        vertex.uv = vertex.position.map(|value| value * 2.0 / SIDE as f32 - 1.0);
+        vertex.style_flags = render_model::UI_STYLE_RADIAL_GRADIENT;
+        vertex.overlay_color = [45.0 / 255.0, 4.0 / 255.0, 4.0 / 255.0, 0.8];
+    }
+    let Some(raster) = Raster::new(&input) else {
+        return;
+    };
+    let output = target(&raster.gpu, false);
+    for extent in [1.0, 3.0] {
+        let mut frame = input.clone();
+        for vertex in Arc::make_mut(&mut frame.vertices) {
+            vertex.uv = vertex.uv.map(|value| value / extent);
+        }
+        raster.draw(&frame, &output, None);
+        let pixels = raster.pixels(&output);
+        for [x, y] in [[32, 32], [0, 32], [0, 0], [16, 32]] {
+            let uv = [x, y].map(|value| ((value as f32 + 0.5) * 2.0 / SIDE as f32 - 1.0) / extent);
+            let radius = uv[0].hypot(uv[1]).min(1.0);
+            let expected = [
+                36.0 * radius,
+                3.2 * radius,
+                3.2 * radius,
+                102.0 + 102.0 * radius,
+            ];
+            let offset = ((y * SIDE + x) * 4) as usize;
+            for (actual, expected) in pixels[offset..offset + 4].iter().zip(expected) {
+                assert!(
+                    (f32::from(*actual) - expected).abs() <= 1.0,
+                    "pixel ({x},{y}), extent {extent}: {:?}",
+                    &pixels[offset..offset + 4]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_layout_on_small_targets_emits_valid_scissors() {
+    let mut input = scene();
+    input.viewport_size = [352, 184];
+    for batch in Arc::make_mut(&mut input.batches) {
+        batch.scissor = UiScissor::new(0, 0, 352, 184);
+        batch.depth_test = 0;
+        batch.depth_write = 0;
+        batch.isolated_depth_scope = None;
+    }
+    let Some(raster) = Raster::new(&input) else {
+        return;
+    };
+    for [width, height] in [[352, 184], [254, 124], [1, 1]] {
+        let output = raster.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("small UI surface"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: super::super::composite::UI_LAYER_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let validation_scope = raster
+            .gpu
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        raster.draw(&input, &output, None);
+        raster
+            .gpu
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let error = bevy::tasks::block_on(validation_scope.pop());
+        assert!(error.is_none(), "{width}x{height}: {error:?}");
+        if width > 1 {
+            assert!(
+                raster
+                    .pixels(&output)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel[3] != 0),
+                "valid small-target drawing must produce pixels"
+            );
+        }
+        raster.snapshot(&output);
+    }
+}
+
+#[test]
+fn admitted_intrinsic_glint_changes_the_production_shader_pixels() {
+    let mut input = scene();
+    input.vertices = Arc::from([]);
+    input.indices = Arc::from([]);
+    input.batches = Arc::from([]);
+    quad(
+        &mut input,
+        [0.0, 0.0, SIDE as f32, SIDE as f32],
+        [35, 55, 75, 255],
+        0,
+        None,
+    );
+    quad(
+        &mut input,
+        [8.0, 8.0, 56.0, 56.0],
+        [190, 140, 60, 255],
+        0,
+        None,
+    );
+    let Some(raster) = Raster::with_glint(&input, 1.0) else {
+        return;
+    };
+    let output = target(&raster.gpu, false);
+    raster.draw(&input, &output, None);
+    let plain = raster.pixels(&output);
+    let glint = assets::item::glint::builtin_item_glint("minecraft:enchanted_book");
+    for vertex in Arc::make_mut(&mut input.vertices).iter_mut().skip(4) {
+        vertex.style_flags = if glint.enabled().unwrap_or(false) {
+            render_model::UI_STYLE_GLINT
+        } else {
+            0
+        };
+    }
+    raster.draw(&input, &output, None);
+    let shiny = raster.pixels(&output);
+    assert_ne!(plain, shiny);
+    assert_eq!(&plain[..4], &shiny[..4], "shine stays within the item quad");
+    if let Some(directory) = std::env::var_os("CINNABAR_UI_RASTER_SNAPSHOT_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, pixels) in [("plain-item", plain), ("intrinsic-glint-item", shiny)] {
+            image::RgbaImage::from_raw(SIDE, SIDE, pixels)
+                .unwrap()
+                .save(directory.join(format!("{name}.png")))
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn item_glint_tints_grayscale_purple_and_restores_pack_pixels_without_changing_alpha() {
+    let mut input = scene();
+    input.vertices = Arc::from([]);
+    input.indices = Arc::from([]);
+    input.batches = Arc::from([]);
+    quad(&mut input, [8.0, 8.0, 56.0, 56.0], [0, 0, 0, 128], 0, None);
+    let Some(raster) = Raster::with_glint(&input, 1.0) else {
+        return;
+    };
+    let output = target(&raster.gpu, false);
+    raster.draw(&input, &output, None);
+    let plain = raster.pixels(&output);
+    for vertex in Arc::make_mut(&mut input.vertices) {
+        vertex.style_flags = render_model::UI_STYLE_GLINT;
+    }
+    let mut first = None;
+    for color in [
+        [100, 0, 0, 255],
+        [0, 100, 0, 255],
+        [100, 0, 0, 255],
+        [100, 100, 100, 255],
+        [255, 255, 255, 0],
+    ] {
+        raster.gpu.queue.write_texture(
+            raster.item_glint.as_image_copy(),
+            &color,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        raster.draw(&input, &output, None);
+        let pixels = raster.pixels(&output);
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(plain.as_chunks::<4>().0)
+                .all(|(a, b)| a[3] == b[3])
+        );
+        assert_eq!(
+            &pixels[..4],
+            &[0; 4],
+            "glint keeps transparent item coverage"
+        );
+        let center = &pixels[((32 * SIDE + 32) * 4) as usize..][..4];
+        if color[3] == 0 {
+            assert_eq!(pixels, plain);
+        } else if color[0] == color[1] && color[1] == color[2] {
+            assert!(
+                center[2] > center[0] && center[0] > center[1] && center[1] > 0,
+                "grayscale artwork must retain the purple enchantment tint: {center:?}"
+            );
+        } else if color[0] != 0 {
+            assert!(center[0] > 0 && center[1] == 0 && center[2] == 0);
+            if let Some(first) = &first {
+                assert_eq!(&pixels, first);
+            } else {
+                first = Some(pixels);
+            }
+        } else {
+            assert!(center[1] > 0 && center[0] == 0 && center[2] == 0);
+        }
+    }
+}
+
+/// A clock-only glint update restores overlapping translucent/model pixels in painter order.
+#[test]
+fn retained_glint_clock_damage_matches_full_replay_with_unchanged_depth_models() {
+    let mut input = scene();
+    for vertex in &mut Arc::make_mut(&mut input.vertices)[4..8] {
+        vertex.style_flags |= UI_STYLE_GLINT;
+    }
+    let Some(raster) = Raster::with_glint_pattern(
+        &input,
+        1.0,
+        [2, 2],
+        &[
+            255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 120, 40, 180, 255,
+        ],
+    ) else {
+        return;
+    };
+    let damage = animated_batches(&input)
+        .into_iter()
+        .fold(UiDamage::Unchanged, UiDamage::union);
+    let UiDamage::Rect(rect) = damage else {
+        panic!("glint must have bounded coverage");
+    };
+    let retained = target(&raster.gpu, false);
+    let full = target(&raster.gpu, false);
+    raster.draw(&input, &retained, None);
+    let initial = raster.pixels(&retained);
+    raster.gpu.queue.write_buffer(
+        &raster.viewport,
+        0,
+        bytemuck::cast_slice(&[SIDE as f32, SIDE as f32, 0.75_f32, 1.0]),
+    );
+    raster.draw(&input, &full, None);
+    raster.draw(&input, &retained, Some(rect));
+    let expected = raster.pixels(&full);
+    assert_ne!(
+        initial, expected,
+        "synthetic glint clock must change pixels"
+    );
+    assert_eq!(raster.pixels(&retained), expected);
+}
+
+/// Resident model vertices use the same projection, UVs, lighting and damage as CPU witnesses.
+#[test]
+fn skinned_ui_model_matches_projected_gpu_pixels() {
+    let mut animated = scene();
+    animated.textures = Arc::new(
+        UiTextureCatalog::new(
+            vec![
+                UiTexturePage::owned(
+                    [2, 2],
+                    Arc::from([
+                        230, 40, 30, 255, 20, 210, 60, 255, 30, 70, 230, 255, 220, 200, 20, 255,
+                    ]),
+                )
+                .unwrap(),
+            ],
+            1,
+        )
+        .unwrap(),
+    );
+    let bone = render_model::UiModelBone {
+        screen: (glam::Mat4::from_translation(glam::Vec3::new(20., 12., 0.5))
+            * glam::Mat4::from_rotation_z(0.17)
+            * glam::Mat4::from_scale(glam::Vec3::new(24., 28., 1.)))
+        .to_cols_array_2d(),
+        normal: [[0.8, 0., 0.6, 0.], [0., 1., 0., 0.], [-0.6, 0., 0.8, 0.]],
+        overlay: [0.3, 0.1, 0.2, 0.15],
+        uv_rect: [0.; 4],
+        uv_cross: [2., 2., 0., 0.],
+        tint: [0.8, 1., 0.7, 1.],
+        styles: [render_model::UI_STYLE_ADDITIVE, 0, 0, 0],
+    };
+    let vertex = UiRenderVertex {
+        position: [0.; 2],
+        clip_z: 0.,
+        clip_w: 1.,
+        uv: [0.; 2],
+        color: [255; 4],
+        style_flags: render_api::UI_STYLE_MODEL_VERTEX,
+        alpha_cutoff: -1.,
+        model_light: 1.,
+        overlay_color: [0., 0., 1., 0.],
+    };
+    animated.vertices = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]]
+        .map(|point| UiRenderVertex {
+            position: point,
+            uv: point,
+            ..vertex
+        })
+        .into();
+    animated.indices = Arc::from([0, 1, 2, 0, 2, 3]);
+    animated.batches =
+        Arc::from([
+            UiRenderBatch::new(0, UiScissor::new(0, 0, SIDE, SIDE), 0, 6, 0)
+                .with_depth_test(true)
+                .with_depth_write(true)
+                .with_isolated_depth_scope(Some(7)),
+        ]);
+    animated.models = Arc::from([render_model::UiModelPose {
+        scope: 7,
+        bones: Arc::from([bone]),
+        bounds: UiScissor::new(10, 10, 45, 45),
+    }]);
+    animated.validate().unwrap();
+    let Some(raster) = Raster::new(&animated) else {
+        return;
+    };
+    let before = target(&raster.gpu, false);
+    raster.draw(&animated, &before, None);
+    let mut projected = animated.clone();
+    projected.models = Arc::from([]);
+    projected.vertices = animated
+        .vertices
+        .iter()
+        .copied()
+        .map(|vertex| bone.project(vertex))
+        .collect::<Vec<_>>()
+        .into();
+    projected.validate().unwrap();
+    let expected = target(&raster.gpu, false);
+    raster.draw(&projected, &expected, None);
+    for (actual, expected) in raster
+        .pixels(&before)
+        .into_iter()
+        .zip(raster.pixels(&expected))
+    {
+        assert!(
+            actual.abs_diff(expected) <= 1,
+            "GPU model shading changed: {actual} vs {expected}"
+        );
+    }
+    // A CPU fallback can cover pixels outside the incoming model's conservative bounds.
+    let mut fallback = projected.clone();
+    for vertex in Arc::make_mut(&mut fallback.vertices) {
+        vertex.position[0] -= 16.;
+    }
+    for (previous, next) in [(&fallback, &animated), (&animated, &fallback)] {
+        raster.draw(previous, &before, None);
+        let damage = match plan(previous, next) {
+            UiDamage::Full => None,
+            UiDamage::Rect(rect) => Some(rect),
+            UiDamage::Unchanged => panic!("projection transitions must redraw their coverage"),
+        };
+        raster.draw(next, &before, damage);
+        raster.draw(next, &expected, None);
+        assert_eq!(raster.pixels(&before), raster.pixels(&expected));
+    }
+    raster.draw(&animated, &before, None);
+    let mut moved_bone = bone;
+    moved_bone.screen[3][0] += 5.;
+    let mut moved = animated.clone();
+    moved.revision += 1;
+    moved.models = Arc::from([render_model::UiModelPose {
+        scope: 7,
+        bones: Arc::from([moved_bone]),
+        bounds: UiScissor::new(15, 10, 45, 45),
+    }]);
+    let UiDamage::Rect(damage) = plan(&animated, &moved) else {
+        panic!("palette motion must redraw its old and new coverage")
+    };
+    raster.draw(&moved, &before, Some(damage));
+    let full = target(&raster.gpu, false);
+    raster.draw(&moved, &full, None);
+    assert_eq!(raster.pixels(&before), raster.pixels(&full));
+    // A simultaneous ordinary HUD edit must preserve palette coverage in the damage union.
+    let mut mixed = moved.clone();
+    quad(&mut mixed, [1., 1., 7., 7.], [220, 100, 30, 255], 0, None);
+    raster.draw(&mixed, &before, None);
+    let mut changed = mixed.clone();
+    Arc::make_mut(&mut changed.vertices)[4].color[0] = 20;
+    Arc::make_mut(&mut Arc::make_mut(&mut changed.models)[0].bones)[0].screen[3][0] += 4.;
+    Arc::make_mut(&mut changed.models)[0].bounds.x += 4;
+    let UiDamage::Rect(damage) = plan(&mixed, &changed) else {
+        panic!("mixed HUD and palette changes need bounded damage");
+    };
+    raster.draw(&changed, &before, Some(damage));
+    raster.draw(&changed, &full, None);
+    assert_eq!(raster.pixels(&before), raster.pixels(&full));
+
+    // Clock-only glint updates use posed coverage even after a retained palette changes.
+    for vertex in Arc::make_mut(&mut moved.vertices) {
+        vertex.style_flags |= UI_STYLE_GLINT;
+    }
+    let Some(glint) = Raster::with_glint_pattern(
+        &moved,
+        1.,
+        [2, 2],
+        &[
+            255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 120, 40, 180, 255,
+        ],
+    ) else {
+        return;
+    };
+    let retained = target(&glint.gpu, false);
+    let reference = target(&glint.gpu, false);
+    glint.draw(&moved, &retained, None);
+    let initial = glint.pixels(&retained);
+    let mut coverage = animated_batches(&moved);
+    assert_eq!(coverage[0], UiDamage::Rect(moved.models[0].bounds));
+    update_model_animation_damage(&changed, &mut coverage);
+    assert_eq!(coverage[0], UiDamage::Rect(changed.models[0].bounds));
+    glint.gpu.queue.write_buffer(
+        &glint.viewport,
+        0,
+        bytemuck::cast_slice(&[SIDE as f32, SIDE as f32, 0.75_f32, 1.]),
+    );
+    let UiDamage::Rect(damage) = animated_batches(&moved)[0] else {
+        panic!("model glint needs posed coverage");
+    };
+    glint.draw(&moved, &retained, Some(damage));
+    glint.draw(&moved, &reference, None);
+    assert_ne!(glint.pixels(&reference), initial);
+    assert_eq!(glint.pixels(&retained), glint.pixels(&reference));
+}

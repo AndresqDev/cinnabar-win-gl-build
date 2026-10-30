@@ -1,0 +1,579 @@
+//! Maps a decoded server form plus its live values onto the engine's form model.
+//! Slider labels use the localized format after resolving their current value.
+
+use std::sync::Arc;
+
+use json_ui::{
+    ActionElement, ActionForm, ButtonImage, CustomElement, CustomForm, FormButton, FormModel,
+    ModalForm,
+};
+use protocol::{CustomFormElement, FormButtonImage, MenuElement, ServerFormModel};
+
+use crate::ui_runtime::forms::{FormEngineState, FormValue, values::slider_fraction};
+use ui_engine::sources::RemoteImage;
+
+/// `None` for a form the engine cannot draw (unsupported controls).
+pub(super) fn engine_model(
+    model: &ServerFormModel,
+    state: &FormEngineState,
+    in_game: bool,
+    translate: &dyn Fn(&str) -> Option<Arc<str>>,
+    remote: &dyn Fn(&str) -> RemoteImage,
+    resolve_text: &dyn Fn(&protocol::FormText, &protocol::FormTextBudget) -> String,
+) -> Option<FormModel> {
+    let budget = protocol::FormTextBudget::default();
+    let resolve = &|text: &protocol::FormText| resolve_text(text, &budget);
+    Some(match model {
+        ServerFormModel::TextMenu(menu) => FormModel::Action(ActionForm {
+            title: resolve(&menu.title),
+            body: resolve(&menu.content),
+            elements: menu
+                .buttons
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    ActionElement::Button(FormButton {
+                        text: resolve(text),
+                        image: menu
+                            .button_images
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .and_then(|image| engine_image(image, remote)),
+                    })
+                })
+                .collect(),
+        }),
+        ServerFormModel::ElementMenu(menu) => FormModel::Action(ActionForm {
+            title: resolve(&menu.title),
+            body: resolve(&menu.content),
+            elements: menu
+                .elements
+                .iter()
+                .map(|element| match element {
+                    MenuElement::Button { text, image } => ActionElement::Button(FormButton {
+                        text: resolve(text),
+                        image: image.as_ref().and_then(|image| engine_image(image, remote)),
+                    }),
+                    MenuElement::Label(text) => ActionElement::Label(resolve(text)),
+                    MenuElement::Header(text) => ActionElement::Header(resolve(text)),
+                    MenuElement::Divider => ActionElement::Divider,
+                })
+                .collect(),
+        }),
+        ServerFormModel::Modal(modal) => FormModel::Modal(ModalForm {
+            title: resolve(&modal.title),
+            body: resolve(&modal.content),
+            button1: resolve(&modal.button1),
+            button2: resolve(&modal.button2),
+        }),
+        ServerFormModel::Custom(form) => {
+            let slider_format =
+                translate("options.sliderLabelFormat").unwrap_or_else(|| Arc::from("%s: %s"));
+            FormModel::Custom(CustomForm {
+                title: resolve(&form.title),
+                icon: form
+                    .icon
+                    .as_ref()
+                    .and_then(|image| engine_image(image, remote)),
+                elements: form
+                    .elements
+                    .iter()
+                    .enumerate()
+                    .map(|(index, element)| {
+                        custom_element(
+                            index,
+                            element,
+                            state,
+                            in_game,
+                            resolve,
+                            &slider_format,
+                            &budget,
+                        )
+                    })
+                    .collect(),
+                submit_text: match &form.submit {
+                    Some(text) => resolve(text),
+                    None => budget.copy(translate("gui.submit").as_deref().unwrap_or("Submit")),
+                },
+                submit_visible: true,
+            })
+        }
+        // NPC dialogue draws through its own screen, not a form template.
+        ServerFormModel::NpcDialogue(_) | ServerFormModel::Unsupported(_) => return None,
+    })
+}
+
+/// Maps package paths and the current remote image state to template bindings.
+fn engine_image(
+    image: &FormButtonImage,
+    remote: &dyn Fn(&str) -> RemoteImage,
+) -> Option<ButtonImage> {
+    match image {
+        FormButtonImage::Path(path) => Some(ButtonImage::Path(path.to_string())),
+        FormButtonImage::Url(url) => match remote(url) {
+            RemoteImage::Ready(_) | RemoteImage::ReadyWithoutBody => {
+                Some(ButtonImage::Url(url.to_string()))
+            }
+            RemoteImage::Loading => Some(ButtonImage::Loading),
+            RemoteImage::Failed => None,
+        },
+    }
+}
+
+/// Resolves one custom control with its retained value and localized slider label.
+fn custom_element(
+    index: usize,
+    element: &CustomFormElement,
+    state: &FormEngineState,
+    in_game: bool,
+    resolve: &dyn Fn(&protocol::FormText) -> String,
+    slider_format: &str,
+    budget: &protocol::FormTextBudget,
+) -> CustomElement {
+    let value = state.values.get(index);
+    let tooltip =
+        |tooltip: &Option<protocol::FormText>| tooltip.as_ref().map_or_else(String::new, resolve);
+    match element {
+        CustomFormElement::Label { text } => CustomElement::Label {
+            text: resolve(text),
+        },
+        CustomFormElement::Header { text } => CustomElement::Header {
+            text: resolve(text),
+        },
+        CustomFormElement::Divider => CustomElement::Divider,
+        CustomFormElement::Toggle {
+            text,
+            control_locked,
+            default,
+            tooltip: tip,
+        } => CustomElement::Toggle {
+            text: resolve(text),
+            enabled: control_locked.is_enabled(in_game),
+            on: match value {
+                Some(FormValue::Toggle(on)) => *on,
+                _ => *default,
+            },
+            tooltip: tooltip(tip),
+        },
+        CustomFormElement::Slider {
+            text,
+            control_locked,
+            min,
+            max,
+            default,
+            tooltip: tip,
+            timeout,
+            step,
+        } => {
+            let current = match value {
+                Some(FormValue::Slider(current)) => *current,
+                _ => default.get(),
+            };
+            CustomElement::Slider {
+                enabled: control_locked.is_enabled(in_game),
+                text: budget.format_translation(
+                    slider_format,
+                    &[
+                        resolve(text),
+                        budget.copy(&number_text(current, step.get())),
+                    ],
+                ),
+                fraction: slider_fraction(min.get(), max.get(), current),
+                tooltip: tooltip(tip),
+                timeout: timeout.get(),
+            }
+        }
+        CustomFormElement::StepSlider {
+            text,
+            control_locked,
+            steps,
+            default,
+            tooltip: tip,
+        } => {
+            let index = match value {
+                Some(FormValue::Step(index)) => *index,
+                _ => *default,
+            };
+            CustomElement::StepSlider {
+                enabled: control_locked.is_enabled(in_game),
+                text: budget.format_translation(
+                    slider_format,
+                    &[
+                        resolve(text),
+                        steps.get(index as usize).map_or_else(String::new, resolve),
+                    ],
+                ),
+                steps: steps.len(),
+                index,
+                tooltip: tooltip(tip),
+            }
+        }
+        CustomFormElement::Dropdown {
+            text,
+            options,
+            default,
+            tooltip: tip,
+        } => CustomElement::Dropdown {
+            text: resolve(text),
+            options: options.iter().map(resolve).collect(),
+            index: match value {
+                Some(FormValue::Dropdown(index)) => *index,
+                _ => *default,
+            },
+            open: state.open_dropdowns.contains(&index),
+            tooltip: tooltip(tip),
+        },
+        CustomFormElement::MultiSelect {
+            text,
+            options,
+            default,
+            tooltip: tip,
+        } => CustomElement::MultiSelect {
+            text: resolve(text),
+            options: options.iter().map(resolve).collect(),
+            selected: match value {
+                Some(FormValue::MultiSelect(indexes)) => indexes.clone(),
+                _ => default.to_vec(),
+            },
+            open: state.open_multiselects.contains(&index),
+            tooltip: tooltip(tip),
+        },
+        CustomFormElement::Input {
+            text,
+            control_locked,
+            placeholder,
+            default,
+            tooltip: tip,
+        } => {
+            // Editable values have their own admission limit; clipping them here would rewrite the draft.
+            let current = match value {
+                Some(FormValue::Text(current)) => current.clone(),
+                _ => default.to_string(),
+            };
+            CustomElement::Input {
+                text: resolve(text),
+                enabled: control_locked.is_enabled(in_game),
+                value: current,
+                placeholder: resolve(placeholder),
+                tooltip: tooltip(tip),
+            }
+        }
+    }
+}
+
+/// Formats float values as integers for whole steps and with six decimals otherwise.
+fn number_text(value: f64, step: f64) -> String {
+    let value = value as f32;
+    if (step as f32).fract() == 0.0 {
+        format!("{}", value.floor() as i32)
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+#[cfg(test)]
+mod control_locked_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn form_display_model_shares_expansion_budget_across_all_buttons() {
+        // The smaller case fails safely before attempting the full amplification case.
+        for count in [32, 4_096] {
+            let source = serde_json::json!({"type":"form", "title":"Title", "content":"Body",
+                "buttons":vec![serde_json::json!({"text":{"rawtext":[{"translate":"large"}]}}); count]
+            }).to_string();
+            assert!(source.len() < protocol::MAX_FORM_JSON_BYTES);
+            let packet = protocol::test_support::packets::modal_form_request_packet(1, &source);
+            let Some(protocol::WorldEvent::Ui(protocol::UiEvent::Form(event))) =
+                protocol::into_world_event(packet, 0).unwrap()
+            else {
+                panic!("server form");
+            };
+            let mut runtime = crate::ui_runtime::UiRuntime::new(1);
+            runtime.set_server_lang(assets::ServerLangOverlay::from_layers([format!(
+                "large={}\n",
+                "x".repeat(protocol::MAX_FORM_JSON_BYTES)
+            )]));
+            let state = FormEngineState::for_model(&event.model);
+            let Some(FormModel::Action(form)) = engine_model(
+                &event.model,
+                &state,
+                true,
+                &|key| runtime.translation(key),
+                &|_| RemoteImage::Failed,
+                &|text, budget| runtime.resolve_form_text(text, budget),
+            ) else {
+                panic!("action form");
+            };
+            let labels: Vec<_> = form
+                .elements
+                .iter()
+                .map(|element| match element {
+                    ActionElement::Button(button) => button.text.as_str(),
+                    _ => panic!("button"),
+                })
+                .collect();
+            let retained = form.title.len()
+                + form.body.len()
+                + labels.iter().map(|text| text.len()).sum::<usize>();
+            assert!(
+                retained <= protocol::MAX_FORM_TEXT_EXPANSION_BYTES,
+                "{count} buttons retained {retained} bytes"
+            );
+            assert_eq!(labels.len(), count);
+            assert_eq!(form.title, "Title");
+            assert_eq!(form.body, "Body");
+            assert!(labels[0].chars().all(|character| character == 'x'));
+            assert_eq!(labels.last(), Some(&""));
+        }
+    }
+
+    #[test]
+    fn form_display_model_shares_expansion_budget_with_slider_formats_and_submit() {
+        let source = serde_json::json!({"type":"custom_form", "content":vec![
+            serde_json::json!({"type":"slider", "text":"Label", "tooltip":"Tip", "min":0, "max":10}); 32
+        ]}).to_string();
+        let packet = protocol::test_support::packets::modal_form_request_packet(1, &source);
+        let Some(protocol::WorldEvent::Ui(protocol::UiEvent::Form(event))) =
+            protocol::into_world_event(packet, 0).unwrap()
+        else {
+            panic!("server form");
+        };
+        let state = FormEngineState::for_model(&event.model);
+        let template: Arc<str> = "x".repeat(protocol::MAX_FORM_JSON_BYTES).into();
+        let Some(FormModel::Custom(form)) = engine_model(
+            &event.model,
+            &state,
+            true,
+            &|_| Some(Arc::clone(&template)),
+            &|_| RemoteImage::Failed,
+            &|text, budget| budget.copy(text),
+        ) else {
+            panic!("custom form");
+        };
+        let retained = form.title.len()
+            + form.submit_text.len()
+            + form
+                .elements
+                .iter()
+                .map(|element| {
+                    let CustomElement::Slider { text, tooltip, .. } = element else {
+                        panic!("slider");
+                    };
+                    text.len() + tooltip.len()
+                })
+                .sum::<usize>();
+        assert!(retained <= protocol::MAX_FORM_TEXT_EXPANSION_BYTES);
+        assert!(form.submit_text.is_empty());
+        assert!(
+            matches!(form.elements.last(), Some(CustomElement::Slider { text, tooltip, .. })
+            if text.is_empty() && tooltip.is_empty())
+        );
+    }
+
+    /// An exhausted display budget must not clip an input's value, which seeds its edit draft.
+    #[test]
+    fn exhausted_display_budget_keeps_input_values_whole() {
+        let mut content =
+            vec![serde_json::json!({"type":"slider", "text":"Label", "min":0, "max":10}); 32];
+        content.push(serde_json::json!({"type":"input", "text":"Name", "default":"keep me"}));
+        let source = serde_json::json!({"type":"custom_form", "content":content}).to_string();
+        let packet = protocol::test_support::packets::modal_form_request_packet(1, &source);
+        let Some(protocol::WorldEvent::Ui(protocol::UiEvent::Form(event))) =
+            protocol::into_world_event(packet, 0).unwrap()
+        else {
+            panic!("server form");
+        };
+        let state = FormEngineState::for_model(&event.model);
+        let template: Arc<str> = "x".repeat(protocol::MAX_FORM_JSON_BYTES).into();
+        let Some(FormModel::Custom(form)) = engine_model(
+            &event.model,
+            &state,
+            true,
+            &|_| Some(Arc::clone(&template)),
+            &|_| RemoteImage::Failed,
+            &|text, budget| budget.copy(text),
+        ) else {
+            panic!("custom form");
+        };
+        assert!(
+            matches!(form.elements.last(), Some(CustomElement::Input { text, value, .. })
+            if text.is_empty() && value == "keep me")
+        );
+    }
+
+    #[test]
+    fn form_display_model_preserves_complete_long_slider_labels_and_steps() {
+        let long = "世界🙂".repeat(4_000);
+        let source = serde_json::json!({"type":"custom_form", "content":[
+            {"type":"slider", "text":long, "min":0, "max":10, "default":5},
+            {"type":"step_slider", "text":long, "steps":[long]}
+        ]})
+        .to_string();
+        let packet = protocol::test_support::packets::modal_form_request_packet(1, &source);
+        let Some(protocol::WorldEvent::Ui(protocol::UiEvent::Form(event))) =
+            protocol::into_world_event(packet, 0).unwrap()
+        else {
+            panic!("server form");
+        };
+        let state = FormEngineState::for_model(&event.model);
+        let Some(FormModel::Custom(form)) = engine_model(
+            &event.model,
+            &state,
+            true,
+            &|key| (key == "options.sliderLabelFormat").then(|| Arc::from("%s|%s")),
+            &|_| RemoteImage::Failed,
+            &|text, budget| budget.copy(text),
+        ) else {
+            panic!("custom form");
+        };
+        let [
+            CustomElement::Slider { text: slider, .. },
+            CustomElement::StepSlider { text: step, .. },
+        ] = form.elements.as_slice()
+        else {
+            panic!("sliders");
+        };
+        assert_eq!(slider.len(), long.len() + 2);
+        assert_eq!(slider, &format!("{long}|5"));
+        assert_eq!(step.len(), long.len() * 2 + 1);
+        assert_eq!(step, &format!("{long}|{long}"));
+    }
+
+    #[test]
+    fn form_display_model_preserves_complete_long_literal_and_translated_labels() {
+        let long = "世界🙂".repeat(4_000);
+        assert!(long.len() > protocol::MAX_UI_TEXT_BYTES);
+        let source = serde_json::json!({"type":"form",
+            "title":{"rawtext":[{"translate":"long"}]}, "content":long,
+            "buttons":[{"text":{"rawtext":[{"text":long}]}}]
+        })
+        .to_string();
+        let packet = protocol::test_support::packets::modal_form_request_packet(1, &source);
+        let Some(protocol::WorldEvent::Ui(protocol::UiEvent::Form(event))) =
+            protocol::into_world_event(packet, 0).unwrap()
+        else {
+            panic!("server form");
+        };
+        let mut runtime = crate::ui_runtime::UiRuntime::new(1);
+        runtime.set_server_lang(assets::ServerLangOverlay::from_layers([format!(
+            "long={long}\n"
+        )]));
+        let state = FormEngineState::for_model(&event.model);
+        let Some(FormModel::Action(form)) = engine_model(
+            &event.model,
+            &state,
+            true,
+            &|key| runtime.translation(key),
+            &|_| RemoteImage::Failed,
+            &|text, budget| runtime.resolve_form_text(text, budget),
+        ) else {
+            panic!("action form");
+        };
+        assert_eq!(form.title, long);
+        assert_eq!(form.body, long);
+        let ActionElement::Button(button) = &form.elements[0] else {
+            panic!("button");
+        };
+        assert_eq!(button.text, long);
+    }
+
+    #[test]
+    fn decorated_menu_button_images_use_the_shared_engine_route() {
+        let model = ServerFormModel::ElementMenu(protocol::ElementMenuForm {
+            title: protocol::FormText::from("Menu"),
+            content: protocol::FormText::from(""),
+            elements: vec![
+                MenuElement::Header(protocol::FormText::from("Header")),
+                MenuElement::Button {
+                    text: protocol::FormText::from("Path"),
+                    image: Some(FormButtonImage::Path(Arc::from("textures/items/apple"))),
+                },
+                MenuElement::Button {
+                    text: protocol::FormText::from("Url"),
+                    image: Some(FormButtonImage::Url(Arc::from(
+                        "https://example.invalid/image",
+                    ))),
+                },
+            ]
+            .into(),
+        });
+        let state = FormEngineState::for_model(&model);
+        for (remote, expected) in [
+            (RemoteImage::Loading, Some(ButtonImage::Loading)),
+            (
+                RemoteImage::Ready(Arc::from([])),
+                Some(ButtonImage::Url("https://example.invalid/image".to_owned())),
+            ),
+            (
+                RemoteImage::ReadyWithoutBody,
+                Some(ButtonImage::Url("https://example.invalid/image".to_owned())),
+            ),
+            (RemoteImage::Failed, None),
+        ] {
+            let Some(FormModel::Action(form)) = engine_model(
+                &model,
+                &state,
+                true,
+                &|_| None,
+                &|_| remote.clone(),
+                &|text, budget| budget.copy(text),
+            ) else {
+                panic!("action form");
+            };
+            assert!(matches!(&form.elements[0], ActionElement::Header(_)));
+            assert!(
+                matches!(&form.elements[1], ActionElement::Button(FormButton { image: Some(ButtonImage::Path(path)), .. }) if path == "textures/items/apple")
+            );
+            let ActionElement::Button(button) = &form.elements[2] else {
+                panic!("url button");
+            };
+            assert_eq!(button.image, expected);
+        }
+    }
+
+    #[test]
+    fn slider_labels_use_the_localized_format_and_fractional_step_precision() {
+        let finite = |value| protocol::FormNumber::new(value).unwrap();
+        let model = ServerFormModel::Custom(protocol::CustomForm {
+            title: "Numbers".into(),
+            icon: None,
+            submit: None,
+            elements: vec![CustomFormElement::Slider {
+                text: "Volume".into(),
+                control_locked: Default::default(),
+                min: finite(0.0),
+                max: finite(10.0),
+                step: finite(0.5),
+                default: finite(2.5),
+                timeout: finite(0.0),
+                tooltip: None,
+            }]
+            .into(),
+        });
+        let state = FormEngineState::for_model(&model);
+        let Some(FormModel::Custom(form)) = engine_model(
+            &model,
+            &state,
+            true,
+            &|key| (key == "options.sliderLabelFormat").then(|| Arc::from("%s : %s")),
+            &|_| RemoteImage::Failed,
+            &|text, budget| budget.copy(text),
+        ) else {
+            panic!("custom form");
+        };
+        assert!(
+            matches!(&form.elements[0], CustomElement::Slider { text, .. } if text == "Volume : 2.500000")
+        );
+    }
+
+    #[test]
+    fn whole_slider_values_drop_the_fraction() {
+        assert_eq!(number_text(5.0, 1.0), "5");
+        assert_eq!(number_text(2.5, 0.5), "2.500000");
+        assert_eq!(number_text(-1.5, 1.0), "-2");
+    }
+}

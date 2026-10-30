@@ -1,0 +1,31 @@
+[package]
+name = "inventory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+reads = [
+    "assets/vanilla-source.json",
+    "crates/protocol/fixtures/*",
+]
+
+[dependencies]
+protocol-ids = { path = "../protocol-ids" }
+simulation-clock = { path = "../simulation-clock" }
+assets = { path = "../assets" }
+protocol = { path = "../protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+protocol = { path = "../protocol", features = ["test-support"] }
+test-alloc = { path = "../test-alloc" }
+
+[lints]
+workspace = true

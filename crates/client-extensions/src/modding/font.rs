@@ -1,0 +1,444 @@
+//! Optional local typography for the explicitly granted personal controls panel.
+
+use std::path::Path;
+
+use assets::{
+    CellGlyph, FontPixels, FontTexturePage, RuntimeFontCatalog, encode_font_catalog, pack_cells,
+};
+use sha2::{Digest, Sha256};
+
+/// Optional font selected for the personal controls panel.
+pub const FONT_ENV: &str = "CINNABAR_MOD_FONT";
+/// Upper bound on the local font source read by the registration worker.
+pub const MAX_SOURCE_BYTES: usize = mod_api::MAX_PANEL_FONT_BYTES;
+const ATLAS_SIDE: u32 = render_model::UI_LOCAL_FONT_PAGE_SIDE;
+const FONT_EM: f32 = mod_api::PANEL_FONT_EM_GUI_PIXELS * ui::FONT_DESIGN_PIXEL_TEXELS as f32;
+const RASTER_SCALE: u32 = 2;
+const ICON_RASTER_SCALE: u32 = RASTER_SCALE * 4;
+const PRINTABLE_ASCII: std::ops::RangeInclusive<char> = ' '..='~';
+const PRINTABLE_LATIN_1: std::ops::RangeInclusive<char> = '\u{a0}'..='\u{ff}';
+// Exclude the General Punctuation block's leading spacing and directional controls.
+const GENERAL_PUNCTUATION: std::ops::RangeInclusive<char> = '\u{2010}'..='\u{205e}';
+
+/// Reads and rasterizes a bounded local source on the registration worker.
+pub fn load(path: &Path) -> Result<RuntimeFontCatalog, String> {
+    let bytes = mod_host::local_files::read(path, MAX_SOURCE_BYTES)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    rasterize(&bytes)
+}
+
+/// Rasterizes a bounded in-memory font source at the panel density.
+pub fn rasterize(bytes: &[u8]) -> Result<RuntimeFontCatalog, String> {
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err("font source exceeds local byte limit".into());
+    }
+    rasterize_at(bytes, RASTER_SCALE)
+}
+
+/// Builds a bounded atlas while preserving logical glyph sizes at the requested density.
+fn rasterize_at(bytes: &[u8], raster_scale: u32) -> Result<RuntimeFontCatalog, String> {
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+        .map_err(str::to_owned)?;
+    let icons: Vec<_> = (mod_api::PANEL_ICON_GLYPH_START
+        ..mod_api::PANEL_ICON_GLYPH_START + mod_api::MAX_PANEL_ICON_GLYPHS)
+        .filter_map(char::from_u32)
+        .filter(|codepoint| font.lookup_glyph_index(*codepoint) != 0)
+        .collect();
+    let side = if icons.is_empty() {
+        ATLAS_SIDE
+    } else {
+        render_model::UI_LOCAL_ICON_FONT_PAGE_SIDE
+    };
+    let mut cells = Vec::new();
+    let characters = PRINTABLE_ASCII
+        .chain(
+            PRINTABLE_LATIN_1
+                .chain(GENERAL_PUNCTUATION)
+                .filter(|codepoint| font.lookup_glyph_index(*codepoint) != 0),
+        )
+        // Keep the established minus and replacement outside the punctuation ranges.
+        .chain(std::iter::once('\u{2212}'))
+        .chain(std::iter::once(char::REPLACEMENT_CHARACTER))
+        .chain(icons);
+    for codepoint in characters {
+        let is_icon = (mod_api::PANEL_ICON_GLYPH_START
+            ..mod_api::PANEL_ICON_GLYPH_START + mod_api::MAX_PANEL_ICON_GLYPHS)
+            .contains(&u32::from(codepoint));
+        let raster_scale = if is_icon {
+            ICON_RASTER_SCALE
+        } else {
+            raster_scale
+        };
+        let source = if font.lookup_glyph_index(codepoint) == 0 {
+            '?'
+        } else {
+            codepoint
+        };
+        let metrics = font.metrics(source, FONT_EM);
+        if metrics.width > 64 || metrics.height > 64 || !metrics.advance_width.is_finite() {
+            return Err("font glyph dimensions exceed local bounds".into());
+        }
+        // Empty glyphs keep their advance and get a transparent texel with valid carrier UVs.
+        let empty = metrics.width == 0 || metrics.height == 0;
+        let logical_size = if empty {
+            [1, 1]
+        } else {
+            [metrics.width as u32, metrics.height as u32]
+        };
+        let size = if empty {
+            [1, 1]
+        } else {
+            logical_size.map(|size| size * raster_scale)
+        };
+        let mut rgba8 = vec![255; size[0] as usize * size[1] as usize * 4];
+        for pixel in rgba8.as_chunks_mut::<4>().0 {
+            pixel[3] = 0;
+        }
+        if !empty {
+            let (dense, alpha) = font.rasterize(source, FONT_EM * raster_scale as f32);
+            let left = dense.xmin - metrics.xmin * raster_scale as i32;
+            let top = (metrics.ymin + metrics.height as i32) * raster_scale as i32
+                - (dense.ymin + dense.height as i32);
+            if left < 0
+                || top < 0
+                || left as usize + dense.width > size[0] as usize
+                || top as usize + dense.height > size[1] as usize
+            {
+                return Err("font raster exceeds logical glyph bounds".into());
+            }
+            for y in 0..dense.height {
+                for x in 0..dense.width {
+                    let target =
+                        (((top as usize + y) * size[0] as usize + left as usize + x) * 4) + 3;
+                    rgba8[target] = alpha[y * dense.width + x];
+                }
+            }
+        }
+        cells.push(CellGlyph {
+            codepoint,
+            size,
+            rgba8: rgba8.into(),
+            bearing: [
+                metrics.xmin as i16,
+                -(metrics.ymin + metrics.height as i32) as i16
+                    + if is_icon {
+                        ((ui::TEXT_LINE_HEIGHT_64 as f32 / 64.0 + FONT_EM) * 0.5
+                            - ui::TEXT_BASELINE_64 as f32 / 64.0)
+                            .round() as i16
+                    } else {
+                        0
+                    },
+            ],
+            advance_64: (metrics.advance_width * 64.0)
+                .round()
+                .clamp(0.0, i16::MAX as f32) as i16,
+            draw_size_64: logical_size.map(|value| value * 64),
+        });
+    }
+    if cells.len() > ui::mod_panel::MAX_FONT_GLYPHS {
+        return Err("font exceeds local glyph limit".into());
+    }
+    let atlas = pack_cells(&cells, 0, side, 1);
+    if atlas.glyphs.len() != cells.len() || atlas.pages.len() != 1 {
+        return Err("font exceeds local atlas bounds".into());
+    }
+    let source_hash: [u8; 32] = Sha256::digest(bytes).into();
+    let pages = atlas
+        .pages
+        .into_iter()
+        .map(|rgba| {
+            let pixels: Vec<_> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[3])
+                .collect();
+            FontTexturePage {
+                source_path: "font/personal-panel.png".into(),
+                source_bytes: bytes.len() as u32,
+                source_sha256: source_hash,
+                pixels_sha256: Sha256::digest(&pixels).into(),
+                width: side,
+                height: side,
+                pixels: FontPixels::Coverage(pixels.into()),
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut glyphs = atlas
+        .glyphs
+        .iter()
+        .map(|glyph| glyph.metrics)
+        .collect::<Vec<_>>();
+    glyphs.sort_unstable_by_key(|glyph| glyph.codepoint);
+    let encoded =
+        encode_font_catalog(source_hash, &glyphs, &pages).map_err(|error| error.to_string())?;
+    RuntimeFontCatalog::decode(&encoded, source_hash)
+        .map(|font| {
+            font.with_glyphs(&atlas.glyphs, |_| true)
+                .with_linear_sampling()
+                .with_rendering(assets::FontRendering::OutlineCoverage)
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Covered punctuation keeps its own outline and survives layout without replacement.
+    #[test]
+    fn panel_font_preserves_typographic_punctuation() {
+        let bytes = include_bytes!("../../../../assets/fonts/InterVariable.ttf");
+        let source =
+            fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).unwrap();
+        let font = rasterize(bytes).unwrap();
+        let mut cache = ui::TextLayoutCache::new(8, 64 * 1024);
+        let layout = cache
+            .layout(ui::TextLayoutRequest {
+                text: "Tune Orbit’s ‘effects’ “smoothly”… – ready",
+                style: ui::TextStyle::default(),
+                width_64: 1000 * 64,
+                line_height_64: ui::TEXT_LINE_HEIGHT_64,
+                baseline_64: ui::TEXT_BASELINE_64,
+                scale: ui::UiScale::new_display(1.).unwrap(),
+                font: &font,
+                wrap: Default::default(),
+            })
+            .unwrap();
+        for codepoint in "’‘“”…–".chars() {
+            assert_ne!(source.lookup_glyph_index(codepoint), 0);
+            let glyph = font.glyph(codepoint).expect("covered punctuation glyph");
+            let metrics = source.metrics(codepoint, FONT_EM);
+            assert_eq!(
+                glyph.advance_64,
+                (metrics.advance_width * 64.).round() as i16
+            );
+            let coverage = glyph_coverage(&font, codepoint);
+            assert!(coverage.iter().any(|alpha| *alpha > 0));
+            assert_ne!(coverage, glyph_coverage(&font, '?'));
+            assert!(layout.glyphs().iter().any(|glyph| {
+                glyph.codepoint == codepoint && glyph.resolved_codepoint == codepoint
+            }));
+        }
+    }
+
+    /// Coverage admission stays bounded and missing characters use the existing replacement.
+    #[test]
+    fn panel_font_bounds_coverage_and_preserves_missing_glyph_fallback() {
+        let bytes = include_bytes!("../../../../assets/fonts/InterVariable.ttf");
+        let source =
+            fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).unwrap();
+        let font = rasterize(bytes).unwrap();
+        assert_eq!(font.pages().len(), 1);
+        assert_eq!(
+            [font.pages()[0].width, font.pages()[0].height],
+            [ATLAS_SIDE; 2]
+        );
+        assert_ne!(source.lookup_glyph_index('Ω'), 0);
+        for codepoint in ['\u{1f}', '\u{7f}', '\u{9f}', 'Ω', '漢', '🙂', '\u{10ffff}'] {
+            assert!(font.glyph(codepoint).is_none());
+        }
+        for codepoint in ('\u{a0}'..='\u{ff}').chain('\u{2010}'..='\u{205e}') {
+            assert_eq!(
+                font.glyph(codepoint).is_some(),
+                source.lookup_glyph_index(codepoint) != 0,
+                "coverage for {codepoint:?}"
+            );
+        }
+        let mut cache = ui::TextLayoutCache::new(8, 64 * 1024);
+        let layout = cache
+            .layout(ui::TextLayoutRequest {
+                text: "Ω🙂",
+                style: ui::TextStyle::default(),
+                width_64: 100 * 64,
+                line_height_64: ui::TEXT_LINE_HEIGHT_64,
+                baseline_64: ui::TEXT_BASELINE_64,
+                scale: ui::UiScale::new_display(1.).unwrap(),
+                font: &font,
+                wrap: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(layout.glyphs().len(), 2);
+        for glyph in layout.glyphs() {
+            assert_eq!(glyph.resolved_codepoint, char::REPLACEMENT_CHARACTER);
+            assert_eq!(
+                glyph.uv,
+                font.glyph(char::REPLACEMENT_CHARACTER).unwrap().uv
+            );
+        }
+    }
+
+    /// Reads a glyph's atlas rectangle to distinguish real ink from a fallback outline.
+    fn glyph_coverage(font: &RuntimeFontCatalog, codepoint: char) -> Vec<u8> {
+        let glyph = font.glyph(codepoint).unwrap();
+        let page = &font.pages()[glyph.page as usize];
+        let [left, top, right, bottom] = glyph.uv.map(usize::from);
+        (top..bottom)
+            .flat_map(|y| {
+                page.pixels.bytes()[y * page.width as usize + left..y * page.width as usize + right]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn invalid_and_oversized_optional_fonts_fail_before_attachment() {
+        assert!(rasterize(b"not a font").is_err());
+        assert!(
+            rasterize(&vec![0; MAX_SOURCE_BYTES + 1])
+                .unwrap_err()
+                .contains("byte limit")
+        );
+        let path =
+            std::env::temp_dir().join(format!("cinnabar-optional-font-{}.ttf", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.set_len((MAX_SOURCE_BYTES + 1) as u64).unwrap();
+        assert!(load(&path).unwrap_err().contains("byte limit"));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn supplied_font_fixture_is_antialiased_and_fits_one_private_page() {
+        let Some(path) = std::env::var_os(FONT_ENV) else {
+            eprintln!(
+                "skipping supplied_font_fixture_is_antialiased_and_fits_one_private_page: fixture unavailable; set CINNABAR_MOD_FONT to a local outline font"
+            );
+            return;
+        };
+        let font = load(Path::new(&path)).unwrap();
+        assert!(font.linear_sampling());
+        assert_eq!(font.pages().len(), 1);
+        let page = &font.pages()[0];
+        assert!(matches!(page.pixels, FontPixels::Coverage(_)));
+        assert!(page.pixels.bytes().len() <= (ATLAS_SIDE * ATLAS_SIDE * 4) as usize);
+        assert!(font.glyph('A').is_some_and(|glyph| glyph.advance_64 > 0));
+        let space = font.glyph(' ').unwrap();
+        assert!(space.advance_64 > 0);
+        assert_eq!(
+            [space.uv[2] - space.uv[0], space.uv[3] - space.uv[1]],
+            [1; 2]
+        );
+        let texel = usize::from(space.uv[1]) * page.width as usize + usize::from(space.uv[0]);
+        assert_eq!(page.pixels.bytes()[texel], 0);
+        let attached = font
+            .with_named_font(ui::mod_panel::FONT_NAME, &font)
+            .unwrap();
+        assert_eq!(attached.glyph('A').unwrap().page, 0);
+        assert_eq!(
+            attached
+                .font_named(ui::mod_panel::FONT_NAME)
+                .glyph('A')
+                .unwrap()
+                .page,
+            1
+        );
+        assert!(
+            font.pages()[0]
+                .pixels
+                .bytes()
+                .iter()
+                .any(|alpha| (1..255).contains(alpha))
+        );
+    }
+
+    #[test]
+    fn supplied_font_density_changes_raster_without_changing_logical_layout() {
+        let Some(path) = std::env::var_os(FONT_ENV) else {
+            eprintln!(
+                "skipping supplied_font_density_changes_raster_without_changing_logical_layout: fixture unavailable; set CINNABAR_MOD_FONT to a local outline font"
+            );
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let native = rasterize_at(&bytes, 1).unwrap();
+        let dense = rasterize_at(&bytes, RASTER_SCALE).unwrap();
+        for codepoint in "Ag1 Cinnaroids".chars() {
+            let native_glyph = native.glyph(codepoint).unwrap();
+            let dense_glyph = dense.glyph(codepoint).unwrap();
+            assert_eq!(native_glyph.bearing, dense_glyph.bearing);
+            assert_eq!(native_glyph.advance_64, dense_glyph.advance_64);
+            assert_eq!(
+                native.draw_size_64(codepoint),
+                dense.draw_size_64(codepoint)
+            );
+            if codepoint != ' ' {
+                assert_eq!(
+                    dense_glyph.uv[2] - dense_glyph.uv[0],
+                    (native_glyph.uv[2] - native_glyph.uv[0]) * RASTER_SCALE as u16
+                );
+            }
+        }
+        let mut cache = ui::TextLayoutCache::new(8, 64 * 1024);
+        for scale in [1.0, 1.5, 2.0] {
+            let request = |font| ui::TextLayoutRequest {
+                text: "Ag1 Cinnaroids",
+                style: ui::TextStyle::default(),
+                width_64: 400 * 64,
+                line_height_64: ui::TEXT_LINE_HEIGHT_64,
+                baseline_64: ui::TEXT_BASELINE_64,
+                scale: ui::UiScale::new_display(scale).unwrap(),
+                font,
+                wrap: Default::default(),
+            };
+            let native_layout = cache.layout(request(&native)).unwrap();
+            let dense_layout = cache.layout(request(&dense)).unwrap();
+            assert_eq!(native_layout.size_64(), dense_layout.size_64());
+            for (native, dense) in native_layout.glyphs().iter().zip(dense_layout.glyphs()) {
+                assert_eq!(native.bounds_64, dense.bounds_64);
+            }
+            assert!(!Arc::ptr_eq(&native_layout, &dense_layout));
+        }
+    }
+
+    /// Real icon outlines retain tint and use a bounded dense atlas with unchanged text metrics.
+    #[test]
+    fn supplied_icon_font_has_dense_coverage_and_bounded_logical_metrics() {
+        let Some(path) = std::env::var_os(FONT_ENV) else {
+            eprintln!(
+                "skipping supplied_icon_font_has_dense_coverage_and_bounded_logical_metrics: fixture unavailable; set CINNABAR_MOD_FONT to an icon outline font"
+            );
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let source =
+            fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()).unwrap();
+        let codepoints: Vec<_> = (mod_api::PANEL_ICON_GLYPH_START
+            ..mod_api::PANEL_ICON_GLYPH_START + mod_api::MAX_PANEL_ICON_GLYPHS)
+            .filter_map(char::from_u32)
+            .filter(|c| source.lookup_glyph_index(*c) != 0)
+            .collect();
+        if codepoints.is_empty() {
+            eprintln!(
+                "skipping supplied_icon_font_has_dense_coverage_and_bounded_logical_metrics: reserved icon glyph fixture unavailable; CINNABAR_MOD_FONT contains no reserved icons"
+            );
+            return;
+        }
+        let font = rasterize(&bytes).unwrap();
+        assert_eq!(font.rendering(), assets::FontRendering::OutlineCoverage);
+        assert!(font.linear_sampling());
+        assert_eq!(
+            font.pages()[0].width,
+            render_model::UI_LOCAL_ICON_FONT_PAGE_SIDE
+        );
+        for codepoint in codepoints {
+            let glyph = font.glyph(codepoint).unwrap();
+            let size = font.draw_size_64(codepoint).unwrap();
+            assert!(size[0] > 0 && size[1] > 0);
+            assert_eq!(
+                u32::from(glyph.uv[2] - glyph.uv[0]) * 64,
+                size[0] * ICON_RASTER_SCALE
+            );
+            assert_eq!(
+                u32::from(glyph.uv[3] - glyph.uv[1]) * 64,
+                size[1] * ICON_RASTER_SCALE
+            );
+        }
+    }
+}

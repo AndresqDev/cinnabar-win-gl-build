@@ -1,0 +1,76 @@
+name: Windows GL build
+
+# Temporary, unofficial build. The source is a snapshot of cinnabar-mc/cinnabar dev
+# with OpenGL added back as a last-resort backend.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CINNABAR_BUILD_COMMIT: ${{ github.sha }}
+
+jobs:
+  build:
+    name: Build Cinnabar for Windows
+    runs-on: windows-2025
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          go version
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Build Rust client and tools
+        shell: bash
+        run: |
+          cargo build --profile play --locked --no-default-features \
+            -p cinnabar -p asset-compiler -p update-installer
+
+      - name: Build Go core and local server
+        shell: bash
+        run: |
+          go build -tags joinprofile \
+            -ldflags "$(bash packaging/common/core-ldflags.sh)" \
+            -o target/play/bedrock-core.exe ./core/cmd/bedrock-core
+          (
+            cd tools/localserver
+            GOWORK=off go build -o ../../target/play/bedrock-local-server.exe .
+          )
+
+      - name: Stage portable Windows payload
+        shell: pwsh
+        run: |
+          ./.github/scripts/stage-windows-payload.ps1 -Root "$PWD" -Out "$PWD/dist/Cinnabar-Windows-OpenGL"
+
+      - name: Show payload
+        shell: bash
+        run: |
+          find dist -maxdepth 3 -type f | head -40
+          du -sh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Cinnabar-Windows-OpenGL
+          path: dist/Cinnabar-Windows-OpenGL
+          retention-days: 7

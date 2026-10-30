@@ -1,0 +1,420 @@
+//! Typed pack rules shared by registry validation and cold asset compilation.
+
+use super::rules::BLOCK_POLICY_BYTES;
+use crate::{EntityRenderMaterial, EntityRenderMaterialState};
+use serde::Deserialize;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::OnceLock,
+};
+
+macro_rules! domain {
+    ($name:ident { $($variant:ident),+ $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+        pub enum $name { $($variant),+ }
+        impl $name {
+            /// Every contract slot, used to reject an incomplete policy.
+            pub const ALL: &[Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+domain!(PackTexture {
+    PaleMossCarpetSide,
+    BambooFenceGate,
+    BeaconCore,
+    BeaconShell,
+    BeeNestSide,
+    BeeNestBottom,
+    BeeNestTop,
+    BeeNestFront,
+    BeehiveSide,
+    BeehiveTop,
+    BeehiveFront,
+    ChiseledBookshelfSide,
+    ChiseledBookshelfTop,
+    ChiseledBookshelfFront,
+    CactusSide,
+    CactusBottom,
+    CactusTop,
+    CakeSide,
+    CakeBottom,
+    CakeTop,
+    CakeWest,
+    FarmlandSide,
+    Farmland,
+    GrassSide,
+    MyceliumSide,
+    ResinClump,
+    PowderSnow,
+    StrawBed
+});
+domain!(PackBlock {
+    Beacon,
+    Obsidian,
+    Glass,
+    BeeNest,
+    Beehive,
+    ChiseledBookshelf,
+    Cactus,
+    Cake,
+    Farmland,
+    ResinClump,
+    Dirt,
+    CobblestoneWall,
+    Air,
+    Stone,
+    HeavyCore,
+    Crafter,
+    DriedGhast,
+    SculkSensor,
+    CalibratedSculkSensor,
+    SculkShrieker,
+    BigDripleaf,
+    SmallDripleaf,
+    StrawBed,
+    Observer
+});
+domain!(TextureSelector {
+    Door,
+    Flower,
+    Sapling,
+    Powered,
+    FrostedIce,
+    Wheat,
+    Stem,
+    CropStages,
+    Torchflower
+});
+
+/// How a built-in block's world faces pick its authored face slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaceSlots {
+    /// The front on the cardinal face reads south, or east when lit; other sides read north.
+    Furnace { lit: bool },
+    /// The front on the cardinal face reads south, other sides north and both caps up.
+    Pumpkin,
+}
+
+/// Selects cardinal face-slot rules, deriving furnace membership from the registry policy.
+pub fn face_slots(identifier: &str) -> Option<FaceSlots> {
+    match super::block_render_fact(identifier).kind {
+        super::BlockRenderKind::Furnace => Some(FaceSlots::Furnace { lit: false }),
+        super::BlockRenderKind::LitFurnace => Some(FaceSlots::Furnace { lit: true }),
+        _ => match identifier {
+            "minecraft:pumpkin" | "minecraft:carved_pumpkin" | "minecraft:lit_pumpkin" => {
+                Some(FaceSlots::Pumpkin)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// Material used by the missing harness attachables supplied by the compiler.
+pub const HARNESS_MATERIAL: &str = "harness";
+
+/// The alpha-tested entity material that compiler-completed bindings draw with.
+pub const ALPHA_TEST_MATERIAL: &str = "entity_alphatest";
+
+/// Native material aliases whose names overlap actor and item identifiers.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum MaterialKind {
+    /// A referenced material without an admitted declaration.
+    Provisional,
+    Actor,
+    UnmaskedArmor,
+    Dragon,
+    DissolveDepth,
+    DissolveColor,
+}
+
+/// The precedence of a block item over its legacy sprite.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum ItemVisualKind {
+    EmptyHand,
+    BlockModel,
+    Sprite,
+}
+
+/// A pinned mineral's native texture and wire identity.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MineralRule {
+    pub network_hash: u32,
+    pub identifier: String,
+    pub key: String,
+    pub path: String,
+}
+
+/// The exact blocks.json texture form admitted by a retained cube route.
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+pub enum AliasCubeSource {
+    Scalar(String),
+    Pillar([String; 3]),
+}
+
+/// Pack-derived names and ordered native selectors with one checked policy owner.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackRules {
+    alias_cubes: BTreeMap<String, AliasCubeSource>,
+    alias_paths: BTreeMap<String, String>,
+    textures: BTreeMap<PackTexture, String>,
+    alpha_textures: Vec<PackTexture>,
+    blocks: BTreeMap<PackBlock, String>,
+    selectors: BTreeMap<String, TextureSelector>,
+    variants: BTreeMap<TextureSelector, Vec<String>>,
+    mushrooms: BTreeMap<String, String>,
+    powered_prefix: String,
+    materials: BTreeMap<String, MaterialKind>,
+    egg_aliases: BTreeMap<String, String>,
+    superseded_eggs: BTreeMap<String, String>,
+    pub minerals: Vec<MineralRule>,
+    item_visuals: BTreeMap<String, ItemVisualKind>,
+    default_item_tints: BTreeMap<String, [u8; 3]>,
+    empty_hand: PackBlock,
+    /// Render controllers vanilla entities reference but the pinned samples omit, each mapped
+    /// to the pack controller it is completed from.
+    omitted_render_controllers: BTreeMap<String, String>,
+}
+
+/// The pinned vanilla pack's names by domain (`material`, `actor`, `terrain_texture`, ...).
+fn vocabulary() -> &'static BTreeMap<&'static str, BTreeSet<&'static str>> {
+    static VOCABULARY: OnceLock<BTreeMap<&str, BTreeSet<&str>>> = OnceLock::new();
+    VOCABULARY.get_or_init(|| {
+        let mut vocabulary = BTreeMap::<&str, BTreeSet<&str>>::new();
+        for row in include_str!("../../data/vanilla-pack-vocabulary-1.26.60.tsv").lines() {
+            let (domain, name) = row
+                .split_once('\t')
+                .expect("pack vocabulary rows are tabbed");
+            vocabulary.entry(domain).or_default().insert(name);
+        }
+        vocabulary
+    })
+}
+
+/// Loads the compiler's embedded pack contracts once for asset admission.
+pub fn rules() -> &'static PackRules {
+    #[derive(Deserialize)]
+    struct Policy {
+        pack_rules: PackRules,
+    }
+    static RULES: OnceLock<PackRules> = OnceLock::new();
+    RULES.get_or_init(|| {
+        serde_json::from_slice::<Policy>(BLOCK_POLICY_BYTES)
+            .expect("valid pack policy")
+            .pack_rules
+    })
+}
+
+impl PackTexture {
+    /// Resolves a typed terrain slot through its checked pack rule.
+    pub fn key(self) -> &'static str {
+        &rules().textures[&self]
+    }
+}
+impl PackBlock {
+    /// Returns the canonical registry identity required by this pack contract.
+    pub fn identifier(self) -> &'static str {
+        &rules().blocks[&self]
+    }
+    /// Returns the unnamespaced blocks.json key for this contract.
+    pub fn bare(self) -> &'static str {
+        self.identifier()
+            .strip_prefix("minecraft:")
+            .expect("vanilla block namespace")
+    }
+}
+impl PackRules {
+    /// Returns the default RGB for an item whose sprite alpha stores a dye mask.
+    pub fn default_item_tint(&self, identifier: &str) -> Option<[u8; 3]> {
+        self.default_item_tints.get(identifier).copied()
+    }
+    /// Resolves the exact source shape of a retained selector-alias cube.
+    pub fn alias_cube(&self, identifier: &str) -> Option<&AliasCubeSource> {
+        self.alias_cubes.get(identifier)
+    }
+    /// Resolves its validated terrain key to the pinned texture path.
+    pub fn alias_path(&self, key: &str) -> Option<&str> {
+        self.alias_paths.get(key).map(String::as_str)
+    }
+    /// Resolves a texture array's declared selector before any state is read.
+    pub fn selector(&self, key: &str) -> Option<TextureSelector> {
+        self.selectors.get(key).copied()
+    }
+    /// Gives a split registry identity its retained legacy array index.
+    pub fn variant(&self, selector: TextureSelector, identifier: &str) -> Option<usize> {
+        self.variants.get(&selector)?.iter().position(|name| {
+            name.strip_prefix("minecraft:").unwrap_or(name)
+                == identifier.strip_prefix("minecraft:").unwrap_or(identifier)
+        })
+    }
+    /// Finds the huge-mushroom family bound to an authored face key.
+    pub fn mushroom_block(&self, key: &str) -> Option<&str> {
+        self.mushrooms.iter().find_map(|(prefix, block)| {
+            key.strip_prefix(prefix)
+                .filter(|face| {
+                    matches!(
+                        *face,
+                        "west" | "east" | "bottom" | "top" | "north" | "south"
+                    )
+                })
+                .map(|_| block.as_str())
+        })
+    }
+    /// Retains the legacy powered-array prefix during cold state admission.
+    pub fn is_powered(&self, identifier: &str) -> bool {
+        identifier
+            .strip_prefix("minecraft:")
+            .unwrap_or(identifier)
+            .starts_with(&self.powered_prefix)
+    }
+    /// Tests native alpha consumers beyond the material's authored flags.
+    pub fn supports_alpha(&self, key: &str) -> bool {
+        self.alpha_textures
+            .iter()
+            .any(|slot| self.textures[slot] == key)
+    }
+    /// Resolves a material class while keeping undeclared aliases explicit.
+    pub fn material(&self, name: &str) -> Option<MaterialKind> {
+        let name = material_name(name);
+        self.materials.get(name).copied().or_else(|| {
+            if material_states().contains_key(name) {
+                return Some(MaterialKind::Actor);
+            }
+            vocabulary()
+                .get("material")?
+                .iter()
+                .any(|known| *known == name || known.strip_suffix(".skinning") == Some(name))
+                .then_some(MaterialKind::Provisional)
+        })
+    }
+    /// Selects the shader contract for exact authored native material targets.
+    pub fn raster(&self, name: &str) -> EntityRenderMaterial {
+        match self.material(name) {
+            Some(MaterialKind::Dragon) => EntityRenderMaterial::Dragon,
+            Some(MaterialKind::DissolveDepth) => EntityRenderMaterial::DissolveDepth,
+            Some(MaterialKind::DissolveColor) => EntityRenderMaterial::DissolveColor,
+            _ => EntityRenderMaterial::Default,
+        }
+    }
+    /// Resolves generated declaration states, including their skinning aliases.
+    pub fn material_state(&self, name: &str) -> Option<EntityRenderMaterialState> {
+        if matches!(
+            self.raster(name),
+            EntityRenderMaterial::DissolveDepth | EntityRenderMaterial::DissolveColor
+        ) {
+            // Paired passes retain the dedicated renderer's comparison and write contracts.
+            return None;
+        }
+        material_states().get(material_name(name)).copied()
+    }
+    /// Enumerates generated states so pipeline preparation follows the material catalog.
+    pub fn material_states(&self) -> impl Iterator<Item = (&str, EntityRenderMaterialState)> {
+        material_states().keys().filter_map(|name| {
+            self.material_state(name)
+                .map(|state| (name.as_str(), state))
+        })
+    }
+    /// Resolves the actor-to-retail egg rename, retaining ordinary suffix routing.
+    pub fn egg_identifier(&self, actor: &str) -> String {
+        self.egg_aliases
+            .get(actor)
+            .cloned()
+            .unwrap_or_else(|| format!("{actor}{}", super::SPAWN_EGG_SUFFIX))
+    }
+    /// Returns the newer actor definition that supersedes a compatibility egg.
+    pub fn superseding_egg(&self, actor: &str) -> Option<&str> {
+        self.superseded_eggs.get(actor).map(String::as_str)
+    }
+    /// Resolves the exact legacy item presentation exceptions at compile time.
+    pub fn item_visual(&self, identifier: &str) -> Option<ItemVisualKind> {
+        if identifier == self.empty_hand() {
+            Some(ItemVisualKind::EmptyHand)
+        } else {
+            self.item_visuals.get(identifier).copied()
+        }
+    }
+    /// Each omitted render controller and the pack controller that completes it.
+    pub fn omitted_render_controllers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.omitted_render_controllers
+            .iter()
+            .map(|(name, template)| (name.as_str(), template.as_str()))
+    }
+    /// Returns the canonical empty-hand item identity for constructing its route.
+    pub fn empty_hand(&self) -> &str {
+        &self.blocks[&self.empty_hand]
+    }
+    /// Finds a pinned mineral contract without copying its identity list.
+    pub fn mineral(&self, identifier: &str) -> Option<&MineralRule> {
+        self.minerals
+            .iter()
+            .find(|rule| rule.identifier == identifier)
+    }
+}
+
+/// Loads generated declaration states independently of pack-authored overrides.
+fn material_states() -> &'static BTreeMap<String, EntityRenderMaterialState> {
+    static STATES: OnceLock<BTreeMap<String, EntityRenderMaterialState>> = OnceLock::new();
+    STATES.get_or_init(|| {
+        serde_json::from_str(include_str!("../../data/entity-material-states.json"))
+            .expect("valid entity material states")
+    })
+}
+
+/// Normalizes skinning variants and the material used by synthesized harness bindings.
+fn material_name(name: &str) -> &str {
+    match name.strip_suffix(".skinning").unwrap_or(name) {
+        HARNESS_MATERIAL => ALPHA_TEST_MATERIAL,
+        name => name,
+    }
+}
+
+/// Derives native leather sprite tinting from the admitted item material.
+pub fn leather_sprite(path: &str) -> bool {
+    let Some(stem) = path.strip_prefix("textures/items/").and_then(|name| {
+        name.strip_suffix(".png")
+            .or_else(|| name.strip_suffix(".tga"))
+    }) else {
+        return false;
+    };
+    let facts = super::ItemFacts::builtin().expect("valid item facts");
+    facts
+        .by_identifier(&format!("minecraft:{stem}"))
+        .is_some_and(|fact| fact.is_leather())
+}
+
+/// How a built-in block's native class picks its terrain texture array entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextureVariant {
+    /// One entry for every state of the block.
+    Fixed(usize),
+    /// Entry one while the boolean state is set, else entry zero.
+    Flag(super::BlockProperty),
+}
+
+/// The class-selected terrain array entry of a built-in block; entries past an array draw its first.
+pub fn texture_variant(identifier: &str) -> Option<TextureVariant> {
+    use TextureVariant::{Fixed, Flag};
+    Some(match identifier {
+        "minecraft:carved_pumpkin" | "minecraft:cave_vines" => Fixed(0),
+        "minecraft:lit_pumpkin"
+        | "minecraft:cave_vines_body_with_berries"
+        | "minecraft:cave_vines_head_with_berries" => Fixed(1),
+        "minecraft:pumpkin" => Fixed(2),
+        "minecraft:pale_hanging_moss" => Flag(super::BlockProperty::Tip),
+        "minecraft:mangrove_propagule" => Flag(super::BlockProperty::Hanging),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests;
+/// Resolves the candle paired with a registered composite cake route.
+pub fn candle_companion(identifier: &str) -> Option<&str> {
+    (super::block_render_fact(identifier).kind == super::BlockRenderKind::CandleCake)
+        .then(|| identifier.strip_suffix("_cake"))
+        .flatten()
+}
+
+mod validation;

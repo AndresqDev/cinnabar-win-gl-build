@@ -1,0 +1,63 @@
+[package]
+name = "assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+platform-specific = ["macos", "windows"]
+reads = [
+    "assets/bedrock-target.json",
+    "assets/cinnangles-five-bold-source.json",
+    "assets/cinnangles-five-source.json",
+    "assets/cinnangles-sans-source.json",
+    "assets/cinnangles-seven-source.json",
+    "assets/cinnangles-ten-source.json",
+    "assets/geyser-mappings-source.json",
+    "assets/hud-source-v2225.json",
+    "assets/oreui-icons-source.json",
+    "assets/vanilla-source.json",
+    "assets/touch-controls.json",
+    "crates/protocol/data/retail_biomes_1_26_60.txt",
+    "crates/protocol/data/retail_actors_1_26_60.txt",
+    "crates/protocol/data/retail_items_1_26_60.tsv",
+    "crates/protocol/data/item_capacity_1_26_60.tsv",
+    "crates/protocol/data/item_tags_native.tsv",
+    "crates/asset-compiler/data/*",
+    "tools/localserver/painting_motives.json",
+]
+
+[features]
+test-support = []
+
+[dependencies]
+fontdue = { version = "0.9.3", default-features = false, features = ["std"] }
+protocol-ids = { path = "../protocol-ids" }
+env-compat = { path = "../env-compat" }
+block-transform = { path = "../block-transform" }
+bitflags = { version = "2", features = ["serde"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+glam.workspace = true
+png = "0.18"
+lewton = "0.10.2"
+rayon.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zip = { version = "7", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,230 @@
+//! Reviewed default-icon bindings, independent of texture filename spelling.
+//!
+//! This bounded crosswalk adds canonical inventory keys to the existing atlas
+//! routes. It establishes neither auxiliary icon states nor metadata policy.
+//! The default alias selects an entry in the pinned item texture atlas.
+
+use std::collections::BTreeSet;
+
+use assets::AssetError;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+
+use super::invalid;
+
+pub(super) const SOURCE_PATH: &str = "registry/default-sprite-bindings-1.26.60.json";
+pub(super) const SOURCE_BYTES: &[u8] =
+    include_bytes!("../../../../assets/data/default-sprite-bindings-1.26.60.json");
+
+const RETAIL_SHA256: &str = "4d9b95a973180279fba6c45e115c5327f995d5b50ac828aad278d6ca2a16946c";
+const ATLAS_SHA256: &str = "b203a6a4daef52efe98a1e7569a1b69ac7c1a08ca824e8556d141be34233107a";
+const ROUTE_COUNT: usize = 46;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingTable {
+    schema: u32,
+    game_version: Box<str>,
+    source_tag: Box<str>,
+    source_commit: Box<str>,
+    source_url: Box<str>,
+    archive_sha256: Box<str>,
+    atlas_sha256: Box<str>,
+    retail_allowlist_sha256: Box<str>,
+    coverage: Box<str>,
+    routes: Box<[DefaultBinding]>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DefaultBinding {
+    pub(super) identifier: Box<str>,
+    pub(super) default_alias: Box<str>,
+    pub(super) atlas_variant: u32,
+}
+
+/// Load the checked-in default routes for the pinned pack and item registry.
+pub(super) fn reviewed() -> Result<Box<[DefaultBinding]>, AssetError> {
+    parse(SOURCE_BYTES)
+}
+
+/// Reject stale pack identities and unsupported, duplicate or unordered routes.
+fn parse(bytes: &[u8]) -> Result<Box<[DefaultBinding]>, AssetError> {
+    let table: BindingTable = serde_json::from_slice(bytes).map_err(|source| AssetError::Json {
+        path: SOURCE_PATH.into(),
+        source,
+    })?;
+    let retail_hash = format!("{:x}", Sha256::digest(assets::item::retail::SOURCE_BYTES));
+    // The table is audited against the pinned pack; a pack bump fails closed until re-audited.
+    let pinned = assets::vanilla_source();
+    if table.schema != 2
+        || !pinned.tag.starts_with(&format!("v{}.", table.game_version))
+        || table.source_tag.as_ref() != pinned.tag.as_ref()
+        || table.source_commit.as_ref() != pinned.commit.as_ref()
+        || table.source_url.as_ref()
+            != format!(
+                "https://github.com/Mojang/bedrock-samples/tree/{}",
+                pinned.commit
+            )
+        || table.archive_sha256.as_ref() != pinned.sha256.as_ref()
+        || table.atlas_sha256.as_ref() != ATLAS_SHA256
+        || table.retail_allowlist_sha256.as_ref() != RETAIL_SHA256
+        || retail_hash != RETAIL_SHA256
+        || table.coverage.is_empty()
+        || table.routes.len() != ROUTE_COUNT
+    {
+        return Err(invalid(
+            "default sprite binding provenance does not match reviewed inputs",
+        ));
+    }
+    let retail = std::str::from_utf8(assets::item::retail::SOURCE_BYTES)
+        .map_err(|_| invalid("retail item allowlist is not UTF-8"))?
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(_, identifier)| identifier))
+        .collect::<BTreeSet<_>>();
+    let mut previous: Option<&str> = None;
+    for binding in &table.routes {
+        let admitted = retail.contains(binding.identifier.as_ref())
+            || binding.identifier.as_ref() == assets::facts::FILLED_MAP_IDENTIFIER;
+        if !admitted
+            || previous.is_some_and(|value| value >= binding.identifier.as_ref())
+            || binding.atlas_variant != 0
+            || binding.default_alias.is_empty()
+            || binding.default_alias.len() > 256
+            || !binding
+                .default_alias
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(invalid(
+                "default sprite binding is noncanonical, unsupported or unordered",
+            ));
+        }
+        previous = Some(&binding.identifier);
+    }
+    Ok(table.routes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mutate one fixture field while keeping all unrelated values valid.
+    fn altered(change: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let mut table = serde_json::from_slice(SOURCE_BYTES).unwrap();
+        change(&mut table);
+        serde_json::to_vec(&table).unwrap()
+    }
+
+    #[test]
+    fn reviewed_table_has_exact_coverage_and_rejects_provenance_drift() {
+        assert_eq!(reviewed().unwrap().len(), ROUTE_COUNT);
+        for field in [
+            "source_commit",
+            "atlas_sha256",
+            "retail_allowlist_sha256",
+            "archive_sha256",
+        ] {
+            assert!(parse(&altered(|table| table[field] = "wrong".into())).is_err());
+        }
+    }
+
+    #[test]
+    fn unsupported_schemas_and_unknown_fields_fail_closed() {
+        assert!(
+            parse(&altered(|table| {
+                table["schema"] = 1.into();
+            }))
+            .is_err()
+        );
+        assert!(
+            parse(&altered(|table| {
+                table["extra"] = "unexpected".into();
+            }))
+            .is_err()
+        );
+        assert!(
+            parse(&altered(|table| {
+                table["routes"][0]["extra"] = "unexpected".into();
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_nonretail_and_nondefault_bindings_fail_closed() {
+        assert!(
+            parse(&altered(
+                |table| table["routes"][1] = table["routes"][0].clone()
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&altered(
+                |table| table["routes"][0]["identifier"] = "minecraft:invented".into()
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&altered(
+                |table| table["routes"][0]["atlas_variant"] = 1.into()
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&altered(
+                |table| table["routes"][0]["default_alias"] = "../apple".into()
+            ))
+            .is_err()
+        );
+    }
+
+    /// Every pinned behavior-pack icon component has its binding, so a pack bump cannot drop one.
+    #[test]
+    fn bindings_cover_every_pinned_behavior_pack_icon() {
+        let items = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join(assets::vanilla_source().cache_dir.as_ref())
+            .join("behavior_pack/items");
+        let Ok(entries) = std::fs::read_dir(&items) else {
+            eprintln!(
+                "skipping missing fixture: pinned behavior pack items at {}",
+                items.display()
+            );
+            return;
+        };
+        let bindings = reviewed()
+            .unwrap()
+            .iter()
+            .map(|binding| {
+                (
+                    binding.identifier.to_string(),
+                    binding.default_alias.to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut icons = 0;
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let item = pack_compile_input::json::parse_semantic_json(
+                &path,
+                &std::fs::read(&path).unwrap(),
+            )
+            .unwrap();
+            let item = &item["minecraft:item"];
+            let Some(default) =
+                item["components"]["minecraft:icon"]["textures"]["default"].as_str()
+            else {
+                continue;
+            };
+            let identifier = item["description"]["identifier"].as_str().unwrap();
+            icons += 1;
+            assert_eq!(
+                bindings.get(identifier).map(String::as_str),
+                Some(default),
+                "{identifier}"
+            );
+        }
+        assert!(icons > 0, "no icon components under {}", items.display());
+    }
+}

@@ -1,0 +1,37 @@
+{
+  "repository": "cinnabar-mc/cinnabar",
+  "checksums": "SHA256SUMS.txt",
+  "assets": {
+    "linux": {
+      "x86_64": "Cinnabar-x86_64.AppImage"
+    },
+    "windows": {
+      "x86_64": "Cinnabar-x64-setup.exe"
+    },
+    "macos": {
+      "arm64": "Cinnabar-arm64.dmg",
+      "x86_64": "Cinnabar-x86_64.dmg"
+    }
+  },
+  "manual_assets": {
+    "android": {
+      "arm64": "Cinnabar-arm64-v8a.apk"
+    }
+  },
+  "symbols": {
+    "archive": "cinnabar-symbols-{version}-{platform}-{arch}.zip",
+    "manifest": "manifest.json"
+  },
+  "install_script": "install.sh",
+  "linux_install": { "app_dir": "app", "current": "current" },
+  "update_payload_prefix": "update-payload-",
+  "update_channels": {
+    "beta": { "track": "tagged", "manifest": "update-beta.json" },
+    "nightly": { "track": "rolling", "tag": "nightly", "manifest": "update-nightly.json" }
+  },
+  "update_assets": {
+    "windows": {
+      "x86_64": "Cinnabar-x64.msi"
+    }
+  }
+}

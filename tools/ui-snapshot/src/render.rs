@@ -1,0 +1,887 @@
+//! Production screen painting into the JSON-UI editor's existing CPU target.
+
+mod backup_font;
+#[cfg(feature = "test-support")]
+mod bedrock_hotbar;
+mod character;
+#[cfg(feature = "test-support")]
+mod control_locked;
+#[cfg(feature = "test-support")]
+mod cosmetic_particles;
+#[cfg(feature = "test-support")]
+mod crafting;
+mod crosshair_coverage;
+#[cfg(feature = "test-support")]
+mod data_driven;
+mod edit_selection;
+#[cfg(feature = "test-support")]
+mod form_overlap;
+#[cfg(feature = "test-support")]
+mod menu_keyboard;
+mod panorama;
+mod saturation_overlap;
+#[cfg(feature = "test-support")]
+mod settings_draft;
+mod sprite_outline;
+mod tiled_image;
+#[cfg(feature = "test-support")]
+mod touch_editor;
+#[cfg(feature = "test-support")]
+mod touch_utilities;
+
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, LazyLock},
+};
+
+use image::ImageEncoder;
+use jsonui_editor::raster::{Canvas, Page};
+use oreui::menu_screen::{MenuGeometry, MenuInput};
+use ui::{DpiScale, SafeArea, TextLayoutCache, UiNode, UiNodeId, UiScale, UiTree, UiVisual};
+use ui_engine::{
+    engine::{
+        FormEngine,
+        screen::{PaintFrame, Screen, ScreenRegistry},
+    },
+    sources::{ImageWork, RemoteImage, RemoteSource},
+    text_metrics::TextMetrics,
+};
+use ui_screens::{
+    chat_screen::{ChatInput, ChatScreen},
+    player_list::PlayerList,
+};
+
+use crate::{
+    carriers::{self, Error},
+    fixtures::{Fixture, State},
+};
+
+pub const CAPTURE_SECONDS: f64 = 1.0;
+
+static REGISTRY: LazyLock<ScreenRegistry> = LazyLock::new(|| {
+    let mut registry = ScreenRegistry::new(ui_screens::menu_screens::retail_context());
+    registry.screen(ui_screens::chat_screen::CHAT_SCREEN);
+    #[cfg(feature = "test-support")]
+    registry.screen(
+        ui_screens::containers::ScreenLayout::Personal { book: true }
+            .screen()
+            .0,
+    );
+    ui_screens::hud::register(&mut registry);
+    ui_screens::chat_screen::register(&mut registry);
+    registry
+});
+
+struct Offline;
+
+impl RemoteSource for Offline {
+    /// Snapshot fixtures never download images or start network work.
+    fn state(&self, _: &str) -> RemoteImage {
+        RemoteImage::Failed
+    }
+}
+
+/// Paints a named state at fixed times and encodes deterministic RGBA PNG bytes.
+#[cfg(test)]
+pub fn png(state: &State, dir: &Path) -> Result<Vec<u8>, Error> {
+    png_at(state, dir, CAPTURE_SECONDS, None)
+}
+
+/// Samples caller-owned UI and cosmetic animation time without reading the clock.
+pub fn png_at(
+    state: &State,
+    dir: &Path,
+    seconds: f64,
+    resource_pack: Option<&Path>,
+) -> Result<Vec<u8>, Error> {
+    png_fixture(state, (state.fixture)(), dir, seconds, resource_pack)
+}
+
+/// Renders an authored panel at an explicit animation sample without creating a window.
+pub fn panel_png(
+    panel: ui::mod_panel::Panel,
+    size: [u32; 2],
+    gui_scale: u8,
+    seconds: f64,
+    dir: &Path,
+    resource_pack: Option<&Path>,
+) -> Result<Vec<u8>, Error> {
+    panel.validate()?;
+    let state = State {
+        name: "mod-panel",
+        size,
+        gui_scale,
+        fixture: || Fixture::EditSelection,
+    };
+    png_fixture(
+        &state,
+        Fixture::ModPanel(Box::new(panel), None, None),
+        dir,
+        seconds,
+        resource_pack,
+    )
+}
+
+/// Runs every source through the same carrier, production-painter and CPU raster path.
+fn png_fixture(
+    state: &State,
+    fixture: Fixture,
+    dir: &Path,
+    seconds: f64,
+    resource_pack: Option<&Path>,
+) -> Result<Vec<u8>, Error> {
+    if let Fixture::CrosshairCoverage { fixed } = &fixture {
+        return crosshair_coverage::png(state.size, *fixed, resource_pack);
+    }
+    if let Fixture::MaskRegression = &fixture {
+        return saturation_overlap::regression_png(state.size);
+    }
+    if let Fixture::SpriteOutline { outline } = &fixture {
+        return sprite_outline::png(state.size, *outline);
+    }
+    if let Fixture::SaturationOverlap { crop, source_alpha } = &fixture {
+        return saturation_overlap::png(state.size, *crop, *source_alpha);
+    }
+    if let Fixture::TiledImage { scale } = &fixture {
+        return tiled_image::png(state.size, *scale);
+    }
+    #[cfg(feature = "test-support")]
+    if matches!(&fixture, Fixture::ControlLocked) {
+        return control_locked::png(state, dir);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::CosmeticParticles { view, emitting } = &fixture {
+        return cosmetic_particles::png(state.size, *view, seconds, *emitting);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::FormHandoff { retained } = &fixture {
+        return form_overlap::handoff_png(state, dir, *retained);
+    }
+    #[cfg(feature = "test-support")]
+    if matches!(&fixture, Fixture::FormOverlap) {
+        return form_overlap::png(state, dir);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::DataDriven(screen) = &fixture {
+        return data_driven::png(state, dir, *screen);
+    }
+    #[cfg(feature = "test-support")]
+    if matches!(&fixture, Fixture::SettingsDraft) {
+        return settings_draft::png(state, dir);
+    }
+    #[cfg(feature = "test-support")]
+    if matches!(&fixture, Fixture::MenuKeyboard) {
+        return menu_keyboard::png(state, dir);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::TouchEditor { phase } = &fixture {
+        return touch_editor::png(state, dir, *phase, seconds);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::TouchUtilities(view) = &fixture {
+        return touch_utilities::png(state, dir, *view);
+    }
+    #[cfg(feature = "test-support")]
+    if let Fixture::BedrockHotbar { raised } = &fixture {
+        return bedrock_hotbar::png(state, dir, *raised);
+    }
+    let menu = matches!(
+        &fixture,
+        Fixture::Menu(_) | Fixture::Loading(_) | Fixture::ResourcePackLoading
+    );
+    let show_panorama = match &fixture {
+        Fixture::Menu(view) => view.out_of_game(),
+        Fixture::Loading(stage) => stage.is_world_entry(),
+        Fixture::ResourcePackLoading => false,
+        Fixture::Chat { .. }
+        | Fixture::TabList(_)
+        | Fixture::EditSelection
+        | Fixture::CrosshairCoverage { .. }
+        | Fixture::MaskRegression
+        | Fixture::SaturationOverlap { .. }
+        | Fixture::SpriteOutline { .. }
+        | Fixture::Toast { .. }
+        | Fixture::BackupFont
+        | Fixture::TiledImage { .. }
+        | Fixture::ModPanel(..)
+        | Fixture::HudSurface(..) => false,
+        #[cfg(feature = "test-support")]
+        Fixture::TouchEditor { .. }
+        | Fixture::TouchUtilities(..)
+        | Fixture::BedrockHotbar { .. }
+        | Fixture::CraftOverlap { .. }
+        | Fixture::CursorDurability
+        | Fixture::FormOverlap
+        | Fixture::FormHandoff { .. }
+        | Fixture::DataDriven(_)
+        | Fixture::SettingsDraft
+        | Fixture::MenuKeyboard
+        | Fixture::ControlLocked
+        | Fixture::CosmeticParticles { .. } => false,
+    };
+    let mut carriers = carriers::load(dir, menu || matches!(&fixture, Fixture::BackupFont))?;
+    #[cfg(feature = "test-support")]
+    let craft_icons = matches!(
+        &fixture,
+        Fixture::CraftOverlap { .. } | Fixture::CursorDurability
+    )
+    .then(|| crafting::icons(&mut carriers.pages))
+    .transpose()?;
+    let size = state.size.map(|value| value as f32);
+    let metrics = TextMetrics::for_viewport(
+        state.size,
+        DpiScale::new(1.0).unwrap(),
+        Some(state.gui_scale),
+    );
+    let mut nodes = Vec::new();
+    let mut next = 1;
+    let mut layouts = TextLayoutCache::new(4096, 32 * 1024 * 1024);
+    let translate = |key: &str| carriers.lang.lookup(key);
+    let mut frame = PaintFrame {
+        layouts: &mut layouts,
+        font: &carriers.font,
+        metrics,
+        solid_page: carriers.solid_page,
+        safe_area: SafeArea::ZERO,
+        content: size,
+        translate: &translate,
+        language: [0; 3],
+        now: 0.0,
+        nodes: &mut nodes,
+        next: &mut next,
+        renderers: &mut [],
+    };
+    match fixture {
+        Fixture::BackupFont => {
+            let engine = json_engine(&carriers)?;
+            backup_font::paint(&engine, &mut frame)?;
+        }
+        Fixture::SpriteOutline { .. }
+        | Fixture::CrosshairCoverage { .. }
+        | Fixture::MaskRegression
+        | Fixture::SaturationOverlap { .. }
+        | Fixture::TiledImage { .. } => {
+            unreachable!("asset-free capture returned above")
+        }
+        #[cfg(feature = "test-support")]
+        Fixture::CosmeticParticles { .. }
+        | Fixture::FormOverlap
+        | Fixture::FormHandoff { .. }
+        | Fixture::DataDriven(_)
+        | Fixture::SettingsDraft
+        | Fixture::MenuKeyboard
+        | Fixture::BedrockHotbar { .. }
+        | Fixture::ControlLocked => {
+            unreachable!("specialized capture returned above")
+        }
+        #[cfg(feature = "test-support")]
+        Fixture::CursorDurability => {
+            let mut engine = json_engine(&carriers)?;
+            crafting::paint_cursor(&engine, &carriers.lang, &craft_icons.unwrap(), &mut frame)?;
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        #[cfg(feature = "test-support")]
+        Fixture::CraftOverlap {
+            selected,
+            block_identity,
+        } => {
+            let mut engine = json_engine(&carriers)?;
+            crafting::paint(
+                &engine,
+                &carriers.lang,
+                &craft_icons.unwrap(),
+                selected,
+                block_identity,
+                &mut frame,
+            )?;
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        Fixture::Toast { title, message } => {
+            let mut engine = json_engine(&carriers)?;
+            let shown = ui::ShownToast {
+                title: &title,
+                message: &message,
+                press: None,
+                started_millis: 0,
+                slide: 1.0,
+            };
+            frame.now = seconds;
+            ui_screens::toast_screen::paint(
+                &mut ui_engine::cached_screen::CachedScreen::default(),
+                &engine,
+                &shown,
+                &mut frame,
+            )
+            .map_err(|error| error.to_string())?;
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        #[cfg(feature = "test-support")]
+        Fixture::TouchEditor { .. } | Fixture::TouchUtilities(..) => {
+            unreachable!("touch editor uses the complete presentation path")
+        }
+        Fixture::HudSurface(surface) => {
+            let mut engine = json_engine(&carriers)?;
+            let surface = Arc::new(*surface);
+            let mut ui = mod_ui::ModUi::default();
+            ui.set_hud_surfaces(std::iter::once(mod_ui::PublishedHudSurface {
+                owner: mod_ui::PanelUiOwner::Environment(0),
+                revision: 1,
+                surface: &surface,
+                authority: Default::default(),
+            }));
+            // The first paint lays out the root the projection then measures against.
+            for _ in 0..2 {
+                frame.nodes.clear();
+                *frame.next = 1;
+                ui.paint_hud_surfaces(Some(&engine), &mut frame, &|_, _| None);
+                ui.set_hud_projection(
+                    Some(crate::fixtures::hud_surface::camera(size[0] / size[1])),
+                    &|_| None,
+                );
+            }
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        Fixture::ModPanel(panel, hud, identity) => {
+            let mut engine = json_engine(&carriers)?;
+            if let Some(root) = resource_pack {
+                let files = panel_textures(&panel, root)?;
+                engine.set_server_atlas(
+                    ui_engine::atlas::ServerAtlas::new(
+                        &files,
+                        None,
+                        ui_engine::pages::SERVER_UI_PAGES,
+                    )
+                    .with_image_work(ImageWork::inline()),
+                    (carriers.pages.len() + ui_engine::pages::SERVER_UI_PAGE) as u16,
+                );
+            }
+            let mut ui = mod_ui::ModUi::default();
+            if let Some((name, portrait)) = identity {
+                engine
+                    .textures
+                    .lock()
+                    .set_local_player_head(Some(&portrait));
+                ui.set_local_player_panel_identity(name, true);
+            }
+            if let Some(hud) = hud {
+                let hud = Arc::new(*hud);
+                ui.set_hud_surfaces(std::iter::once(mod_ui::PublishedHudSurface {
+                    owner: mod_ui::PanelUiOwner::Environment(0),
+                    revision: 1,
+                    surface: &hud,
+                    authority: Default::default(),
+                }));
+            }
+            ui.set_mod_panel(mod_ui::PanelUiOwner::Environment(0), Some(&panel))?;
+            ui.set_mod_panel_open(true);
+            for now in [0.0, seconds] {
+                frame.nodes.clear();
+                *frame.next = 1;
+                frame.now = now;
+                ui.paint_mod_panel(Some(&engine), &mut frame);
+                engine.poll_native_images();
+            }
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        Fixture::EditSelection => {
+            let mut engine = json_engine(&carriers)?;
+            edit_selection::paint(&mut engine, &mut frame)?;
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        Fixture::Menu(view) => {
+            carriers::validate_oreui(dir)?;
+            let images = oreui::images::load_optional_oreui_images(dir)
+                .ok_or_else(|| Error::Invalid("OreUI artwork is unusable; make assets".into()))?;
+            let first = carriers.pages.len() as u16;
+            let mut artwork: HashMap<_, _> = images
+                .sprites
+                .iter()
+                .map(|(key, sprite)| {
+                    (
+                        key.clone(),
+                        ui::IconRef {
+                            color_mask: None,
+                            page: first + sprite.page,
+                            uv: sprite.bounds,
+                            glint: false,
+                        },
+                    )
+                })
+                .collect();
+            carriers.pages.extend(images.pages.iter().map(|page| Page {
+                repeat_content: None,
+                width: page.dimensions[0],
+                height: page.dimensions[1],
+                rgba: Arc::clone(&page.pixels),
+            }));
+            let logo = image::load_from_memory(launcher::branding::TITLE)
+                .map_err(|error| Error::Invalid(format!("embedded title artwork: {error}")))?
+                .into_rgba8();
+            let title_artwork = ui::IconRef {
+                color_mask: None,
+                page: carriers.pages.len() as u16,
+                uv: [0, 0, logo.width() as u16, logo.height() as u16],
+                glint: false,
+            };
+            carriers.pages.push(Page {
+                repeat_content: None,
+                width: logo.width(),
+                height: logo.height(),
+                rgba: logo.into_raw().into(),
+            });
+            cosmetic_icons(&mut artwork, &mut carriers.pages, seconds);
+            mod_icons(&view, &mut artwork, &mut carriers.pages)?;
+            let character_page = (view.screen == launcher::menu::MenuScreen::Home)
+                .then(|| character::texture(dir, &mut carriers.pages))
+                .transpose()?;
+            let mut screen = oreui_screen(first, images);
+            let mut scrolls = ui_engine::menu_scroll::MenuScrolls::default();
+            // Mount at zero, then sample settled motion without reading a clock or sleeping.
+            for now in [0.0, seconds] {
+                frame.nodes.clear();
+                *frame.next = 1;
+                frame.now = now;
+                screen
+                    .paint(
+                        MenuInput {
+                            view: &view,
+                            size,
+                            portrait: None,
+                            translate: frame.translate,
+                            artwork: &artwork,
+                            title_artwork: Some(title_artwork),
+                            scrolls: &mut scrolls,
+                            geometry: MenuGeometry::default(),
+                        },
+                        &mut frame,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let paint = screen.take_paint().unwrap();
+                paint
+                    .apply_entrance(frame.nodes, size)
+                    .map_err(|error| error.to_string())?;
+                if let (Some(preview), Some(page)) = (&paint.character_preview, character_page) {
+                    character::paint(preview.control, page, &mut frame)?;
+                }
+                if view.dressing_room.editor.is_some() || view.dressing_room.cosmetic_filter_open {
+                    screen
+                        .paint_dressing_overlay(&paint, &view, size, &artwork, &mut frame)
+                        .map_err(|error| error.to_string())?;
+                }
+                let popup = if let Some(prompt) = view.server_trust_prompt() {
+                    Some(launcher::menu::dialogs::server_trust(
+                        &prompt.url,
+                        frame.translate,
+                    ))
+                } else if let Some(name) = view.join_request_prompt() {
+                    Some(launcher::menu::dialogs::join_request(name, frame.translate))
+                } else {
+                    view.dialog
+                        .filter(|dialog| {
+                            !matches!(
+                                dialog,
+                                launcher::menu::MenuDialog::MinecraftImport
+                                    | launcher::menu::MenuDialog::Accounts
+                                    | launcher::menu::MenuDialog::Exit
+                            )
+                        })
+                        .map(|dialog| {
+                            launcher::menu::dialogs::dialog(&view, dialog, frame.translate)
+                        })
+                };
+                if let Some(popup) = popup {
+                    screen
+                        .paint_popup(&view, &popup, size, &scrolls, &mut frame)
+                        .map_err(|error| error.to_string())?;
+                }
+                if view.dialog == Some(launcher::menu::MenuDialog::MinecraftImport) {
+                    screen
+                        .paint_minecraft_import(&view, size, &mut scrolls, &mut frame)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Fixture::TabList(rows) => {
+            carriers::install_default_skin(dir)?;
+            let mut engine = json_engine(&carriers)?;
+            let mut list = PlayerList::default();
+            for now in [0.0, seconds] {
+                frame.nodes.clear();
+                *frame.next = 1;
+                frame.now = now;
+                list.paint(&engine, &rows, &mut frame, 0. ..state.size[1] as f32)
+                    .map_err(|error| error.to_string())?;
+            }
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+        Fixture::Loading(stage) => {
+            carriers::validate_oreui(dir)?;
+            let images = oreui::images::load_optional_oreui_images(dir)
+                .ok_or_else(|| Error::Invalid("OreUI artwork is unusable; make assets".into()))?;
+            let first = carriers.pages.len() as u16;
+            let artwork = HashMap::new();
+            carriers.pages.extend(images.pages.iter().map(|page| Page {
+                repeat_content: None,
+                width: page.dimensions[0],
+                height: page.dimensions[1],
+                rgba: Arc::clone(&page.pixels),
+            }));
+            let mut screen = oreui_screen(first, images);
+            let words = launcher::menu::join_progress::loading_words(stage, &|key, fallback| {
+                ui_engine::engine::screen::translated(frame.translate, key, fallback)
+            });
+            frame.now = seconds;
+            screen
+                .paint_loading(
+                    oreui::loading_screen::LoadingInput {
+                        stage,
+                        words: [&words[0], &words[1]],
+                        size,
+                        title_artwork: None,
+                        destination_icon: None,
+                        artwork: &artwork,
+                        dimension: 0,
+                    },
+                    &mut frame,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Fixture::ResourcePackLoading => {
+            carriers::validate_oreui(dir)?;
+            let images = oreui::images::load_optional_oreui_images(dir)
+                .ok_or_else(|| Error::Invalid("OreUI artwork is unusable; make assets".into()))?;
+            let first = carriers.pages.len() as u16;
+            let artwork = HashMap::new();
+            carriers.pages.extend(images.pages.iter().map(|page| Page {
+                repeat_content: None,
+                width: page.dimensions[0],
+                height: page.dimensions[1],
+                rgba: Arc::clone(&page.pixels),
+            }));
+            let mut screen = oreui_screen(first, images);
+            let viewport = ui_engine::engine::rect(0.0, 0.0, size[0], size[1])
+                .map_err(|error| error.to_string())?;
+            frame.nodes.push(
+                UiNode::new(UiNodeId::new(*frame.next), None, viewport).with_visual(
+                    UiVisual::Solid {
+                        texture_page: frame.solid_page,
+                        color: oreui::loading_screen::RESOURCE_PACK_BACKGROUND,
+                    },
+                ),
+            );
+            *frame.next = (*frame.next).saturating_add(1);
+            frame.now = seconds;
+            screen
+                .paint_loading(
+                    oreui::loading_screen::LoadingInput {
+                        stage: ui::LoadingStage::BuildingTerrain,
+                        words: oreui::loading_screen::RESOURCE_PACK_WORDS,
+                        size,
+                        title_artwork: None,
+                        destination_icon: None,
+                        artwork: &artwork,
+                        dimension: 0,
+                    },
+                    &mut frame,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Fixture::Chat {
+            draft,
+            suggestions,
+            messages,
+            options,
+            server_hover,
+        } => {
+            let mut engine = json_engine(&carriers)?;
+            #[cfg(feature = "test-support")]
+            if server_hover.is_some() {
+                engine.set_server_pack(&[ui_screens::test_support::hover_chat::files()]);
+            }
+
+            let mut editor = ui::ChatEditor::new(ui::MAX_CHAT_INPUT_BYTES)
+                .map_err(|error| format!("{error:?}"))?;
+            editor.set_text(draft);
+            frame.now = seconds;
+            let mut screen = ChatScreen::default();
+            screen.settings.set_snapshot((options, None));
+            for now in [0.0, seconds, seconds] {
+                frame.nodes.clear();
+                *frame.next = 1;
+                frame.now = now;
+                screen
+                    .paint(
+                        &engine,
+                        ChatInput {
+                            local_player: "Alex",
+                            editor: &editor,
+                            messages: &messages,
+                            suggestions: &suggestions,
+                            usage: None,
+                            selected_suggestion: Some(0),
+                            annotations: &[],
+                            clocks: &Default::default(),
+                            now_millis: (now * 1000.0) as u64,
+                        },
+                        &mut frame,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if server_hover == Some(true)
+                    && let Some(caption) = screen.nodes().iter().find(|node| node.name == "caption")
+                {
+                    screen.set_pointer(
+                        ui::UiPoint::new(
+                            (caption.dest.x as f32 + caption.dest.w as f32 - 4.0)
+                                * metrics.gui_scale,
+                            (caption.dest.y as f32 + 4.0) * metrics.gui_scale,
+                        )
+                        .ok(),
+                    );
+                }
+            }
+            if screen.nodes().is_empty() {
+                return Err(Error::Invalid("native chat screen did not resolve".into()));
+            }
+            add_server_pages(&mut engine, &mut carriers.pages);
+        }
+    }
+    if nodes.is_empty() {
+        return Err(Error::Invalid("screen painted no nodes".into()));
+    }
+    let mut tree = UiTree::new(nodes).map_err(|error| error.to_string())?;
+    let viewport =
+        ui_engine::engine::rect(0.0, 0.0, size[0], size[1]).map_err(|error| error.to_string())?;
+    tree.layout(viewport, UiScale::default(), SafeArea::ZERO)
+        .map_err(|error| error.to_string())?;
+    let list = tree.build_draw_list().map_err(|error| error.to_string())?;
+    if let Some(batch) = list.batches.iter().find(|batch| {
+        carriers
+            .pages
+            .get(usize::from(batch.texture_page))
+            .is_none()
+    }) {
+        return Err(Error::Invalid(format!(
+            "screen sampled unavailable texture page {} ({} loaded)",
+            batch.texture_page,
+            carriers.pages.len()
+        )));
+    }
+    let mut canvas = Canvas::new(state.size[0], state.size[1]);
+    canvas.draw(&list, |page| carriers.pages.get(usize::from(page)));
+    let mut pixels = canvas.into_rgba();
+    if show_panorama {
+        panorama::composite(&mut pixels, state.size, &carriers.ui)?;
+    }
+    if !menu {
+        // An anonymous backdrop makes transparent in-world UI visible in an ordinary image viewer.
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            let alpha = f32::from(pixel[3]) / 255.0;
+            for (channel, background) in [70.0, 90.0, 110.0].into_iter().enumerate() {
+                pixel[channel] =
+                    (f32::from(pixel[channel]) * alpha + background * (1.0 - alpha)).round() as u8;
+            }
+            pixel[3] = 255;
+        }
+    }
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &pixels,
+            state.size[0],
+            state.size[1],
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(png)
+}
+
+/// A JSON-UI engine over the vanilla carrier whose server atlas loads built-in images inline.
+fn json_engine(carriers: &carriers::Carriers) -> Result<FormEngine, Error> {
+    let catalog = json_ui::Catalog::from_files(
+        carriers
+            .ui
+            .ui_files()
+            .iter()
+            .map(|file| (&*file.path, &*file.bytes)),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut engine = FormEngine::new(
+        Arc::clone(&carriers.ui),
+        catalog,
+        carriers.ui_page,
+        &REGISTRY,
+        Arc::new(Offline),
+        ImageWork::inline(),
+    );
+    engine.set_server_atlas(
+        ui_engine::atlas::ServerAtlas::new(&[], None, ui_engine::pages::SERVER_UI_PAGES)
+            .with_image_work(ImageWork::inline()),
+        (carriers.pages.len() + ui_engine::pages::SERVER_UI_PAGE) as u16,
+    );
+    Ok(engine)
+}
+
+/// Loads only a custom panel's referenced pack images through the shared atlas input path.
+fn panel_textures(
+    panel: &ui::mod_panel::Panel,
+    root: &Path,
+) -> Result<Vec<(String, Vec<u8>)>, Error> {
+    let document: serde_json::Value = serde_json::from_str(&panel.surface.resolved_document()?)
+        .map_err(|error| error.to_string())?;
+    let mut paths = std::collections::BTreeSet::new();
+    collect_textures(&document, &mut paths);
+    let mut files = Vec::new();
+    for stem in paths {
+        if stem.starts_with('/')
+            || stem.contains('\\')
+            || stem.split('/').any(|part| matches!(part, ".." | "."))
+        {
+            return Err(Error::Invalid(
+                "panel texture must be relative to the resource pack".into(),
+            ));
+        }
+        for extension in ui_engine::atlas::IMAGE_EXTENSIONS
+            .into_iter()
+            .chain([".json"])
+        {
+            let relative = format!("{stem}{extension}");
+            let path = root.join(&relative);
+            if path.is_file() {
+                files.push((
+                    relative,
+                    carriers::read(&path, resource_pack::MAX_FILE_BYTES as usize)?,
+                ));
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// Finds authored image paths without reading unrelated pack assets or UI documents.
+fn collect_textures(value: &serde_json::Value, paths: &mut std::collections::BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(path) = object.get("texture").and_then(serde_json::Value::as_str) {
+                paths.insert(path.to_owned());
+            }
+            for value in object.values() {
+                collect_textures(value, paths);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_textures(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Appends the server atlas pages after painting; page order comes from the atlas.
+fn add_server_pages(engine: &mut FormEngine, pages: &mut Vec<Page>) {
+    let first = pages.len();
+    if let Some(server) = engine.take_server_pages() {
+        let server = server
+            .iter()
+            .map(|page| {
+                let [width, height] = page.dimensions();
+                Page {
+                    repeat_content: page.repeat_content(),
+                    width,
+                    height,
+                    rgba: page.pixels().into(),
+                }
+            })
+            .collect::<Vec<_>>();
+        pages.resize_with(first + ui_engine::pages::SERVER_UI_PAGE, Page::white);
+        pages.extend(server);
+        if !engine.server_sheet_pages.is_empty() {
+            pages.resize_with(
+                first + render_model::UI_NATIVE_SHEET_PAGE_OFFSET,
+                Page::white,
+            );
+            pages.extend(engine.server_sheet_pages.iter().map(|page| {
+                let [width, height] = page.dimensions();
+                Page {
+                    repeat_content: page.repeat_content(),
+                    width,
+                    height,
+                    rgba: page.pixels().into(),
+                }
+            }));
+        }
+    }
+}
+
+/// Gives each Mods-tab icon its own page under the key its card draws, as the client's
+/// artwork worker does.
+fn mod_icons(
+    view: &launcher::menu::MenuView,
+    artwork: &mut HashMap<String, ui::IconRef>,
+    pages: &mut Vec<Page>,
+) -> Result<(), Error> {
+    for item in &view.mods.library.installed {
+        let (Some(key), Some(png)) = (item.icon_key(), &item.metadata.icon) else {
+            continue;
+        };
+        let image = image::load_from_memory(png)
+            .map_err(|error| error.to_string())?
+            .to_rgba8();
+        let (width, height) = image.dimensions();
+        let page = u16::try_from(pages.len()).map_err(|error| error.to_string())?;
+        artwork.insert(
+            key,
+            ui::IconRef {
+                color_mask: None,
+                page,
+                uv: [0, 0, width as u16, height as u16],
+                glint: false,
+            },
+        );
+        pages.push(Page {
+            repeat_content: None,
+            width,
+            height,
+            rgba: image.into_raw().into(),
+        });
+    }
+    Ok(())
+}
+
+/// Attaches the atlas to the sprite and nine-slice painters with the client's artwork look.
+pub(crate) fn oreui_screen(first: u16, images: oreui::images::OreUiImages) -> oreui::OreUiScreen {
+    let mut screen = oreui::OreUiScreen::default();
+    screen.look = oreui::Look::Originals;
+    screen.originals = Some(Arc::new(oreui::Originals::new(first, images)));
+    screen
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Uses the production cosmetic gallery renderer for original fixture artwork.
+fn cosmetic_icons(artwork: &mut HashMap<String, ui::IconRef>, pages: &mut Vec<Page>, seconds: f64) {
+    for item in cosmetics::Item::all() {
+        let [width, height] = render_model::hats::thumbnail::SIZE;
+        let Some(image) = render_model::hats::thumbnail::render_at(item, width, height, seconds)
+        else {
+            continue;
+        };
+        artwork.insert(
+            item.thumbnail_key(),
+            ui::IconRef {
+                color_mask: None,
+                page: pages.len() as u16,
+                uv: [0, 0, image.width as u16, image.height as u16],
+                glint: false,
+            },
+        );
+        pages.push(Page {
+            repeat_content: None,
+            width: image.width,
+            height: image.height,
+            rgba: image.rgba8,
+        });
+    }
+}

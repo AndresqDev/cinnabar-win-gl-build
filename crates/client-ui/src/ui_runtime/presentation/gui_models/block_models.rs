@@ -1,0 +1,118 @@
+//! Native geometry for block items whose carrier icon is a model thumbnail (slabs, stairs, walls,
+//! fences), so they draw at the control's physical size like ordinary cubes.
+
+use std::{collections::BTreeMap, sync::Arc};
+
+use assets::gui_item::{GUI_BLOCK_ALPHA_THRESHOLD, block_gui_quads, material_tile};
+use assets::{
+    BlockFace, BlockVisualId, Material, ModelQuad, ModelTemplate, NetworkIdMode, RuntimeAssets,
+    TexturePage, VisualKind,
+};
+use ui::UiMesh;
+
+use super::{atlas::Atlas, item_gui};
+
+/// One block state's shape and the world tables it indexes.
+struct Shape<'a> {
+    kind: VisualKind,
+    faces: [u32; 6],
+    template: Option<u32>,
+    templates: &'a [ModelTemplate],
+    quads: &'a [ModelQuad],
+    materials: &'a [Material],
+    pages: &'a [TexturePage],
+}
+
+/// The world state's GUI quads over their full-resolution tiles. `None` keeps the thumbnail: an
+/// unknown state, unsupported material lighting or translucency, a UV wrapping past its tile,
+/// or a full atlas.
+pub(super) fn mesh(
+    world: &RuntimeAssets,
+    visual: BlockVisualId,
+    atlas: &mut Atlas,
+) -> Option<Arc<UiMesh>> {
+    if world.is_diagnostic() || visual.0 as usize >= world.visual_count() {
+        return None;
+    }
+    let block = world.resolve(NetworkIdMode::Sequential, visual.0);
+    if !block.is_known() {
+        return None;
+    }
+    let shape = Shape {
+        kind: block.kind(),
+        faces: BlockFace::ALL.map(|face| block.face(face).material_id()),
+        template: block.model_template(),
+        templates: world.model_templates(),
+        quads: world.model_quads(),
+        materials: world.materials(),
+        pages: world.texture_pages(),
+    };
+    shaped(&shape, atlas)
+}
+
+/// Builds GUI geometry from a block shape, keeping the thumbnail when any input is unsupported.
+fn shaped(shape: &Shape<'_>, atlas: &mut Atlas) -> Option<Arc<UiMesh>> {
+    let quads = block_gui_quads(
+        shape.kind,
+        shape.faces,
+        shape.template,
+        shape.templates,
+        shape.quads,
+    )
+    .ok()?;
+    let mut sources = BTreeMap::new();
+    for quad in &quads {
+        let std::collections::btree_map::Entry::Vacant(source) = sources.entry(quad.material)
+        else {
+            continue;
+        };
+        // Native GUI meshes always shade faces; the baked thumbnail retains unshaded art.
+        if shape.materials.get(quad.material as usize)?.flags
+            & assets::MATERIAL_FLAG_DISABLE_FACE_DIMMING
+            != 0
+        {
+            return None;
+        }
+        let (tile, side, blend) = material_tile(shape.materials, quad.material, |page| {
+            shape.pages.get(page as usize).map(|page| &page.texture)
+        })
+        .ok()?;
+        // Blend-flagged art that is only opaque or cut out (the anvil's) draws like cutout.
+        if blend
+            && tile
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|texel| texel[3] != 0 && texel[3] != 255)
+        {
+            return None;
+        }
+        let side = u16::try_from(side).ok()?;
+        let mut pixels = tile.to_vec();
+        for texel in pixels.as_chunks_mut::<4>().0 {
+            texel[3] = if texel[3] >= GUI_BLOCK_ALPHA_THRESHOLD {
+                255
+            } else {
+                0
+            };
+        }
+        source.insert((side, pixels));
+    }
+    atlas.try_insert(
+        sources
+            .values()
+            .map(|(side, pixels)| ([*side; 2], pixels.as_slice())),
+        |icons| {
+            let textures: BTreeMap<_, _> =
+                sources.keys().copied().zip(icons.iter().copied()).collect();
+            let placed: Vec<_> = quads
+                .into_iter()
+                .map(|quad| (quad, textures[&quad.material]))
+                .collect();
+            item_gui::block_model(&placed)
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests;

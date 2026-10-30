@@ -1,0 +1,44 @@
+[package]
+name = "client-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = ["client-session/test-support"]
+
+[dependencies]
+web-time.workspace = true
+env-compat = { path = "../env-compat" }
+anyhow.workspace = true
+bevy.workspace = true
+bridge = { path = "../bridge" }
+chunk-pipeline = { path = "../chunk-pipeline" }
+client-session = { path = "../client-session" }
+client-state = { path = "../client-state" }
+client-ui = { path = "../client-ui" }
+client-world = { path = "../client-world" }
+diagnostics = { path = "../diagnostics" }
+meshing = { path = "../meshing" }
+pack-runtime = { path = "../pack-runtime" }
+protocol = { path = "../protocol" }
+tracing.workspace = true
+render = { path = "../render" }
+render-scene = { path = "../render-scene" }
+render-api = { path = "../render-api" }
+simulation-clock = { path = "../simulation-clock" }
+tokio.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+launcher-host = { path = "../launcher-host" }
+redb = "4.3"
+
+[dev-dependencies]
+protocol-ids = { path = "../protocol-ids" }
+test-time = { path = "../test-time" }
+tempfile = "3"
+client-session = { path = "../client-session", features = ["test-support"] }
+
+[lints]
+workspace = true

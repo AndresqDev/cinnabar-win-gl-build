@@ -1,0 +1,375 @@
+//! Offline witnesses for the captured Zeqa shop and populated hotbar.
+
+use super::pack_harness;
+use ui::DpiScale;
+
+#[test]
+fn populated_hotbar_snapshot() {
+    let mut player_runtime = player_state::PlayerState::new(1);
+
+    use {super::super::tests::engine_hud_tests, ui::IconRef};
+    let Some(mut presentation) = engine_hud_tests::engine_presentation() else {
+        eprintln!(
+            "skipping populated_hotbar_snapshot: fixture unavailable; requires installed local carriers (make assets)"
+        );
+        return;
+    };
+    if let Some(pack) = pack_harness::env_pack() {
+        presentation.set_server_ui_pack(&pack);
+    }
+    let runtime = crate::ui_runtime::UiRuntime::new(1);
+    player_runtime
+        .facts
+        .publish_player_game_mode(protocol::PlayerGameMode::Survival);
+    player_runtime.inventory.set_local_selected_slot(0);
+    let icon = IconRef {
+        color_mask: None,
+        page: presentation.solid_texture_page,
+        uv: [0, 0, 1, 1],
+        glint: false,
+    };
+    for index in 0..presentation.hud_frame.hotbar_stacks.len() {
+        presentation.hud_frame.hotbar_stacks[index] = Some(protocol::NetworkItemStack {
+            network_id: 1,
+            count: 1,
+            ..protocol::NetworkItemStack::empty()
+        });
+        presentation.hud_frame.hotbar_icons[index] = Some(icon);
+    }
+    let input = presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    super::snapshot::write(&input, "hotbar");
+    let image = super::snapshot::rasterize(&input);
+    assert!(image.pixels().filter(|pixel| pixel.0 == [255; 4]).count() > 100);
+}
+
+#[test]
+fn spirit_bundle_snapshot() {
+    let mut player_runtime = player_state::PlayerState::new(1);
+
+    let Some(runtime) = captured_form(&mut player_runtime) else {
+        eprintln!(
+            "skipping spirit_bundle_snapshot: fixture unavailable; requires installed UI carrier, CINNABAR_LOBBY_CAPTURE and CINNABAR_FORM_PACK_DIR"
+        );
+        return;
+    };
+    let Some(mut presentation) = pack_harness::engine_presentation() else {
+        return;
+    };
+    let Some(pack) = pack_harness::env_pack() else {
+        eprintln!("skipping captured form snapshot: missing CINNABAR_FORM_PACK_DIR fixture");
+        return;
+    };
+    presentation.set_server_ui_pack(&pack);
+    test_time::eventually_within(
+        std::time::Duration::from_secs(5),
+        "form images resolve",
+        || {
+            presentation
+                .build(
+                    &player_runtime,
+                    &runtime,
+                    0,
+                    [1280, 720],
+                    DpiScale::new(1.0).unwrap(),
+                )
+                .unwrap();
+            let engine = presentation.engine.as_ref().unwrap();
+            engine.drawn_sprites().1.is_empty()
+        },
+    );
+    presentation.finish_menu_artwork();
+    let input = presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    super::snapshot::write(&input, "spirit-bundle");
+    eprintln!(
+        "spirit: vertices={} batches={}",
+        input.vertices.len(),
+        input.batches.len()
+    );
+    let engine = presentation.engine.as_ref().unwrap();
+    let (drawn, missing) = engine.drawn_sprites();
+    assert!(missing.is_empty(), "unresolved form images: {missing:?}");
+    for texture in [
+        "textures/ads/SpiritBundle",
+        "textures/ui/common/dark_field",
+        "textures/ui/common/buttons/green/default",
+    ] {
+        assert!(drawn.iter().any(|key| key == texture), "{texture} absent");
+    }
+    let passes = engine.passes;
+    for _ in 0..5 {
+        presentation
+            .build(
+                &player_runtime,
+                &runtime,
+                0,
+                [1280, 720],
+                DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+    }
+    assert_eq!(presentation.engine.as_ref().unwrap().passes, passes);
+    let image = super::snapshot::rasterize(&input);
+    assert!(
+        image
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| {
+                (435..843).contains(x)
+                    && (205..440).contains(y)
+                    && pixel[2] > pixel[0]
+                    && pixel[0] > 60
+            })
+            .count()
+            > 1_000,
+        "the purple bundle artwork must reach the published texture pages"
+    );
+}
+
+#[test]
+fn spirit_bundle_before_pack_has_stable_resident_pages_after_install() {
+    let mut player_runtime = player_state::PlayerState::new(1);
+
+    let Some(runtime) = captured_form(&mut player_runtime) else {
+        eprintln!(
+            "skipping spirit_bundle_before_pack_has_stable_resident_pages_after_install: fixture unavailable; requires installed UI carrier, CINNABAR_LOBBY_CAPTURE and CINNABAR_FORM_PACK_DIR"
+        );
+        return;
+    };
+    let Some(mut presentation) = pack_harness::engine_presentation() else {
+        return;
+    };
+    let dpi = DpiScale::new(1.0).unwrap();
+    let cold = presentation
+        .build(&player_runtime, &runtime, 0, [1280, 720], dpi)
+        .unwrap();
+    super::snapshot::write(&cold, "spirit-bundle-before-pack");
+    let Some(pack) = pack_harness::env_pack() else {
+        eprintln!("skipping captured form snapshot: missing CINNABAR_FORM_PACK_DIR fixture");
+        return;
+    };
+    presentation.set_server_ui_pack(&pack);
+    test_time::eventually("button textures become resident", || {
+        presentation
+            .build(&player_runtime, &runtime, 0, [1280, 720], dpi)
+            .unwrap();
+        let engine = presentation.engine.as_ref().unwrap();
+        let atlas = engine.textures.lock();
+        [
+            "textures/ui/common/dark_field",
+            "textures/ui/common/buttons/green/default",
+        ]
+        .iter()
+        .all(|key| atlas.placement(key).is_some())
+    });
+    presentation.finish_menu_artwork();
+    let settled = presentation
+        .build(&player_runtime, &runtime, 0, [1280, 720], dpi)
+        .unwrap();
+    super::snapshot::write(&settled, "spirit-bundle-after-pack");
+    let pixels = super::snapshot::rasterize(&settled);
+    assert!(
+        pixels
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| (435..843).contains(x)
+                && (205..440).contains(y)
+                && pixel[2] > pixel[0]
+                && pixel[0] > 60)
+            .count()
+            > 1_000,
+        "bundle art did not reach the published pages"
+    );
+    let passes = presentation.engine.as_ref().unwrap().passes;
+    let pages: Vec<_> = settled
+        .textures
+        .pages()
+        .iter()
+        .map(render_model::UiTexturePage::identity)
+        .collect();
+    for now in 1..6 {
+        let frame = presentation
+            .build(&player_runtime, &runtime, now, [1280, 720], dpi)
+            .unwrap();
+        assert_eq!(presentation.engine.as_ref().unwrap().passes, passes);
+        assert_eq!(
+            frame
+                .textures
+                .pages()
+                .iter()
+                .map(render_model::UiTexturePage::identity)
+                .collect::<Vec<_>>(),
+            pages
+        );
+    }
+}
+
+/// Replays the captured ModalFormRequest through the packet decoder and UI state.
+fn captured_form(
+    player_runtime: &mut player_state::PlayerState,
+) -> Option<crate::ui_runtime::UiRuntime> {
+    let path = std::path::PathBuf::from(std::env::var_os("CINNABAR_LOBBY_CAPTURE")?);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipping captured form snapshot: missing {}",
+                path.display()
+            );
+            return None;
+        }
+        Err(error) => panic!("read captured form fixture {}: {error}", path.display()),
+    };
+    let mut at = 0;
+    while at + 8 <= bytes.len() {
+        let id = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let length = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+        let body = &bytes[at + 8..at + 8 + length];
+        at += 8 + length;
+        if id != 100 {
+            continue;
+        }
+        let mut batch = vec![0xfe];
+        varint(&mut batch, body.len() as u64 + 1);
+        batch.push(id as u8);
+        batch.extend(body);
+        let packet = protocol::decode_batch(batch.into()).unwrap().remove(0);
+        let Some(protocol::WorldEvent::Ui(event)) = protocol::into_world_event(packet, 0).unwrap()
+        else {
+            panic!("captured form did not decode as a UI event");
+        };
+        let mut runtime = crate::ui_runtime::UiRuntime::new(1);
+        runtime
+            .apply(
+                player_runtime,
+                crate::ui_runtime::SequencedUiEvent {
+                    session_id: 1,
+                    fifo_sequence: 1,
+                    local_millis: 0,
+                    server_tick: None,
+                    event,
+                },
+            )
+            .unwrap();
+        return Some(runtime);
+    }
+    panic!("capture contains no server form");
+}
+
+/// Writes the unsigned length prefix used by packet batches.
+fn varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        out.push(byte | if value == 0 { 0 } else { 0x80 });
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+#[test]
+fn snapshot_custom_display_name_search() {
+    use crate::ui_runtime::{
+        inventory_actions::visible_creative_entries, item_facts::SessionItemComponents,
+    };
+    use std::sync::Arc;
+    let Some(mut presentation) =
+        crate::test_support::engine_presentation_with(pack_harness::font())
+    else {
+        return;
+    };
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::test_support::creative_with(&mut player, 1);
+    runtime
+        .inventory_ledger_mut(&mut player)
+        .apply_registry(&protocol::ItemRegistryEvent {
+            entries: Arc::from([protocol::ItemRegistryEntry {
+                components: None,
+                network_id: 1,
+                identifier: "custom:blade".into(),
+                component_based: true,
+                version: protocol::ItemRegistryVersion::None,
+                component_digest: [0; 32],
+                negotiated_max_stack_size: None,
+                canonical_empty_component_data: true,
+                item_tags: Arc::from([]),
+            }]),
+        });
+    runtime.set_session_items(Some(Arc::new(SessionItemComponents::from_iter([(
+        Arc::from("custom:blade"),
+        protocol::ItemComponents {
+            display_name: Some(Arc::from("Crystal Blade")),
+            ..Default::default()
+        },
+    )]))));
+    runtime
+        .screen_state_mut()
+        .select_tab(ui_screens::container_actions::SEARCH_TAB);
+    runtime.screen_state_mut().search = "Crystal".into();
+    runtime.screen_state_mut().search_focused = true;
+    runtime.set_session_icons(Some(Arc::new(super::super::SessionIcons {
+        icons: vec![super::super::SessionIcon {
+            identifier: Arc::from("custom:blade"),
+            metadata: 0,
+            width: 16,
+            height: 16,
+            rgba8: [70, 225, 220, 255].repeat(16 * 16).into(),
+        }],
+        ..Default::default()
+    })));
+    // Wait for the original fixture icon's asynchronous atlas admission.
+    test_time::eventually_within(
+        std::time::Duration::from_secs(5),
+        "fixture icon is admitted",
+        || {
+            presentation
+                .build(
+                    &player,
+                    &runtime,
+                    0,
+                    [1280, 720],
+                    ui::DpiScale::new(1.0).unwrap(),
+                )
+                .unwrap();
+            presentation.item_icon("custom:blade", 0).is_some()
+        },
+    );
+    let icon = presentation.item_icon("custom:blade", 0).unwrap();
+    presentation.hud_frame_mut().window_icons.book_entries = vec![Some(icon)];
+    let first = runtime.screen_state().creative_row;
+    let matched = visible_creative_entries(&player, &runtime).len();
+    for frame in 0..24 {
+        let input = presentation
+            .build(
+                &player,
+                &runtime,
+                frame * 100,
+                [1280, 720],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+        if frame == 23 {
+            assert!(
+                !input.vertices.is_empty(),
+                "creative inventory must be visible"
+            );
+            super::snapshot::write(&input, "custom-display-name-search");
+        }
+    }
+    assert_eq!(first, 0);
+    assert_eq!(matched, 1);
+}

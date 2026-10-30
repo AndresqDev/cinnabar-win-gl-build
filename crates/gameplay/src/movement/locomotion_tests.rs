@@ -1,0 +1,1153 @@
+//! Locomotion-mode wire edges: each start/stop flag rides exactly the tick the simulator changed mode.
+
+include!("flight_replay_tests.rs");
+
+#[path = "flight_boundary_tests.rs"]
+mod flight_boundary_tests;
+#[path = "flight_toggle_tests.rs"]
+mod flight_toggle_tests;
+#[path = "jump_tap_tests.rs"]
+mod jump_tap_tests;
+#[path = "sneak_sprint_tests.rs"]
+mod sneak_sprint_tests;
+
+use std::time::Duration;
+
+use protocol::PlayerInputFlags;
+use sim::{
+    Aabb, CollisionQuery, CollisionWorld, MovementInput, MovementMode, Vec3, WorldQueryError,
+};
+
+use super::integration_tests::VersionedFloor;
+use super::settle_tests::settled_sample;
+use super::{
+    HeldInput, LocalPhysicsController, ModeIntent, MovementSource, MovementTicker,
+    PhysicsMovementSample, PhysicsSampleContext, RideKind, input_flags,
+    reconcile_candidate_physics_correction,
+};
+
+const TICK: Duration = Duration::from_millis(50);
+
+/// Flight toggles on a second jump press within the seven-tick window, counted in fixed ticks.
+#[test]
+fn flight_double_tap_counts_fixed_ticks() {
+    let can_fly = ModeIntent {
+        can_fly: true,
+        ..Default::default()
+    };
+    let world = VersionedFloor(1);
+    for (idle_ticks, flies) in [(5, true), (6, false)] {
+        let mut physics = grounded_controller();
+        let press = MovementInput {
+            jumping: true,
+            ..Default::default()
+        };
+        step(&mut physics, press, can_fly, &world);
+        for _ in 0..idle_ticks {
+            step(&mut physics, MovementInput::default(), can_fly, &world);
+        }
+        let second = step(&mut physics, press, can_fly, &world);
+        assert_eq!(
+            second.processed.mode == MovementMode::Flying,
+            flies,
+            "{idle_ticks}"
+        );
+    }
+}
+
+/// A spatial correction cannot cancel unacknowledged flight or erase a later server clear.
+#[test]
+fn in_session_snap_preserves_flight_and_server_ability_edges() {
+    for server_flying in [false, true] {
+        let mut physics = grounded_controller();
+        let world = VersionedFloor(1);
+        let intent = ModeIntent {
+            can_fly: true,
+            flight: client_world::game_mode_capabilities::FlightAuthority::Mutable(server_flying),
+            ..Default::default()
+        };
+        if !server_flying {
+            // Open the double-tap window so the first recorded tick toggles flight.
+            for jumping in [true, false] {
+                let input = MovementInput {
+                    jumping,
+                    ..Default::default()
+                };
+                step(&mut physics, input, intent, &world);
+            }
+        }
+        let mut ticker = MovementTicker::default();
+        ticker.reset(
+            1,
+            physics.state().unwrap().tick,
+            physics.network_position().unwrap(),
+        );
+        ticker.set_source(MovementSource::Physics);
+        let input = MovementInput {
+            jumping: true,
+            ..Default::default()
+        };
+        let flying = step(&mut physics, input, intent, &world);
+        assert_eq!(flying.processed.mode, MovementMode::Flying);
+        ticker.enqueue_completed_physics(flying.clone()).unwrap();
+        let started = ticker.pop_pending().unwrap().snapshot;
+        // Only the double-tap requests flight; server-set flight sends no start.
+        assert_eq!(
+            has(started.flags, PlayerInputFlags::START_FLYING),
+            !server_flying
+        );
+        reconcile_candidate_physics_correction(
+            &mut ticker,
+            &mut physics,
+            flying.position,
+            flying.tick,
+            false,
+            super::PhysicsCorrectionMode::Snap,
+            &world,
+        )
+        .unwrap();
+        assert_eq!(ticker.pending_count(), 0);
+        // Consume the render delta preceding the correction before advancing a fresh tick.
+        let discarded = physics.advance_with_context(
+            Duration::ZERO,
+            input,
+            PhysicsSampleContext {
+                input: super::TickInput {
+                    jump: semantic_input::ActionPhase {
+                        held: input.jumping,
+                        ..Default::default()
+                    },
+                    sneak: semantic_input::ActionPhase {
+                        held: input.sneaking,
+                        ..Default::default()
+                    },
+                    sneak_down: input.sneaking,
+                    ..Default::default()
+                },
+                mode_intent: intent,
+                ..Default::default()
+            },
+            &world,
+        );
+        assert!(discarded.samples.is_empty());
+        let continued = step(&mut physics, input, intent, &world);
+        assert_eq!(continued.processed.mode, MovementMode::Flying);
+        ticker.enqueue_completed_physics(continued).unwrap();
+        let flags = ticker.pop_pending().unwrap().snapshot.flags;
+        assert!(!has(flags, PlayerInputFlags::START_FLYING));
+        assert!(!has(flags, PlayerInputFlags::STOP_FLYING));
+        assert!(has(flags, PlayerInputFlags::WANT_UP));
+        if server_flying {
+            let stopped = step(
+                &mut physics,
+                input,
+                ModeIntent {
+                    flight: client_world::game_mode_capabilities::FlightAuthority::Mutable(false),
+                    ..intent
+                },
+                &world,
+            );
+            assert_eq!(stopped.processed.mode, MovementMode::Walking);
+            ticker.enqueue_completed_physics(stopped).unwrap();
+            let flags = ticker.pop_pending().unwrap().snapshot.flags;
+            assert!(!has(flags, PlayerInputFlags::STOP_FLYING));
+            assert!(!has(flags, PlayerInputFlags::START_FLYING));
+        }
+    }
+}
+
+/// Floor top at y=1 plus a ceiling whose underside sits at the given height.
+struct LowCeiling(f64);
+
+impl CollisionWorld for LowCeiling {
+    fn collision_boxes(&self, query: Aabb) -> Result<CollisionQuery<Vec<Aabb>>, WorldQueryError> {
+        let mut base = VersionedFloor(1).collision_boxes(query)?;
+        let ceiling = Aabb::new(
+            Vec3::new(-64.0, self.0, -64.0),
+            Vec3::new(64.0, self.0 + 1.0, 64.0),
+        );
+        if ceiling.intersects(query) {
+            base.value.push(ceiling);
+        }
+        Ok(base)
+    }
+
+    fn block_physics(&self, block: [i32; 3]) -> Result<sim::BlockPhysicsSample, WorldQueryError> {
+        VersionedFloor(1).block_physics(block)
+    }
+}
+
+fn grounded_controller() -> LocalPhysicsController {
+    let mut physics = LocalPhysicsController::default();
+    physics.reanchor_network_position([0.0, 2.620_01, 0.0], 100, true);
+    physics
+}
+
+/// Consumes the fresh-anchor depenetration probe on open ground so later ticks start clean.
+fn settled_controller() -> LocalPhysicsController {
+    let mut physics = grounded_controller();
+    step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &VersionedFloor(1),
+    );
+    physics
+}
+
+fn step(
+    physics: &mut LocalPhysicsController,
+    input: MovementInput,
+    intent: ModeIntent,
+    world: &impl CollisionWorld,
+) -> PhysicsMovementSample {
+    let frame = physics.advance_with_context(
+        TICK,
+        input,
+        PhysicsSampleContext {
+            input: super::TickInput {
+                jump: semantic_input::ActionPhase {
+                    held: input.jumping,
+                    ..Default::default()
+                },
+                sneak: semantic_input::ActionPhase {
+                    held: input.sneaking,
+                    ..Default::default()
+                },
+                sneak_down: input.sneaking,
+                ..Default::default()
+            },
+            mode_intent: intent,
+            ..PhysicsSampleContext::default()
+        },
+        world,
+    );
+    assert!(frame.blocked.is_none(), "blocked: {:?}", frame.blocked);
+    frame.samples.into_iter().next().expect("one tick")
+}
+
+fn has(flags: PlayerInputFlags, flag: PlayerInputFlags) -> bool {
+    flags.bits() & flag.bits() != 0
+}
+
+/// Releases and presses jump twice; the final press completes a flight double-tap.
+fn double_tap_jump(
+    physics: &mut LocalPhysicsController,
+    intent: ModeIntent,
+    world: &impl CollisionWorld,
+) -> PhysicsMovementSample {
+    let press = MovementInput {
+        jumping: true,
+        ..MovementInput::default()
+    };
+    step(physics, MovementInput::default(), intent, world);
+    step(physics, press, intent, world);
+    step(physics, MovementInput::default(), intent, world);
+    step(physics, press, intent, world)
+}
+
+#[test]
+fn flight_start_ascend_and_stop_edges_follow_the_simulated_mode() {
+    let mut physics = grounded_controller();
+    let can_fly = ModeIntent {
+        can_fly: true,
+        ..ModeIntent::default()
+    };
+    let hold_jump = MovementInput {
+        jumping: true,
+        ..MovementInput::default()
+    };
+    let world = VersionedFloor(1);
+
+    let start = double_tap_jump(&mut physics, can_fly, &world);
+    assert_eq!(start.processed.mode, MovementMode::Flying);
+    let start_flags = input_flags(&start, HeldInput::default());
+    assert!(has(start_flags, PlayerInputFlags::START_FLYING));
+    assert!(has(start_flags, PlayerInputFlags::ASCEND));
+
+    let cruise = step(&mut physics, hold_jump, can_fly, &world);
+    assert_eq!(cruise.processed.mode, MovementMode::Flying);
+    let cruise_flags = input_flags(&cruise, HeldInput::from(&start));
+    assert!(!has(cruise_flags, PlayerInputFlags::START_FLYING));
+    assert!(cruise.position[1] > start.position[1]);
+
+    let before_stop = step(&mut physics, MovementInput::default(), can_fly, &world);
+    step(&mut physics, hold_jump, can_fly, &world);
+    step(&mut physics, MovementInput::default(), can_fly, &world);
+    let stop = step(&mut physics, hold_jump, can_fly, &world);
+    assert_eq!(before_stop.processed.mode, MovementMode::Flying);
+    assert_eq!(stop.processed.mode, MovementMode::Walking);
+    let stop_flags = input_flags(&stop, HeldInput::from(&before_stop));
+    assert!(has(stop_flags, PlayerInputFlags::STOP_FLYING));
+}
+
+#[test]
+fn keyboard_vertical_intents_reach_server_flight_controls() {
+    // Vanilla sends processed up/down as WantUp/WantDown and the server reads
+    // them directly; raw JumpDown/Ascend alone do not populate these control lanes.
+    for (jumping, sneaking, expected) in [
+        (false, false, 0),
+        (true, false, 4),
+        (false, true, 8),
+        (true, true, 12),
+    ] {
+        let mut physics = grounded_controller();
+        let can_fly = ModeIntent {
+            can_fly: true,
+            ..Default::default()
+        };
+        let toggled = double_tap_jump(&mut physics, can_fly, &VersionedFloor(1));
+        let sample = step(
+            &mut physics,
+            MovementInput {
+                jumping,
+                sneaking,
+                ..Default::default()
+            },
+            can_fly,
+            &VersionedFloor(1),
+        );
+        assert_eq!(sample.processed.mode, MovementMode::Flying);
+        let flags = input_flags(&sample, HeldInput::from(&toggled));
+        let server_vertical_controls = (flags.bits() >> 14) & 12;
+        assert_eq!(server_vertical_controls, expected);
+        assert_eq!(has(flags, PlayerInputFlags::WANT_UP), jumping);
+        assert_eq!(has(flags, PlayerInputFlags::WANT_DOWN), sneaking);
+        let released = step(
+            &mut physics,
+            MovementInput::default(),
+            ModeIntent {
+                can_fly: true,
+                ..Default::default()
+            },
+            &VersionedFloor(1),
+        );
+        let released_flags = input_flags(&released, HeldInput::from(&sample));
+        assert_eq!((released_flags.bits() >> 14) & 12, 0);
+    }
+}
+
+#[test]
+fn flight_without_permission_never_starts() {
+    let mut physics = grounded_controller();
+    let sample = double_tap_jump(&mut physics, ModeIntent::default(), &VersionedFloor(1));
+    assert_eq!(sample.processed.mode, MovementMode::Walking);
+}
+
+/// A server ability clear ends flight without echoing a stop request.
+#[test]
+fn server_clearing_flight_stops_an_airborne_player_with_jump_held() {
+    let mut physics = grounded_controller();
+    let input = MovementInput {
+        jumping: true,
+        ..Default::default()
+    };
+    let world = VersionedFloor(1);
+    let flying = step(
+        &mut physics,
+        input,
+        ModeIntent {
+            can_fly: true,
+            flight: client_world::game_mode_capabilities::FlightAuthority::Mutable(true),
+            ..Default::default()
+        },
+        &world,
+    );
+    assert_eq!(flying.processed.mode, MovementMode::Flying);
+    assert!(!flying.grounded_after_tick);
+    let stopped = step(
+        &mut physics,
+        input,
+        ModeIntent {
+            can_fly: true,
+            flight: client_world::game_mode_capabilities::FlightAuthority::Mutable(false),
+            ..Default::default()
+        },
+        &world,
+    );
+    assert_eq!(stopped.processed.mode, MovementMode::Walking);
+    assert!(!has(
+        input_flags(&stopped, HeldInput::from(&flying)),
+        PlayerInputFlags::STOP_FLYING
+    ));
+}
+
+#[test]
+fn crawl_edges_fire_once_on_entry_and_once_on_exit() {
+    let mut crawling = settled_sample(101, [0.0, 2.620_01, 0.0]);
+    crawling.processed.mode = MovementMode::Crawling;
+    let entry = input_flags(&crawling, HeldInput::default());
+    assert!(has(entry, PlayerInputFlags::START_CRAWLING));
+
+    let steady = input_flags(&crawling, HeldInput::from(&crawling));
+    assert!(!has(steady, PlayerInputFlags::START_CRAWLING));
+    assert!(!has(steady, PlayerInputFlags::STOP_CRAWLING));
+
+    let standing = settled_sample(102, [0.0, 2.620_01, 0.0]);
+    let exit = input_flags(&standing, HeldInput::from(&crawling));
+    assert!(has(exit, PlayerInputFlags::STOP_CRAWLING));
+}
+
+/// Closing a trapdoor selects the low box before travel and publishes the matching pose edges.
+#[test]
+fn trapdoor_closure_enters_crawl_and_opening_restores_standing() {
+    let mut physics = settled_controller();
+    let feet = physics.state().unwrap().position;
+    let low = LowCeiling(feet.y + 1.0);
+    let input = MovementInput {
+        forward: 1.0,
+        ..Default::default()
+    };
+    let first = step(&mut physics, input, ModeIntent::default(), &low);
+    assert_eq!(first.processed.mode, MovementMode::Crawling);
+    assert!(!first.sneaking);
+    assert_eq!(physics.state().unwrap().position.y, feet.y);
+    assert!(physics.state().unwrap().position.z > feet.z);
+    let flags = input_flags(&first, HeldInput::default());
+    assert!(has(flags, PlayerInputFlags::START_CRAWLING));
+    assert!(!has(flags, PlayerInputFlags::START_SWIMMING));
+    assert!(!has(flags, PlayerInputFlags::SNEAK_DOWN));
+    for _ in 0..24 {
+        let next = step(&mut physics, input, ModeIntent::default(), &low);
+        assert_eq!(next.processed.mode, MovementMode::Crawling);
+        let flags = input_flags(&next, HeldInput::from(&first));
+        assert!(!has(flags, PlayerInputFlags::START_CRAWLING));
+        assert!(!has(flags, PlayerInputFlags::STOP_CRAWLING));
+    }
+    assert!((physics.render_eye_position().unwrap()[1] - feet.y as f32 - 0.4).abs() < 0.001);
+    let open = step(
+        &mut physics,
+        input,
+        ModeIntent::default(),
+        &VersionedFloor(1),
+    );
+    assert_eq!(open.processed.mode, MovementMode::Walking);
+    let flags = input_flags(&open, HeldInput::from(&first));
+    assert!(has(flags, PlayerInputFlags::STOP_CRAWLING));
+    assert!(!has(flags, PlayerInputFlags::START_CRAWLING));
+}
+
+/// A teleport into a one-block opening must shrink the pose without ejecting the feet anchor.
+#[test]
+fn teleport_into_a_low_opening_starts_crawl_at_the_authoritative_position() {
+    let mut physics = grounded_controller();
+    let feet = physics.state().unwrap().position;
+    let network = physics.network_position().unwrap();
+    let low = LowCeiling(feet.y + 1.0);
+    let sample = step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &low,
+    );
+    assert_eq!(sample.processed.mode, MovementMode::Crawling);
+    assert_eq!(sample.position, network);
+    assert!(has(
+        input_flags(&sample, HeldInput::default()),
+        PlayerInputFlags::START_CRAWLING
+    ));
+}
+
+/// Water contact suppresses dry crawl entry even when only a low box fits.
+struct WetLowCeiling(LowCeiling);
+
+impl CollisionWorld for WetLowCeiling {
+    fn collision_boxes(&self, query: Aabb) -> Result<CollisionQuery<Vec<Aabb>>, WorldQueryError> {
+        self.0.collision_boxes(query)
+    }
+
+    fn block_physics(&self, block: [i32; 3]) -> Result<sim::BlockPhysicsSample, WorldQueryError> {
+        PoolFloor(std::cell::Cell::new(true)).block_physics(block)
+    }
+}
+
+/// Low-space water contact selects swimming without expanding the box or requiring sprint input.
+#[test]
+fn crawling_into_water_keeps_a_low_pose_and_publishes_swim_edges() {
+    for already_crawling in [false, true] {
+        let mut physics = settled_controller();
+        let low = LowCeiling(2.0);
+        let previous = if already_crawling {
+            let entry = step(
+                &mut physics,
+                MovementInput::default(),
+                ModeIntent::default(),
+                &low,
+            );
+            assert_eq!(entry.processed.mode, MovementMode::Crawling);
+            HeldInput::from(&entry)
+        } else {
+            HeldInput::default()
+        };
+        let wet = WetLowCeiling(low);
+        let sample = step(
+            &mut physics,
+            MovementInput::default(),
+            ModeIntent::default(),
+            &wet,
+        );
+        assert_eq!(sample.processed.mode, MovementMode::Swimming);
+        let flags = input_flags(&sample, previous);
+        assert!(has(flags, PlayerInputFlags::START_SWIMMING));
+        assert_eq!(
+            has(flags, PlayerInputFlags::STOP_CRAWLING),
+            already_crawling
+        );
+        assert!(!has(flags, PlayerInputFlags::START_CRAWLING));
+        let steady = step(
+            &mut physics,
+            MovementInput::default(),
+            ModeIntent::default(),
+            &wet,
+        );
+        assert_eq!(steady.processed.mode, MovementMode::Swimming);
+        assert!(!has(
+            input_flags(&steady, HeldInput::from(&sample)),
+            PlayerInputFlags::START_SWIMMING
+        ));
+    }
+}
+
+#[test]
+fn a_fully_blocked_opening_does_not_start_crawling() {
+    let mut physics = settled_controller();
+    let sample = step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &LowCeiling(1.4),
+    );
+    assert_eq!(sample.processed.mode, MovementMode::Walking);
+}
+
+/// Correction replay derives crawl entry at the corrected position and retains it on the next tick.
+#[test]
+fn a_low_space_prediction_correction_replays_crawl_input() {
+    let mut physics = settled_controller();
+    let input = MovementInput {
+        forward: 1.0,
+        ..Default::default()
+    };
+    let world = VersionedFloor(1);
+    let first = step(&mut physics, input, ModeIntent::default(), &world);
+    let mut ticker = MovementTicker::default();
+    ticker.reset(1, first.tick - 1, first.position);
+    ticker.set_source(MovementSource::Physics);
+    for sample in [
+        first.clone(),
+        step(&mut physics, input, ModeIntent::default(), &world),
+    ] {
+        ticker.enqueue_completed_physics(sample).unwrap();
+    }
+    let low = LowCeiling(2.0);
+    let mut anchor = first.position;
+    anchor[0] += 0.1;
+    reconcile_candidate_physics_correction(
+        &mut ticker,
+        &mut physics,
+        anchor,
+        first.tick,
+        true,
+        super::PhysicsCorrectionMode::ReplayIfRetained,
+        &low,
+    )
+    .unwrap();
+    assert_eq!(physics.mode(), MovementMode::Crawling);
+    let pending = ticker.pending_snapshots();
+    assert_eq!(pending.len(), 1);
+    assert!(has(pending[0].flags, PlayerInputFlags::START_CRAWLING));
+    physics.advance_with_context(Duration::ZERO, input, PhysicsSampleContext::default(), &low);
+    let next = step(&mut physics, input, ModeIntent::default(), &low);
+    assert_eq!(next.processed.mode, MovementMode::Crawling);
+    assert!((next.position[0] - anchor[0]).abs() < 0.000_001);
+    assert!((next.position[1] - anchor[1]).abs() < 0.000_001);
+}
+
+#[test]
+fn swim_and_glide_edges_pair_start_with_stop() {
+    for (mode, start, stop) in [
+        (
+            MovementMode::Swimming,
+            PlayerInputFlags::START_SWIMMING,
+            PlayerInputFlags::STOP_SWIMMING,
+        ),
+        (
+            MovementMode::Gliding,
+            PlayerInputFlags::START_GLIDING,
+            PlayerInputFlags::STOP_GLIDING,
+        ),
+    ] {
+        let mut active = settled_sample(101, [0.0, 2.620_01, 0.0]);
+        active.processed.mode = mode;
+        assert!(has(input_flags(&active, HeldInput::default()), start));
+        let idle = settled_sample(102, [0.0, 2.620_01, 0.0]);
+        assert!(has(input_flags(&idle, HeldInput::from(&active)), stop));
+    }
+}
+
+#[test]
+fn a_ceiling_that_only_fits_a_sneak_forces_the_pose_without_request_lanes() {
+    let mut physics = settled_controller();
+    let world = LowCeiling(2.6);
+    let first = step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &world,
+    );
+    assert!(first.processed.forced_sneak && first.sneaking);
+    let flags = input_flags(&first, HeldInput::default());
+    assert!(!has(flags, PlayerInputFlags::PERSIST_SNEAK));
+    assert!(!has(flags, PlayerInputFlags::SNEAKING));
+    assert!(!has(flags, PlayerInputFlags::SNEAK_DOWN));
+    assert!(!has(flags, PlayerInputFlags::WANT_DOWN));
+    assert_eq!(first.processed.mode, MovementMode::Walking);
+}
+
+fn riding_sample(kind: RideKind, move_vector: [f32; 2]) -> PhysicsMovementSample {
+    let mut sample = settled_sample(101, [0.0, 2.620_01, 0.0]);
+    sample.processed.mode = MovementMode::Riding;
+    sample.processed.ride = Some(kind);
+    sample.move_vector = move_vector;
+    sample
+}
+
+#[test]
+fn other_boat_input_retains_its_provisional_steering_mapping() {
+    let paddles = |kind, vector| {
+        let mut sample = riding_sample(kind, vector);
+        sample.input_mode = protocol::PlayerInputMode::Touch;
+        let flags = input_flags(&sample, HeldInput::default());
+        (
+            has(flags, PlayerInputFlags::PADDLING_LEFT),
+            has(flags, PlayerInputFlags::PADDLING_RIGHT),
+        )
+    };
+    assert_eq!(paddles(RideKind::Boat, [0.0, 1.0]), (true, true));
+    assert_eq!(paddles(RideKind::Boat, [-1.0, 0.0]), (true, false));
+    assert_eq!(paddles(RideKind::Boat, [1.0, 0.0]), (false, true));
+    assert_eq!(paddles(RideKind::Boat, [0.0, 0.0]), (false, false));
+    assert_eq!(paddles(RideKind::Horse, [0.0, 1.0]), (false, false));
+}
+
+/// Forward motion must not invent either request for the mouse boating path.
+#[test]
+fn mouse_boat_paddles_do_not_derive_from_forward_motion() {
+    for (kind, vector, expected) in [
+        (RideKind::Boat, [0.0, 1.0], (false, false)),
+        (RideKind::Boat, [-0.7, 0.7], (true, false)),
+        (RideKind::Boat, [0.7, 0.7], (false, true)),
+        (RideKind::Boat, [0.0, -1.0], (false, false)),
+        (RideKind::Boat, [-1.0, 0.0], (true, false)),
+        (RideKind::Boat, [1.0, 0.0], (false, true)),
+        (RideKind::Boat, [0.0, 0.0], (false, false)),
+        (RideKind::Horse, [0.0, 1.0], (false, false)),
+        (RideKind::Horse, [-1.0, 0.0], (false, false)),
+    ] {
+        let mut sample = riding_sample(kind, vector);
+        sample.input_mode = protocol::PlayerInputMode::Mouse;
+        sample.input.movement_buttons = semantic_input::MovementButtons {
+            forward: vector[1] > 0.0,
+            backward: vector[1] < 0.0,
+            left: vector[0] < 0.0,
+            right: vector[0] > 0.0,
+        };
+        let flags = input_flags(&sample, HeldInput::default());
+        assert_eq!(
+            (
+                has(flags, PlayerInputFlags::PADDLING_LEFT),
+                has(flags, PlayerInputFlags::PADDLING_RIGHT)
+            ),
+            expected,
+            "kind={kind:?} movement={vector:?}"
+        );
+    }
+}
+
+#[test]
+fn a_mounted_controller_streams_a_frozen_pose_with_steering_intact() {
+    let mut physics = settled_controller();
+    let rider = ModeIntent {
+        ride: Some(RideKind::Horse),
+        ..ModeIntent::default()
+    };
+    let before = physics.network_position().unwrap();
+    let sample = step(
+        &mut physics,
+        MovementInput {
+            forward: 1.0,
+            sprinting: true,
+            ..MovementInput::default()
+        },
+        rider,
+        &VersionedFloor(1),
+    );
+    assert_eq!(sample.processed.mode, MovementMode::Riding);
+    assert_eq!(sample.position, before);
+    assert_eq!(sample.movement, [0.0; 3]);
+    assert!(!sample.processed.sprinting);
+    assert_eq!(sample.move_vector[1], 1.0);
+}
+
+#[test]
+fn a_rider_follows_the_mount_seat_and_reports_the_seat_delta() {
+    let mut physics = settled_controller();
+    let before = physics.network_position().unwrap();
+    let rider = ModeIntent {
+        ride: Some(RideKind::Boat),
+        ride_seat: Some([5.0, 3.0, 5.0]),
+        ..ModeIntent::default()
+    };
+    let sample = step(
+        &mut physics,
+        MovementInput::default(),
+        rider,
+        &VersionedFloor(1),
+    );
+    assert_eq!(sample.position[0], 5.0);
+    assert_eq!(sample.position[2], 5.0);
+    assert!((sample.position[1] - (3.0 + protocol::PLAYER_NETWORK_OFFSET)).abs() < 1.0e-4);
+    assert!((sample.movement[0] - (5.0 - before[0])).abs() < 1.0e-5);
+    assert!(!has(
+        input_flags(&sample, HeldInput::default()),
+        PlayerInputFlags::JUMPING
+    ));
+}
+
+#[test]
+fn holding_right_sends_negative_wire_x_and_moves_right_of_facing() {
+    let mut physics = settled_controller();
+    let mut ticker = super::MovementTicker::default();
+    ticker.reset(1, 101, [0.0, 2.620_01, 0.0]);
+    ticker.set_source(super::MovementSource::Physics);
+    // Yaw 0 faces +z, so the player's right is -x.
+    let input = super::physics_movement_input([1.0, 0.0], 0.0, true, false, false, false, None);
+    let mut sample = step(
+        &mut physics,
+        input,
+        ModeIntent::default(),
+        &VersionedFloor(1),
+    );
+    assert!(
+        sample.position[0] < 0.0,
+        "strafing right moves toward -x at yaw 0"
+    );
+    sample.input.movement_buttons.right = true;
+    ticker.enqueue_completed_physics(sample).unwrap();
+    let snapshot = ticker.pop_pending().unwrap().snapshot;
+    assert!(snapshot.move_vector[0] < 0.0, "wire x is left-positive");
+    assert!(has(snapshot.flags, PlayerInputFlags::RIGHT));
+    assert!(!has(snapshot.flags, PlayerInputFlags::LEFT));
+}
+
+#[test]
+fn a_repeated_takeoff_from_a_held_jump_signals_start_jumping() {
+    let mut physics = settled_controller();
+    let jump = MovementInput {
+        jumping: true,
+        ..MovementInput::default()
+    };
+    let mut previous = HeldInput::default();
+    let mut takeoffs = 0;
+    for _ in 0..60 {
+        let sample = step(
+            &mut physics,
+            jump,
+            ModeIntent::default(),
+            &VersionedFloor(1),
+        );
+        let flags = input_flags(&sample, previous);
+        if sample.processed.jump_initiated {
+            takeoffs += 1;
+            assert!(has(flags, PlayerInputFlags::START_JUMPING));
+        }
+        previous = HeldInput::from(&sample);
+    }
+    assert!(takeoffs >= 2, "a held jump repeats");
+}
+
+#[test]
+fn rider_correction_replay_does_not_start_a_player_jump() {
+    let mut physics = grounded_controller();
+    let mut ticker = super::MovementTicker::default();
+    ticker.reset(1, 100, [0.0, 2.620_01, 0.0]);
+    ticker.set_source(super::MovementSource::Physics);
+    for _ in 0..3 {
+        let sample = step(
+            &mut physics,
+            MovementInput {
+                jumping: true,
+                ..MovementInput::default()
+            },
+            ModeIntent {
+                ride: Some(RideKind::Boat),
+                ..ModeIntent::default()
+            },
+            &VersionedFloor(1),
+        );
+        ticker.enqueue_completed_physics(sample).unwrap();
+    }
+    super::reconcile_candidate_physics_correction(
+        &mut ticker,
+        &mut physics,
+        [0.1, 2.620_01, 0.0],
+        101,
+        true,
+        super::PhysicsCorrectionMode::ReplayIfRetained,
+        &VersionedFloor(1),
+    )
+    .unwrap();
+    for snapshot in ticker.pending_snapshots() {
+        assert_eq!(
+            snapshot.flags.bits() & PlayerInputFlags::START_JUMPING.bits(),
+            0
+        );
+        assert_ne!(snapshot.flags.bits() & PlayerInputFlags::JUMPING.bits(), 0);
+    }
+}
+
+struct PoolFloor(std::cell::Cell<bool>);
+
+impl CollisionWorld for PoolFloor {
+    fn collision_boxes(&self, query: Aabb) -> Result<CollisionQuery<Vec<Aabb>>, WorldQueryError> {
+        VersionedFloor(1).collision_boxes(query)
+    }
+
+    fn block_physics(&self, block: [i32; 3]) -> Result<sim::BlockPhysicsSample, WorldQueryError> {
+        let mut sample = VersionedFloor(1).block_physics(block)?;
+        if self.0.get() && block[1] >= 1 {
+            sample.layers[0].flags = sim::BlockPhysicsFlags::from_bits(
+                sample.layers[0].flags.bits() | sim::BlockPhysicsFlags::WATER.bits(),
+            )
+            .unwrap();
+            sample.layers[0].fluid_height_blocks = 1.0;
+        }
+        Ok(sample)
+    }
+
+    fn primary_is_air(
+        &self,
+        block: [i32; 3],
+    ) -> Result<Option<CollisionQuery<bool>>, WorldQueryError> {
+        Ok(Some(CollisionQuery {
+            value: !self.0.get() && block[1] >= 1,
+            identity: self.block_physics(block)?.identity,
+        }))
+    }
+}
+
+#[test]
+fn leaving_water_defers_held_ground_jump_until_native_swim_blend_finishes() {
+    let world = PoolFloor(std::cell::Cell::new(true));
+    let mut physics = grounded_controller();
+    let swim = MovementInput {
+        forward: 1.0,
+        sprinting: true,
+        ..MovementInput::default()
+    };
+    let mut previous = HeldInput::default();
+    for _ in 0..12 {
+        let sample = step(&mut physics, swim, ModeIntent::default(), &world);
+        assert_eq!(sample.processed.mode, MovementMode::Swimming);
+        previous = HeldInput::from(&sample);
+    }
+    assert_eq!(physics.state().unwrap().swim_amount, 1.0);
+    world.0.set(false);
+    // The swim-amount blend runs before the swim trigger. The first dry tick still advances
+    // the previous swimming flag; decay starts on the following tick.
+    let stopped = step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &world,
+    );
+    let stopped_flags = input_flags(&stopped, previous);
+    assert!(has(stopped_flags, PlayerInputFlags::STOP_SWIMMING));
+    assert_eq!(physics.state().unwrap().swim_amount, 1.0);
+    previous = HeldInput::from(&stopped);
+    let held_jump = MovementInput {
+        jumping: true,
+        ..MovementInput::default()
+    };
+    let mut stop_edges = 1;
+    let mut takeoffs = 0;
+    for tick in 0..10 {
+        let sample = step(&mut physics, held_jump, ModeIntent::default(), &world);
+        let flags = input_flags(&sample, previous);
+        assert_eq!(sample.processed.mode, MovementMode::Walking);
+        assert!(has(flags, PlayerInputFlags::WANT_UP));
+        stop_edges += usize::from(has(flags, PlayerInputFlags::STOP_SWIMMING));
+        takeoffs += usize::from(has(flags, PlayerInputFlags::START_JUMPING));
+        assert_eq!(sample.processed.jump_initiated, tick == 9);
+        previous = HeldInput::from(&sample);
+    }
+    assert_eq!((stop_edges, takeoffs), (1, 1));
+}
+
+#[test]
+fn in_session_snap_preserves_swimming_blend_and_mode_edges() {
+    let world = PoolFloor(std::cell::Cell::new(true));
+    let mut physics = grounded_controller();
+    let mut ticker = MovementTicker::default();
+    ticker.reset(1, 100, physics.network_position().unwrap());
+    ticker.set_source(MovementSource::Physics);
+    let input = MovementInput {
+        forward: 1.0,
+        sprinting: true,
+        ..MovementInput::default()
+    };
+    let mut last = None;
+    for _ in 0..3 {
+        let sample = step(&mut physics, input, ModeIntent::default(), &world);
+        ticker.enqueue_completed_physics(sample.clone()).unwrap();
+        ticker.pop_pending().unwrap();
+        last = Some(sample);
+    }
+    let last = last.unwrap();
+    let blend = physics.state().unwrap().swim_amount;
+    assert!(physics.state().unwrap().swim_pose_active);
+    reconcile_candidate_physics_correction(
+        &mut ticker,
+        &mut physics,
+        last.position,
+        last.tick,
+        true,
+        super::PhysicsCorrectionMode::Snap,
+        &world,
+    )
+    .unwrap();
+    assert_eq!(physics.state().unwrap().swim_amount, blend);
+    assert!(physics.state().unwrap().swim_pose_active);
+    physics.advance_with_context(
+        Duration::ZERO,
+        input,
+        PhysicsSampleContext::default(),
+        &world,
+    );
+    let next = step(&mut physics, input, ModeIntent::default(), &world);
+    assert_eq!(next.processed.mode, MovementMode::Swimming);
+    assert!(physics.state().unwrap().swim_amount > blend);
+    ticker.enqueue_completed_physics(next).unwrap();
+    let flags = ticker.pop_pending().unwrap().snapshot.flags;
+    assert!(!has(flags, PlayerInputFlags::START_SWIMMING));
+    assert!(!has(flags, PlayerInputFlags::STOP_SWIMMING));
+}
+
+#[test]
+fn mod_jump_pulse_survives_subtick_frames_and_consumes_one_tick() {
+    let mut physics = settled_controller();
+    physics.set_jump_pulse_scope(Some((1, 0)));
+    physics.request_jump_pulse();
+    let early = physics.advance(
+        Duration::from_millis(10),
+        MovementInput::default(),
+        &VersionedFloor(1),
+    );
+    assert_eq!(early.completed_ticks, 0);
+    let frame = physics.advance(
+        Duration::from_millis(90),
+        MovementInput::default(),
+        &VersionedFloor(1),
+    );
+    assert_eq!(frame.completed_ticks, 2);
+    assert!(frame.samples[0].jumping);
+    assert!(frame.samples[0].processed.jump_initiated);
+    assert!(frame.samples[0].input.jump.held);
+    assert!(frame.samples[0].input.jump.pressed);
+    assert!(!frame.samples[1].jumping);
+    assert!(!frame.samples[1].input.jump.held);
+    assert!(!frame.samples[1].input.jump.pressed);
+    assert!(frame.samples[1].input.jump.released);
+    let pressed = input_flags(&frame.samples[0], HeldInput::default());
+    let released = input_flags(&frame.samples[1], (&frame.samples[0]).into());
+    assert!(has(pressed, PlayerInputFlags::JUMP_DOWN));
+    assert!(has(pressed, PlayerInputFlags::JUMP_PRESSED_RAW));
+    assert!(!has(released, PlayerInputFlags::JUMP_DOWN));
+    assert!(has(released, PlayerInputFlags::JUMP_RELEASED_RAW));
+}
+
+#[test]
+fn mod_jump_pulse_revocation_releases_published_input_without_releasing_physical_jump() {
+    for physical_held in [false, true] {
+        let mut physics = settled_controller();
+        physics.set_jump_pulse_scope(Some((1, 0)));
+        physics.request_jump_pulse();
+        let pressed = physics.advance(TICK, MovementInput::default(), &VersionedFloor(1));
+        assert!(pressed.samples[0].input.jump.held);
+        physics.set_jump_pulse_scope(None);
+        let mut context = PhysicsSampleContext::default();
+        context.input.jump.held = physical_held;
+        let released = physics.advance_with_context(
+            TICK,
+            MovementInput {
+                jumping: physical_held,
+                ..Default::default()
+            },
+            context,
+            &VersionedFloor(1),
+        );
+        let flags = input_flags(&released.samples[0], (&pressed.samples[0]).into());
+        assert_eq!(has(flags, PlayerInputFlags::JUMP_DOWN), physical_held);
+        assert_eq!(
+            has(flags, PlayerInputFlags::JUMP_RELEASED_RAW),
+            !physical_held
+        );
+    }
+}
+
+#[test]
+fn mod_jump_pulse_scope_revocation_and_reanchor_discard_pending_input() {
+    for reset in 0..3 {
+        let mut physics = settled_controller();
+        physics.set_jump_pulse_scope(Some((1, 0)));
+        physics.request_jump_pulse();
+        match reset {
+            0 => physics.set_jump_pulse_scope(None),
+            1 => physics.set_jump_pulse_scope(Some((2, 0))),
+            _ => physics.reanchor_network_position([0.0, 2.620_01, 0.0], 100, true),
+        }
+        let frame = physics.advance(TICK, MovementInput::default(), &VersionedFloor(1));
+        assert!(!frame.samples[0].jumping);
+        assert!(!frame.samples[0].processed.jump_initiated);
+    }
+}
+
+#[test]
+fn mod_jump_pulse_preserves_physically_held_jump() {
+    let mut physics = settled_controller();
+    physics.set_jump_pulse_scope(Some((1, 0)));
+    physics.request_jump_pulse();
+    let frame = physics.advance(
+        Duration::from_millis(100),
+        MovementInput {
+            jumping: true,
+            ..Default::default()
+        },
+        &VersionedFloor(1),
+    );
+    assert!(frame.samples.iter().all(|sample| sample.jumping));
+}
+
+#[test]
+fn movement_motion_sequence_counts_only_admitted_impulses() {
+    let mut physics = settled_controller();
+    assert_eq!(physics.knockback_sequence(), 0);
+    physics.queue_server_motion([0.1, 0.2, 0.3], 0);
+    assert_eq!(physics.knockback_sequence(), 1);
+    physics.queue_server_motion([f32::NAN, 0.2, 0.3], 0);
+    assert_eq!(physics.knockback_sequence(), 1);
+    physics.queue_server_motion([0.3, 0.2, 0.1], physics.state().unwrap().tick);
+    assert_eq!(physics.knockback_sequence(), 2);
+    physics.deactivate();
+    physics.queue_server_motion([0.1, 0.2, 0.3], 0);
+    assert_eq!(physics.knockback_sequence(), 2);
+}
+
+/// Vanilla's sneak trigger leaves the crawl flag when no pose fits and stops
+/// crawling, without a forced sneak, during a Riptide spin.
+#[test]
+fn crawl_holds_without_a_fitting_pose_and_ends_during_a_spin() {
+    let mut physics = settled_controller();
+    let feet = physics.state().unwrap().position;
+    let tunnel = LowCeiling(feet.y + 1.0);
+    let idle = MovementInput::default();
+    let crawl = step(&mut physics, idle, ModeIntent::default(), &tunnel);
+    assert_eq!(crawl.processed.mode, MovementMode::Crawling);
+    let closed = LowCeiling(feet.y + 0.4);
+    let held = step(&mut physics, idle, ModeIntent::default(), &closed);
+    assert_eq!(held.processed.mode, MovementMode::Crawling);
+    let spin = client_world::MovementFlagUpdate {
+        spinning: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(physics.apply_server_movement_flags(0, spin), None);
+    let spinning = step(&mut physics, idle, ModeIntent::default(), &tunnel);
+    assert_eq!(spinning.processed.mode, MovementMode::Walking);
+    assert!(!spinning.sneaking);
+}
+
+/// A stamped crawl clear in a tunnel lets the crawl rules restart it, with
+/// their start action, instead of forcing a standing pose.
+#[test]
+fn a_stamped_crawl_clear_lets_the_tunnel_restart_the_crawl() {
+    let mut physics = settled_controller();
+    let feet = physics.state().unwrap().position;
+    let tunnel = LowCeiling(feet.y + 1.0);
+    let samples: Vec<_> = (0..3)
+        .map(|_| {
+            step(
+                &mut physics,
+                MovementInput::default(),
+                ModeIntent::default(),
+                &tunnel,
+            )
+        })
+        .collect();
+    let mut ticker = MovementTicker::default();
+    ticker.reset(1, samples[0].tick - 1, samples[0].position);
+    ticker.set_source(MovementSource::Physics);
+    for sample in samples.clone() {
+        ticker.enqueue_completed_physics(sample).unwrap();
+    }
+    let clear = client_world::MovementFlagUpdate {
+        crawling: Some(false),
+        ..Default::default()
+    };
+    let stamp = samples[0].tick;
+    assert_eq!(
+        physics.apply_server_movement_flags(stamp, clear),
+        Some(stamp)
+    );
+    super::reconcile_timeline_rewind(&mut ticker, &mut physics, stamp, &tunnel).unwrap();
+    let pending = ticker.pending_snapshots();
+    let after = pending
+        .iter()
+        .find(|snapshot| snapshot.tick == stamp + 1)
+        .expect("the tick after the stamp stays queued");
+    assert!(has(after.flags, PlayerInputFlags::START_CRAWLING));
+    assert!(!has(after.flags, PlayerInputFlags::STOP_CRAWLING));
+    // The replay ended the crawl and the tunnel restarted it, so the live
+    // state takes the replayed crawl, which the next tick continues.
+    assert_eq!(physics.mode(), MovementMode::Crawling);
+    let next = step(
+        &mut physics,
+        MovementInput::default(),
+        ModeIntent::default(),
+        &tunnel,
+    );
+    assert_eq!(next.processed.mode, MovementMode::Crawling);
+}
+
+/// Replay through a retained server swim start leaves the live swim blend,
+/// which vanilla keeps in its own component that replay copy-back omits.
+#[test]
+fn replaying_a_server_swim_start_keeps_the_live_swim_blend() {
+    let world = PoolFloor(std::cell::Cell::new(true));
+    let mut physics = grounded_controller();
+    let forward = MovementInput {
+        forward: 1.0,
+        ..MovementInput::default()
+    };
+    let samples: Vec<_> = (0..12)
+        .map(|_| step(&mut physics, forward, ModeIntent::default(), &world))
+        .collect();
+    let mut ticker = MovementTicker::default();
+    ticker.reset(1, samples[0].tick - 1, samples[0].position);
+    ticker.set_source(MovementSource::Physics);
+    for sample in samples.clone() {
+        ticker.enqueue_completed_physics(sample).unwrap();
+    }
+    let blend = physics.state().unwrap().swim_amount;
+    let swim = client_world::MovementFlagUpdate {
+        swimming: Some(true),
+        ..Default::default()
+    };
+    let stamp = samples[0].tick;
+    assert_eq!(
+        physics.apply_server_movement_flags(stamp, swim),
+        Some(stamp)
+    );
+    physics.queue_server_motion([0.0; 3], stamp);
+    super::reconcile_timeline_rewind(&mut ticker, &mut physics, stamp, &world).unwrap();
+    assert_eq!(physics.state().unwrap().swim_amount, blend);
+}

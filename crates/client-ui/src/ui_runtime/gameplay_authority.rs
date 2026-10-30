@@ -1,0 +1,670 @@
+//! Local gameplay authority on [`UiRuntime`]: hotbar-slot precedence, the
+//! retained gameplay-HUD event appliers, and the per-frame inventory drain.
+//! Split from the runtime root to honor the production line budget.
+
+use std::sync::Arc;
+
+use protocol::{ActorEffectEvent, ActorMetadata};
+use ui::BoundedStat;
+
+use super::{GameplayHudState, SequencedLocalAttributes, UiRuntime, UiRuntimeError, hud_adapter};
+
+/// Bedrock's fixed wire cadence: 20 server ticks per second.
+pub(super) const MILLIS_PER_SERVER_TICK: u64 = simulation_clock::TICK_DURATION.as_millis() as u64;
+
+/// The reference charges the mount jump bar from empty to full over half a
+/// second of held jump input; pinned in milliseconds as a bounded recorded
+/// approximation pending the native comparison gallery.
+const MOUNT_JUMP_CHARGE_FULL_MILLIS: u64 = 500;
+
+impl UiRuntime {
+    pub fn set_hardcore(&mut self, hardcore: bool) {
+        self.session.gameplay_hud.set_hardcore(hardcore);
+    }
+
+    pub fn apply_hud_rules(&mut self, rules: protocol::HudRules) {
+        self.session.gameplay_hud.apply_hud_rules(rules);
+    }
+
+    pub(super) fn apply_game_mode_update(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        update: protocol::GameModeUpdate,
+    ) -> super::UiApplyOutcome {
+        if player_runtime.facts.apply_game_mode_update(update) {
+            super::UiApplyOutcome::Applied
+        } else {
+            self.session.gameplay_hud.note_odd_hud_packet();
+            super::UiApplyOutcome::IgnoredByReceiveStore
+        }
+    }
+
+    pub(super) fn apply_default_game_mode_update(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        update: protocol::GameModeUpdate,
+    ) -> super::UiApplyOutcome {
+        if player_runtime.facts.apply_default_game_mode_update(update) {
+            super::UiApplyOutcome::Applied
+        } else {
+            self.session.gameplay_hud.note_odd_hud_packet();
+            super::UiApplyOutcome::IgnoredByReceiveStore
+        }
+    }
+
+    pub const fn gameplay_hud(&self) -> &GameplayHudState {
+        &self.session.gameplay_hud
+    }
+
+    /// The presentation tick at `now_millis`, advancing at 20 tps from its real-time anchor.
+    /// Equal or lagging packet ticks never rewind this clock or discard fractional elapsed time.
+    /// Effect durations start when received; a server Remove remains authoritative for early clears.
+    pub fn estimated_server_tick(&self, now_millis: u64) -> Option<u64> {
+        let (tick, observed) = self.session.presentation_tick_anchor?;
+        Some(tick.saturating_add(now_millis.saturating_sub(observed) / MILLIS_PER_SERVER_TICK))
+    }
+
+    /// Retains specified wire ticks and advances the presentation clock when they lead it.
+    /// Zero timestamps leave the last nonzero ordering fence intact.
+    pub(super) fn observe_presentation_tick(&mut self, tick: u64, now_millis: u64) -> u64 {
+        if tick != 0 {
+            self.session.last_server_tick =
+                Some(self.session.last_server_tick.unwrap_or(0).max(tick));
+        }
+        let estimated = self.estimated_server_tick(now_millis);
+        if estimated.is_none_or(|estimated| tick > estimated) {
+            self.session.presentation_tick_anchor = Some((tick, now_millis));
+        }
+        self.estimated_server_tick(now_millis).unwrap()
+    }
+
+    /// Drops effects that expired on the estimated session clock.
+    pub fn expire_gameplay_effects(&mut self, now_millis: u64) {
+        let now_tick = self.estimated_server_tick(now_millis);
+        self.session.gameplay_hud.expire_effects(now_tick);
+    }
+
+    /// Observes the held state of the jump action for the mount jump-charge
+    /// ramp. Holding jump while mounted starts the charge clock; releasing
+    /// it, or losing the mount, resets the charge to empty.
+    pub fn set_mount_jump_held(&mut self, held: bool, now_millis: u64) {
+        if !held || self.session.gameplay_hud.mount_unique_id().is_none() {
+            self.session.mount_jump_hold_started_millis = None;
+            return;
+        }
+        if self.session.mount_jump_hold_started_millis.is_none() {
+            self.session.mount_jump_hold_started_millis = Some(now_millis);
+        }
+    }
+
+    /// The current jump charge in `0.0..=1.0`: a linear ramp over the pinned
+    /// hold window, zero while jump is not held.
+    pub fn mount_jump_charge(&self, now_millis: u64) -> f32 {
+        let Some(started) = self.session.mount_jump_hold_started_millis else {
+            return 0.0;
+        };
+        let elapsed = now_millis.saturating_sub(started);
+        (elapsed as f32 / MOUNT_JUMP_CHARGE_FULL_MILLIS as f32).clamp(0.0, 1.0)
+    }
+
+    /// Publishes the armor bar derived from the authoritative equipped armor
+    /// identifiers. `None` means armor equipment is unknown, which clears the
+    /// row (fail closed) rather than retaining a stale value.
+    pub fn set_derived_armor(&mut self, points: Option<u16>) {
+        let armor = points.and_then(|points| BoundedStat::new(points.min(20), 20));
+        self.session.hud.set_stats(
+            self.session.hud.health(),
+            self.session.hud.hunger(),
+            armor,
+            self.session.hud.air(),
+        );
+    }
+
+    /// Current local actor damage state, absent when its session has no player actor.
+    pub const fn local_actor_damage(&self) -> Option<client_world::ActorDamageState> {
+        self.session.local_actor_damage
+    }
+
+    /// Publishes the current local actor's damage snapshot after its completed ticks.
+    pub fn publish_local_actor_damage(&mut self, damage: Option<client_world::ActorDamageState>) {
+        self.session.local_actor_damage = damage;
+    }
+
+    /// Projects actor health and damage; life transitions stay in committed packet order.
+    pub fn publish_local_actor_health(&mut self, actor: Option<&client_world::ActorSnapshot>) {
+        self.publish_local_actor_damage(actor.map(|actor| actor.status.damage));
+        if let Some(health) = actor
+            .and_then(|actor| actor.attributes.get("minecraft:health"))
+            .and_then(hud_adapter::attribute_stat)
+        {
+            self.session.local_player_health_available =
+                self.session.last_known_local_player_alive.is_some();
+            self.session.hud.set_health(Some(health));
+        } else if actor.is_none() {
+            self.session.local_player_health_available = false;
+        }
+    }
+
+    /// Millis timestamp when the selected slot or item identity last changed,
+    /// for the selected-item label fade.
+    pub const fn selected_item_changed_millis(&self) -> Option<u64> {
+        self.session.last_selected_identity_change_millis
+    }
+
+    /// Refreshes the selected-item identity clock. Runs before presentation so
+    /// the label timer starts when the selection or item identity changes.
+    /// Bedrock's HUD tick notices slot changes even between identical items.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn observe_selected_item_identity(
+        &mut self,
+        player_runtime: &player_state::PlayerState,
+        now_millis: u64,
+    ) {
+        let identity = player_runtime
+            .selected_stack_snapshot()
+            .and_then(|snapshot| match snapshot.state {
+                inventory::inventory_ledger::PlayerInventorySlot::Present(stack) => {
+                    Some((snapshot.slot, stack.network_id, stack.metadata))
+                }
+                _ => None,
+            });
+        self.observe_selected_item_identity_value(identity, now_millis);
+    }
+
+    /// Updates the selected-item clock from an already-sampled frame identity.
+    pub fn observe_selected_item_identity_value(
+        &mut self,
+        identity: Option<(u8, i32, u32)>,
+        now_millis: u64,
+    ) {
+        if identity != self.session.last_selected_identity {
+            self.session.last_selected_identity = identity;
+            self.session.last_selected_identity_change_millis = if identity.is_some() {
+                Some(now_millis)
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Applies every queued authoritative inventory event to the inventory
+    /// ledger and HUD diagnostics. Runs once per frame before presentation; the
+    /// queue would otherwise grow without a consumer until the container store
+    /// takes over this drain.
+    pub fn drain_pending_inventory(&mut self, player_runtime: &mut player_state::PlayerState) {
+        self.drain_inventory_prefix(player_runtime, None);
+        player_runtime.inventory.finish_drain();
+        self.sample_crafting_observation(player_runtime);
+        self.sync_anvil_name(player_runtime);
+    }
+
+    /// Updates inventory presentation only through the transport prefix before an item event.
+    pub(super) fn drain_inventory_prefix(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        before: Option<u64>,
+    ) {
+        while let Some(sequenced) = match before {
+            Some(sequence) => player_runtime.inventory.apply_next_before(sequence),
+            None => player_runtime.inventory.apply_next(),
+        } {
+            let event = match sequenced.event {
+                inventory::InventoryAuthorityEvent::Inventory(event) => event,
+                inventory::InventoryAuthorityEvent::Registry(registry) => {
+                    self.observe_use_on_identity(
+                        player_runtime,
+                        sequenced.session_generation,
+                        sequenced.fifo_sequence,
+                        &inventory::InventoryAuthorityEvent::Registry(registry),
+                    );
+                    continue;
+                }
+            };
+            let ledger = player_runtime.inventory.ledger();
+            self.session.inventory_open = self.session.screen.book.is_some()
+                || ledger.personal_inventory_desired_open()
+                || ledger.storage_inventory_desired_open();
+            if self.session.inventory_open {
+                self.session.chat_focused = false;
+            }
+            self.observe_inventory_window(player_runtime);
+            self.session.gameplay_hud.apply_inventory(&event);
+            self.observe_use_on_identity(
+                player_runtime,
+                sequenced.session_generation,
+                sequenced.fifo_sequence,
+                &inventory::InventoryAuthorityEvent::Inventory(event),
+            );
+        }
+    }
+
+    pub fn apply_local_attributes(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        envelope: SequencedLocalAttributes,
+    ) -> Result<(), UiRuntimeError> {
+        self.validate_identity(
+            envelope.session_id,
+            envelope.fifo_sequence,
+            envelope.local_millis,
+            Some(envelope.server_tick),
+        )?;
+        let mut health = self.session.hud.health();
+        let mut hunger = self.session.hud.hunger();
+        let mut absorption = self.session.hud.absorption();
+        let mut xp_level = self.session.hud.experience().map(|xp| xp.level);
+        let mut xp_progress = self.session.hud.experience().map(|xp| xp.progress);
+        for attribute in envelope.attributes.iter() {
+            match attribute.name.as_ref() {
+                // A semantically odd value (non-finite, inverted range) in a
+                // well-formed attribute skips that field, counted, keeping the
+                // previous authoritative value and the session alive.
+                "minecraft:health" => match hud_adapter::attribute_stat(attribute) {
+                    Some(stat) => {
+                        self.publish_local_player_alive(attribute.current > 0.0);
+                        health = Some(stat);
+                    }
+                    None => self.session.gameplay_hud.note_odd_attribute(),
+                },
+                "minecraft:player.hunger" => {
+                    if player_runtime.facts.apply_hunger_attribute(attribute) {
+                        hunger = player_runtime.facts.hunger().and_then(|stat| {
+                            BoundedStat::new_scaled(stat.current(), stat.maximum(), stat.scale())
+                        });
+                    } else {
+                        self.session.gameplay_hud.note_odd_attribute();
+                    }
+                }
+                "minecraft:player.saturation" => {
+                    self.session.gameplay_hud.set_saturation(attribute.current);
+                }
+                // The native heart renderer reads current absorption, independently
+                // of the attribute range; zero clears the golden hearts.
+                "minecraft:absorption" => match hud_adapter::attribute_stat(attribute) {
+                    Some(stat) => absorption = Some(stat),
+                    None => self.session.gameplay_hud.note_odd_attribute(),
+                },
+                // Bedrock sends experience as attributes, not a dedicated packet: progress in
+                // 0.0..=1.0 and an integer level. `f32 as u32` saturates, so a stray value is bounded.
+                "minecraft:player.experience" if attribute.current.is_finite() => {
+                    xp_progress = Some(attribute.current);
+                }
+                "minecraft:player.level" if attribute.current.is_finite() => {
+                    xp_level = Some(attribute.current.max(0.0) as u32);
+                }
+                _ => {}
+            }
+        }
+        // An authoritative health decrease can dismiss screens that close when hurt.
+        if let (Some(previous), Some(next)) = (self.session.hud.health(), health)
+            && u32::from(next.current()) * u32::from(previous.scale())
+                < u32::from(previous.current()) * u32::from(next.scale())
+        {
+            self.note_player_hurt();
+        }
+        self.session.hud.set_stats(
+            health,
+            hunger,
+            self.session.hud.armor(),
+            self.session.hud.air(),
+        );
+        self.session.hud.set_absorption(absorption);
+        if xp_level.is_some() || xp_progress.is_some() {
+            self.session
+                .hud
+                .set_experience(xp_level.unwrap_or(0), xp_progress.unwrap_or(0.0));
+        }
+        self.session.last_fifo_sequence = Some(envelope.fifo_sequence);
+        self.session.last_local_millis = Some(envelope.local_millis);
+        self.observe_presentation_tick(envelope.server_tick, envelope.local_millis);
+        Ok(())
+    }
+
+    /// Applies accepted spawn health and its resulting mount at one FIFO position.
+    pub fn apply_local_spawn(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        envelope: SequencedLocalAttributes,
+        ridden_unique_id: Option<i64>,
+    ) -> Result<(), UiRuntimeError> {
+        self.apply_local_attributes(player_runtime, envelope)?;
+        self.publish_mount(player_runtime, ridden_unique_id);
+        Ok(())
+    }
+
+    /// Applies a committed local-player SetEntityData batch (air supply,
+    /// freezing strength). Odd values are counted and skipped inside the
+    /// gameplay-HUD state; they never fail the session.
+    pub fn apply_local_metadata(
+        &mut self,
+        session_id: u64,
+        fifo_sequence: u64,
+        metadata: &[ActorMetadata],
+    ) -> Result<(), UiRuntimeError> {
+        self.guard_local_apply(session_id, fifo_sequence)?;
+        self.session.gameplay_hud.apply_metadata(metadata);
+        if let Some((current, maximum)) = self.session.gameplay_hud.air_ticks() {
+            self.session.hud.set_air(BoundedStat::new(current, maximum));
+        }
+        self.session.last_fifo_sequence = Some(fifo_sequence);
+        Ok(())
+    }
+
+    /// Applies a committed local-player MobEffect change. Its duration starts at the
+    /// receive-time presentation tick, including packets with absent or lagging wire ticks.
+    pub fn apply_local_effect(
+        &mut self,
+        session_id: u64,
+        fifo_sequence: u64,
+        mut event: ActorEffectEvent,
+        local_millis: u64,
+    ) -> Result<(), UiRuntimeError> {
+        self.guard_local_apply(session_id, fifo_sequence)?;
+        let event_tick = event.tick;
+        event.tick = self.observe_presentation_tick(event_tick, local_millis);
+        self.session.gameplay_hud.apply_effect(event);
+        self.session.last_fifo_sequence = Some(fifo_sequence);
+        Ok(())
+    }
+
+    /// The local player's worn armor, helmet to boots, from its armor
+    /// container as the inventory shows it.
+    #[must_use]
+    pub fn local_armor(
+        &self,
+        player_runtime: &player_state::PlayerState,
+    ) -> super::gameplay_hud::ArmorSlots {
+        let [helmet, chestplate, leggings, boots] = player_runtime.inventory.local_armor();
+        super::gameplay_hud::ArmorSlots {
+            helmet,
+            chestplate,
+            leggings,
+            boots,
+        }
+    }
+
+    /// The local offhand as the inventory presents it, `None` while unobserved or empty. The
+    /// offhand cell, its tooltip, the HUD frame and the hand all read this one cell.
+    pub fn local_offhand_stack<'a>(
+        &self,
+        player_runtime: &'a player_state::PlayerState,
+    ) -> Option<&'a protocol::NetworkItemStack> {
+        self.inventory_ledger(player_runtime)
+            .target_stack(inventory::inventory_ledger::InventoryTarget::Offhand)
+            .filter(|stack| !stack.is_empty())
+    }
+
+    /// The server-confirmed local offhand without pending screen moves, for item-use checks that
+    /// read backing inventory cells; `None` while unobserved or empty.
+    pub fn local_backing_offhand_stack<'a>(
+        &self,
+        player_runtime: &'a player_state::PlayerState,
+    ) -> Option<&'a protocol::NetworkItemStack> {
+        match self
+            .inventory_ledger(player_runtime)
+            .authoritative_gear_slot_state(inventory::inventory_ledger::InventoryTarget::Offhand)?
+        {
+            inventory::PlayerInventorySlot::Present(stack) if !stack.is_empty() => Some(stack),
+            _ => None,
+        }
+    }
+
+    /// Whether the presented local offhand is empty; `None` until the server has stated it.
+    pub fn local_offhand_is_empty(
+        &self,
+        player_runtime: &player_state::PlayerState,
+    ) -> Option<bool> {
+        match self
+            .inventory_ledger(player_runtime)
+            .gear_slot_state(inventory::inventory_ledger::InventoryTarget::Offhand)?
+        {
+            inventory::PlayerInventorySlot::Unknown => None,
+            inventory::PlayerInventorySlot::Empty => Some(true),
+            inventory::PlayerInventorySlot::Present(stack) => Some(stack.is_empty()),
+        }
+    }
+
+    /// Applies the committed local mount change from SetActorLink.
+    pub fn apply_local_mount(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        session_id: u64,
+        fifo_sequence: u64,
+        ridden_unique_id: Option<i64>,
+    ) -> Result<(), UiRuntimeError> {
+        self.guard_local_apply(session_id, fifo_sequence)?;
+        self.publish_mount(player_runtime, ridden_unique_id);
+        self.session.last_fifo_sequence = Some(fifo_sequence);
+        Ok(())
+    }
+
+    /// Publishes accepted mount facts and their HUD target together.
+    fn publish_mount(
+        &mut self,
+        player_runtime: &mut player_state::PlayerState,
+        ridden_unique_id: Option<i64>,
+    ) {
+        player_runtime.facts.set_mount(ridden_unique_id);
+        self.session.gameplay_hud.set_mount(ridden_unique_id);
+    }
+
+    fn guard_local_apply(&self, session_id: u64, fifo_sequence: u64) -> Result<(), UiRuntimeError> {
+        if session_id != self.session.session_id {
+            return Err(UiRuntimeError::WrongSession {
+                expected: self.session.session_id,
+                actual: session_id,
+            });
+        }
+        if let Some(previous) = self.session.last_fifo_sequence
+            && fifo_sequence <= previous
+        {
+            return Err(UiRuntimeError::StaleFifoSequence {
+                previous,
+                actual: fifo_sequence,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl UiRuntime {
+    /// Installs the startup-loaded localization catalog used for rawtext
+    /// translation and item display names.
+    pub fn set_lang_catalog(&mut self, catalog: Arc<assets::RuntimeLangCatalog>) {
+        self.lang_catalog = Some(catalog);
+        self.item_name_generation = self.item_name_generation.wrapping_add(1);
+    }
+
+    /// The UI language's table, consulted before en_US.
+    pub fn set_active_language(&mut self, catalog: Option<Arc<assets::RuntimeLangCatalog>>) {
+        self.active_lang = catalog;
+        self.item_name_generation = self.item_name_generation.wrapping_add(1);
+    }
+
+    pub fn set_server_lang(&mut self, overlay: Option<Arc<assets::ServerLangOverlay>>) {
+        self.session.server_lang = overlay;
+        self.item_name_generation = self.item_name_generation.wrapping_add(1);
+    }
+
+    pub fn set_session_icons(&mut self, icons: Option<Arc<super::presentation::SessionIcons>>) {
+        self.session.session_icons = icons;
+    }
+
+    pub fn set_session_glyphs(
+        &mut self,
+        glyphs: Option<Arc<super::presentation::SessionGlyphSheets>>,
+    ) {
+        self.session.session_glyphs = glyphs;
+    }
+
+    pub fn session_glyphs(&self) -> Option<&Arc<super::presentation::SessionGlyphSheets>> {
+        self.session.session_glyphs.as_ref()
+    }
+
+    pub fn session_icons(&self) -> Option<&Arc<super::presentation::SessionIcons>> {
+        self.session.session_icons.as_ref()
+    }
+
+    pub fn set_session_items(
+        &mut self,
+        items: Option<Arc<super::item_facts::SessionItemComponents>>,
+    ) {
+        self.session.session_items = items;
+        self.item_name_generation = self.item_name_generation.wrapping_add(1);
+    }
+
+    /// Identifies all component and language inputs used to resolve item names.
+    pub const fn item_name_generation(&self) -> u64 {
+        self.item_name_generation
+    }
+
+    /// The server's components for `identifier` this session.
+    pub fn item_components(&self, identifier: &str) -> Option<&protocol::ItemComponents> {
+        self.session.session_items.as_ref()?.get(identifier)
+    }
+
+    /// The semantic item-name colour resolved when session components were admitted.
+    pub fn item_name_color(&self, identifier: &str) -> Option<ui::BedrockColor> {
+        self.session.session_items.as_ref()?.name_color(identifier)
+    }
+
+    /// Combines cached enchantments with the current numeric registry's shine fact.
+    pub fn item_glint(
+        &self,
+        stack: &protocol::NetworkItemStack,
+        intrinsic: assets::item::glint::ItemGlint,
+    ) -> bool {
+        super::item_facts::glint_for_facts(self.stack_facts(stack).has_enchantment_list, intrinsic)
+    }
+
+    /// Returns shared immutable NBT facts; descriptor and language generations are resolved separately.
+    pub fn stack_facts(&self, stack: &protocol::NetworkItemStack) -> Arc<protocol::ItemStackFacts> {
+        self.stack_facts.get(&stack.extra_data, true)
+    }
+
+    /// Resolves a cell's bar from cached damage and the latest authority correction.
+    pub fn stack_durability(
+        &self,
+        stack: &protocol::NetworkItemStack,
+        maximum: Option<u32>,
+        correction: Option<i32>,
+    ) -> Option<f32> {
+        let damage = correction
+            .and_then(|damage| u32::try_from(damage).ok())
+            .or_else(|| self.stack_facts(stack).damage)?;
+        super::item_facts::durability_fraction_for_damage(maximum, damage)
+    }
+
+    pub fn set_server_ui(&mut self, pack: Option<Arc<super::presentation::ServerUiPack>>) {
+        self.session.server_ui = pack;
+    }
+
+    pub fn server_ui(&self) -> Option<&Arc<super::presentation::ServerUiPack>> {
+        self.session.server_ui.as_ref()
+    }
+
+    /// Identifies the language tables [`Self::translation`] reads; any
+    /// replacement changes it, so text laid out before is measured again.
+    pub fn text_generation(&self) -> [usize; 3] {
+        fn address<T: ?Sized>(table: Option<&Arc<T>>) -> usize {
+            table.map_or(0, |table| Arc::as_ptr(table).cast::<()>().addr())
+        }
+        [
+            address(self.lang_catalog.as_ref()),
+            address(self.active_lang.as_ref()),
+            address(self.session.server_lang.as_ref()),
+        ]
+    }
+
+    pub(super) fn translation(&self, key: &str) -> Option<Arc<str>> {
+        translate(
+            self.session.server_lang.as_deref(),
+            self.active_lang.as_deref(),
+            self.lang_catalog.as_deref(),
+            key,
+        )
+    }
+
+    /// The language tables [`Self::translation`] reads, detached for another thread.
+    pub fn translator(&self) -> Translator {
+        Translator {
+            server: self.session.server_lang.clone(),
+            active: self.active_lang.clone(),
+            base: self.lang_catalog.clone(),
+        }
+    }
+
+    /// Resolves pinned description identities, then falls back to the identifier's title case.
+    pub fn localized_item_name(&self, identifier: &str) -> String {
+        // A display_name component is a language key, shown literally when untranslated.
+        if let Some(name) = self
+            .item_components(identifier)
+            .and_then(|components| components.display_name.as_deref())
+        {
+            return self
+                .translation(name)
+                .map_or_else(|| name.to_owned(), |text| text.as_ref().to_owned());
+        }
+        if self.session.server_lang.is_some()
+            || self.active_lang.is_some()
+            || self.lang_catalog.is_some()
+        {
+            if let Some(ids) = assets::item::names::serialization_ids(identifier) {
+                for id in ids.into_iter().filter(|id| !id.is_empty()) {
+                    let key = if id.starts_with("item.record_") {
+                        "item.record.name".to_owned()
+                    } else if id == "item.emptymap" {
+                        "item.emptyMap.name".to_owned()
+                    } else if id.ends_with(".name") {
+                        id.to_owned()
+                    } else {
+                        format!("{id}.name")
+                    };
+                    if let Some(value) = self.translation(&key) {
+                        return value.as_ref().to_owned();
+                    }
+                }
+            }
+            let path = identifier.strip_prefix("minecraft:").unwrap_or(identifier);
+            for key in [format!("item.{path}.name"), format!("tile.{path}.name")] {
+                if let Some(value) = self.translation(&key) {
+                    return value.as_ref().to_owned();
+                }
+            }
+        }
+        super::item_facts::mechanical_display_name(identifier)
+    }
+}
+
+/// A snapshot of the language tables translations read.
+#[derive(Clone, Default)]
+pub struct Translator {
+    server: Option<Arc<assets::ServerLangOverlay>>,
+    active: Option<Arc<assets::RuntimeLangCatalog>>,
+    base: Option<Arc<assets::RuntimeLangCatalog>>,
+}
+
+impl Translator {
+    pub fn lookup(&self, key: &str) -> Option<Arc<str>> {
+        translate(
+            self.server.as_deref(),
+            self.active.as_deref(),
+            self.base.as_deref(),
+            key,
+        )
+    }
+}
+
+/// `key` from the server's overlay, else the active language, else the base catalog.
+fn translate(
+    server: Option<&assets::ServerLangOverlay>,
+    active: Option<&assets::RuntimeLangCatalog>,
+    base: Option<&assets::RuntimeLangCatalog>,
+    key: &str,
+) -> Option<Arc<str>> {
+    server
+        .and_then(|overlay| overlay.lookup(key))
+        .map(Arc::from)
+        .or_else(|| active.and_then(|active| active.lookup(key)))
+        .or_else(|| base.and_then(|base| base.lookup(key)))
+}

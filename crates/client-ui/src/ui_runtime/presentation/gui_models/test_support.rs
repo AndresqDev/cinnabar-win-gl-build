@@ -1,0 +1,187 @@
+//! Assertions shared with app-owned installed-carrier integration tests.
+use super::*;
+
+mod cosmetic_particles;
+use crate::test_support::fixture_hud;
+pub use cosmetic_particles::cosmetic_particle_preview;
+#[cfg(test)]
+pub(super) use cosmetic_particles::particle_fixture_assets;
+use ui_engine::test_support::fixture_font;
+
+/// Checks installed geometry admission and diagnostic fallback without owning asset paths.
+pub fn assert_installed_geometry(
+    world: &RuntimeAssets,
+    entities: &RuntimeEntityAssets,
+    icons: Arc<assets::RuntimeIconCatalog>,
+    equipment: Option<Arc<assets::RuntimeEquipmentCatalog>>,
+) {
+    let mut presentation =
+        UiPresentationRuntime::with_hud_and_icons(fixture_font(), fixture_hud(), icons).unwrap();
+    presentation.set_equipment_catalog(equipment);
+    presentation.set_gui_models(world, entities).unwrap();
+    let icons = presentation.icon_catalog.as_deref().unwrap();
+    for identifier in ["minecraft:dirt", "minecraft:grass_block"] {
+        let icon = presentation.item_icon(identifier, 0).unwrap();
+        assert!(
+            presentation
+                .gui_models
+                .sources
+                .models
+                .contains_key(&icon_key(icon))
+        );
+        let model = presentation
+            .gui_models
+            .sources
+            .held
+            .get(identifier)
+            .and_then(|variants| variants.get(&0))
+            .and_then(|held| held.model(icons))
+            .unwrap();
+        assert_eq!(model.vertices.len(), 36);
+        assert!(matches!(
+            model.placements[0],
+            player_preview::PreviewHeldPlacement::Block
+        ));
+    }
+    if presentation.equipment_catalog.is_some() {
+        let shield = presentation
+            .gui_models
+            .sources
+            .held
+            .get("minecraft:shield")
+            .and_then(|variants| variants.get(&0))
+            .and_then(|held| held.model(icons))
+            .unwrap();
+        assert!(matches!(
+            shield.placements[0],
+            player_preview::PreviewHeldPlacement::Authored { .. }
+        ));
+        assert!(shield.vertices.len() > 36);
+        let mesh = player_preview::geometry::mesh(
+            Default::default(),
+            Default::default(),
+            0.0,
+            presentation.item_icon("minecraft:dirt", 0).unwrap(),
+            &Default::default(),
+            [None; 4],
+            [Some(&shield); 2],
+            true,
+        )
+        .unwrap();
+        for batch in mesh.batches().iter().skip(1) {
+            let high = mesh.vertices()
+                [batch.index_range.start as usize..batch.index_range.end as usize]
+                .iter()
+                .map(|vertex| {
+                    (player_preview::PREVIEW_FEET_Y
+                        - vertex.position[1] * player_preview::PREVIEW_HEIGHT as f32)
+                        / player_preview::PREVIEW_PIXELS_PER_BLOCK
+                })
+                .fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                high < 2.3,
+                "factory Shield must remain at the hand, not above head"
+            );
+        }
+    }
+    let modelled = presentation
+        .icon_catalog
+        .as_deref()
+        .is_some_and(|icons| !icons.block_models().is_empty());
+    if modelled {
+        for identifier in [
+            "minecraft:oak_stairs",
+            "minecraft:cobblestone_wall",
+            "minecraft:oak_fence",
+        ] {
+            let icon = presentation.item_icon(identifier, 0).unwrap();
+            let mesh = presentation
+                .gui_models
+                .sources
+                .models
+                .get(&icon_key(icon))
+                .unwrap_or_else(|| panic!("{identifier} draws at the control's size"));
+            assert!(mesh.batches().iter().all(|batch| batch.depth_test));
+        }
+    }
+    assert_installed_blended_thumbnails(&presentation, world, entities, icons);
+    let dynamic = presentation.textures.dynamic_start();
+    assert_eq!(
+        presentation.textures.pages()[dynamic + MODEL_PAGE].dimensions(),
+        [render_model::UI_MODEL_ATLAS_SIDE; 2]
+    );
+    assert!(presentation.textures.plan().bytes() <= render_model::MAX_UI_TEXTURE_BYTES);
+    presentation
+        .set_gui_models(&RuntimeAssets::diagnostic(), entities)
+        .unwrap();
+    let grass = presentation.item_icon("minecraft:grass_block", 0).unwrap();
+    assert!(
+        presentation
+            .gui_models
+            .sources
+            .models
+            .contains_key(&icon_key(grass))
+    );
+}
+
+/// Checks fractional blended faces using the installed carrier's material and alpha data.
+#[expect(
+    clippy::print_stderr,
+    reason = "reports the missing fractional blended sheet fixture without skipping geometry checks"
+)]
+fn assert_installed_blended_thumbnails(
+    presentation: &UiPresentationRuntime,
+    world: &RuntimeAssets,
+    entities: &RuntimeEntityAssets,
+    icons: &assets::RuntimeIconCatalog,
+) {
+    let mut checked = 0;
+    for definition in entities.item_visuals() {
+        let assets::ItemVisualDefinitionRoute::BlockItem { block_visual } = definition.route else {
+            continue;
+        };
+        let Ok(index) = icons
+            .block_sheets()
+            .binary_search_by_key(&block_visual.0, |sheet| sheet.visual.0)
+        else {
+            continue;
+        };
+        let sheet = &icons.sprites()[icons.block_sheets()[index].sprite as usize];
+        let fractional = sheet
+            .rgba8
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] != 0 && pixel[3] != 255);
+        let block = world.resolve(assets::NetworkIdMode::Sequential, block_visual.0);
+        let blended = assets::BlockFace::ALL.into_iter().all(|face| {
+            world
+                .materials()
+                .get(block.face(face).material_id() as usize)
+                .is_some_and(|material| material.flags & assets::MATERIAL_FLAG_ALPHA_BLEND != 0)
+        });
+        if !fractional || !blended {
+            continue;
+        }
+        let Some(icon) =
+            presentation.item_icon(&definition.key.identifier, definition.key.metadata)
+        else {
+            continue;
+        };
+        assert!(
+            !presentation
+                .gui_models
+                .sources
+                .models
+                .contains_key(&icon_key(icon)),
+            "fractional blended faces retain their composited thumbnail: {:?}",
+            definition.key
+        );
+        checked += 1;
+    }
+    if checked == 0 {
+        eprintln!(
+            "skipping installed_carriers_blended_thumbnail_subcase: missing fractional blended carried-sheet fixture (make assets)"
+        );
+    }
+}

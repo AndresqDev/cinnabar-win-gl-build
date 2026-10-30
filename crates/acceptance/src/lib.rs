@@ -1,0 +1,68 @@
+//! Optional evidence and control adapters over committed runtime observations.
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+
+use bevy::prelude::Resource;
+use chunk_pipeline::ViewCohortStatus;
+use client_world::CommittedControlEvent;
+use render_scene::{PresentedFrameAck, TargetRenderExpectation};
+use world::SubChunkKey;
+
+use self::{
+    mutation::{MutationTracker, target_mutation_armed_marker},
+    remesh::FullViewRemeshTracker,
+    teleport::FullViewTeleportTracker,
+    world_ready::{GalleryAnchorEmitter, WorldReadySettler},
+};
+
+mod exit;
+use diagnostics::bounded_file;
+
+pub mod model_witness;
+pub mod movement_evidence;
+pub mod mutation;
+pub mod proofs;
+pub mod publication_evidence;
+pub mod remesh;
+pub mod teleport;
+mod terminal_drain;
+pub mod transparent_witness;
+pub mod world_observation;
+pub mod world_ready;
+
+mod run;
+pub use exit::AcceptanceExitDecision;
+pub use terminal_drain::MovementTerminalDrainDecision;
+
+pub const TRANSPARENT_PRESENTATION_EXIT_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Resource)]
+pub struct AcceptanceRun {
+    pub duration: Option<Duration>,
+    pub deadline: Option<Instant>,
+    pub metrics_out: Option<PathBuf>,
+    pub mutation_surface_anchor: Option<[i32; 2]>,
+    pub source_mutation_coordinate: Option<[i32; 3]>,
+    pub mutation: Option<MutationTracker>,
+    pub mutation_cohort: Option<ViewCohortStatus>,
+    pub gallery_anchor: GalleryAnchorEmitter,
+    pub world_ready_settler: WorldReadySettler,
+    pub full_view_teleport: FullViewTeleportTracker,
+    pub full_view_remesh: FullViewRemeshTracker,
+    pub world_ready: bool,
+    pub require_transparent_presentation: bool,
+    pub shutdown_requested: bool,
+    pub finished: bool,
+}
+
+pub mod audio_wire;
+pub mod committed_control;
+
+mod plugin;
+pub use plugin::AcceptancePlugin;
+
+pub mod finish;
+
+pub mod witness_markers;

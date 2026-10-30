@@ -1,0 +1,432 @@
+use super::{
+    brewing::{BrewingMix, BrewingMixItem},
+    budget::MAX_RECORDS,
+    model::Output,
+    reader::{ReadResult, Reader, Refusal},
+    screen::ScreenRecipeKind,
+};
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Ingredient<'a> {
+    pub(super) name: &'a str,
+    pub(super) tag: bool,
+    pub(super) aux: i32,
+    pub(super) count: i32,
+    pub(super) valid: bool,
+}
+
+pub(super) struct Candidate<'a> {
+    pub(super) width: u8,
+    pub(super) height: u8,
+    pub(super) shapeless: bool,
+    pub(super) mirror: bool,
+    pub(super) priority: i32,
+    pub(super) ingredients: [Ingredient<'a>; super::model::MAX_INGREDIENTS],
+    pub(super) output: Output,
+    pub(super) extra: ExtraOutputs<'a>,
+}
+
+/// The wire results after a recipe's first, kept borrowed until materialization.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ExtraOutputs<'a> {
+    bytes: &'a [u8],
+    count: usize,
+}
+
+impl ExtraOutputs<'_> {
+    pub(super) const fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Re-reads the already validated results.
+    pub(super) fn read(&self) -> ReadResult<Vec<Output>> {
+        let mut reader = Reader::new(self.bytes)?;
+        let mut outputs = Vec::new();
+        outputs
+            .try_reserve_exact(self.count)
+            .map_err(|_| Refusal::Policy)?;
+        for _ in 0..self.count {
+            outputs.push(output(&mut reader)?.ok_or(Refusal::Wire)?);
+        }
+        reader.finish()?;
+        Ok(outputs)
+    }
+}
+
+/// Borrowed identity metadata carried beside the numeric recipe it describes.
+pub(super) struct Identity<'a> {
+    pub(super) name: &'a str,
+    pub(super) tag: &'a str,
+    pub(super) context: i32,
+}
+
+/// One parsed record keeps its identity and supported crafting shape together.
+struct ParsedRecipe<'a> {
+    id: u32,
+    candidate: Option<Candidate<'a>>,
+    identity: Option<Identity<'a>>,
+    screen: Option<ScreenRecord<'a>>,
+    skipped: bool,
+}
+
+/// A screen recipe as read from the wire, borrowing its strings.
+pub(super) struct ScreenRecord<'a> {
+    pub(super) id: u32,
+    pub(super) kind: ScreenRecipeKind,
+    pub(super) ingredients: [Ingredient<'a>; 3],
+    pub(super) len: usize,
+    pub(super) output: Option<Output>,
+}
+
+/// Something the screens need beyond crafting-table recipes.
+pub(super) enum ScreenItem<'a> {
+    Recipe(ScreenRecord<'a>),
+    Multi {
+        uuid: [u8; 16],
+        id: u32,
+    },
+    /// A station recipe outside the supported input shape.
+    Skipped,
+    Brewing(super::screen::BrewingRecipe),
+}
+
+pub(super) fn identifier(value: &str) -> bool {
+    let Some((namespace, path)) = value.split_once(':') else {
+        return false;
+    };
+    !namespace.is_empty()
+        && !namespace.contains('/')
+        && !path.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'-' | b'.' | b'/' | b':')
+        })
+        && !path.contains(':')
+}
+
+fn ingredient<'a>(reader: &mut Reader<'a>) -> ReadResult<Ingredient<'a>> {
+    let pairs = reader.count(8)?;
+    let mut name = "";
+    let mut tag = false;
+    let mut valid = pairs == 1;
+    for _ in 0..pairs {
+        let key = reader.string()?;
+        let value = reader.string()?;
+        // `item_tag` descriptors name a tag rather than an item.
+        match key {
+            "name" | "item_tag" if identifier(value) => {
+                name = value;
+                tag = key == "item_tag";
+            }
+            _ => valid = false,
+        }
+    }
+    let aux = reader.int()?;
+    let count = reader.int()?;
+    valid &= (0..=u16::MAX as i32).contains(&aux) && (1..=255).contains(&count);
+    if pairs == 0 && count == 0 {
+        valid = true;
+    }
+    Ok(Ingredient {
+        name,
+        tag,
+        aux,
+        count,
+        valid,
+    })
+}
+
+fn output(reader: &mut Reader<'_>) -> ReadResult<Option<Output>> {
+    let id = reader.int()?;
+    let bytes = reader.take(2)?;
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let aux = reader.uint()?;
+    let block = reader.int()?;
+    let extra = reader.opaque()?;
+    let user_data = super::crafting::RecipeOutputData::decode(extra);
+    // Block items carry negative network ids; only 0 (air) makes nothing.
+    Ok(user_data
+        .filter(|_| id != 0 && (1..=255).contains(&count) && aux <= u16::MAX as u32)
+        .map(|user_data| Output {
+            id,
+            aux: aux as u16,
+            count: count as u8,
+            // The recipe descriptor transports block identity as signed
+            // ZigZag32; inventory item descriptors retain its raw u32 bits.
+            // Hashed block identities may have bit 31 set.
+            block: u32::from_ne_bytes(block.to_ne_bytes()),
+            user_data,
+        }))
+}
+
+/// Reads discovery context without using it as a recipe admission gate.
+fn unlock(reader: &mut Reader<'_>) -> ReadResult<i32> {
+    if reader.byte()? == 0 {
+        return Ok(0);
+    }
+    // Discovery requirements belong to the recipe book/unlocked-recipe state,
+    // not recipe admission. Native manual crafting checks unlock authority only
+    // under the limited-crafting rules. Retain the recipe and traverse these
+    // optional fields with the same bounds, without declaring it unlocked.
+    let context = reader.int()?;
+    if reader.byte()? != 0 {
+        let count = reader.count(64)?;
+        for _ in 0..count {
+            ingredient(reader)?;
+        }
+    }
+    Ok(context)
+}
+
+/// Traverses a named recipe and reports its identity independently of craft support.
+fn normal<'a>(
+    reader: &mut Reader<'a>,
+    shaped: bool,
+    eligible: bool,
+) -> ReadResult<ParsedRecipe<'a>> {
+    let name = reader.text()?;
+    let (width, height) = if shaped {
+        (reader.int()?, reader.int()?)
+    } else {
+        (0, 0)
+    };
+    let count = reader.count(64)?;
+    let mut ingredients = [Ingredient::default(); super::model::MAX_INGREDIENTS];
+    let mut valid = eligible
+        && if shaped {
+            (1..=3).contains(&width)
+                && (1..=3).contains(&height)
+                && count == (width * height) as usize
+        } else {
+            (1..=super::model::MAX_INGREDIENTS).contains(&count)
+        };
+    for target in ingredients
+        .iter_mut()
+        .map(Some)
+        .chain(std::iter::repeat_with(|| None))
+        .take(count)
+    {
+        let item = ingredient(reader)?;
+        // Shapeless recipes have no empty cells to describe.
+        valid &= item.valid && (shaped || item.count > 0);
+        if let Some(target) = target {
+            *target = item;
+        }
+    }
+    valid &= ingredients.iter().any(|i| i.count > 0);
+    let results = reader.count(64)?;
+    valid &= results >= 1;
+    let mut result = None;
+    let mut extra_start = reader.position();
+    for index in 0..results {
+        if index == 1 {
+            extra_start = reader.position();
+        }
+        let current = output(reader)?;
+        // Every result must be craftable for the recipe to be.
+        valid &= current.is_some();
+        if index == 0 {
+            result = current;
+        }
+    }
+    let extra = if results > 1 {
+        ExtraOutputs {
+            bytes: reader.since(extra_start),
+            count: results - 1,
+        }
+    } else {
+        ExtraOutputs::default()
+    };
+    // Station screens take exactly one result.
+    let single = if results == 1 { result } else { None };
+    reader.take(16)?;
+    let tag = reader.text()?;
+    let block = tag.unwrap_or("");
+    let priority = reader.int()?;
+    let mirror = shaped && reader.byte()? != 0;
+    let context = unlock(reader)?;
+    let id = reader.uint()?;
+    // Keep unsupported ingredients, output data and large shapes addressable by name.
+    // Missing network IDs/results and inconsistent shapes never enter this identity view.
+    let identity = if id != 0
+        && results > 0
+        && (!shaped
+            || (width >= 0 && height >= 0 && width.checked_mul(height) == Some(count as i32)))
+    {
+        name.zip(tag)
+            .map(|(name, tag)| Identity { name, tag, context })
+    } else {
+        None
+    };
+    valid &= id != 0;
+    let screen_kind = match block {
+        "stonecutter" => Some(ScreenRecipeKind::Stonecutter),
+        "cartography_table" => Some(ScreenRecipeKind::Cartography),
+        "furnace" => Some(ScreenRecipeKind::Furnace),
+        "blast_furnace" => Some(ScreenRecipeKind::BlastFurnace),
+        "smoker" => Some(ScreenRecipeKind::Smoker),
+        _ => None,
+    };
+    // Current station consumers support one item per required slot only.
+    let supported = screen_kind.is_some_and(|kind| {
+        let expected = if kind == ScreenRecipeKind::Cartography {
+            2
+        } else {
+            1
+        };
+        count == expected && ingredients.iter().take(count).all(|item| item.count == 1)
+    });
+    let skipped = screen_kind.is_some() && !(valid && !shaped && supported && single.is_some());
+    let screen = screen_kind
+        .filter(|_| valid && !shaped && supported)
+        .zip(single)
+        .map(|(kind, output)| {
+            let mut kept = [Ingredient::default(); 3];
+            kept[..count].copy_from_slice(&ingredients[..count]);
+            ScreenRecord {
+                id,
+                kind,
+                ingredients: kept,
+                len: count,
+                output: Some(output),
+            }
+        });
+    valid &= block == "crafting_table";
+    Ok(ParsedRecipe {
+        id,
+        candidate: if valid {
+            result.map(|output| Candidate {
+                width: width as u8,
+                height: height as u8,
+                shapeless: !shaped,
+                mirror,
+                priority,
+                ingredients,
+                output,
+                extra,
+            })
+        } else {
+            None
+        },
+        identity,
+        screen,
+        skipped,
+    })
+}
+
+/// Traverses all eleven vectors, including unavailable families, without
+/// generated owned/borrowed materialization. Returning Policy stops immediately;
+/// it does not attest to the unseen tail's wire validity.
+pub(super) fn walk<'a>(
+    reader: &mut Reader<'a>,
+    mut record: impl FnMut(u32, Option<Candidate<'a>>, Option<Identity<'a>>) -> ReadResult<()>,
+    mut screen: impl FnMut(ScreenItem<'a>) -> ReadResult<()>,
+    mut brewing: impl FnMut(BrewingMix) -> ReadResult<()>,
+) -> ReadResult<(bool, usize)> {
+    let mut total = 0usize;
+    for family in 0..11 {
+        let count = reader.count(MAX_RECORDS)?;
+        total = total.checked_add(count).ok_or(Refusal::Policy)?;
+        if total > MAX_RECORDS {
+            return Err(Refusal::Policy);
+        }
+        for _ in 0..count {
+            match family {
+                0 | 1 | 3 | 4 | 5 => {
+                    let parsed = normal(reader, matches!(family, 0 | 5), matches!(family, 0 | 1))?;
+                    if parsed.skipped {
+                        screen(ScreenItem::Skipped)?;
+                    }
+                    if let Some(recipe) = parsed.screen {
+                        screen(ScreenItem::Recipe(recipe))?;
+                    }
+                    record(parsed.id, parsed.candidate, parsed.identity)?;
+                }
+                2 => {
+                    let uuid: [u8; 16] = reader.take(16)?.try_into().map_err(|_| Refusal::Wire)?;
+                    let id = reader.uint()?;
+                    screen(ScreenItem::Multi { uuid, id })?;
+                    record(id, None, None)?;
+                }
+                6 | 7 => {
+                    let name = reader.text()?;
+                    let mut ingredients = [Ingredient::default(); 3];
+                    for slot in &mut ingredients {
+                        *slot = ingredient(reader)?;
+                    }
+                    let result = if family == 6 { output(reader)? } else { None };
+                    let tag = reader.text()?;
+                    let id = reader.uint()?;
+                    let identity =
+                        (id != 0)
+                            .then_some(name.zip(tag))
+                            .flatten()
+                            .map(|(name, tag)| Identity {
+                                name,
+                                tag,
+                                context: 0,
+                            });
+                    let sound = ingredients.iter().all(|item| item.valid && item.count == 1)
+                        && id != 0
+                        && (family == 7 || result.is_some());
+                    if sound {
+                        screen(ScreenItem::Recipe(ScreenRecord {
+                            id,
+                            kind: if family == 6 {
+                                ScreenRecipeKind::SmithingTransform
+                            } else {
+                                ScreenRecipeKind::SmithingTrim
+                            },
+                            ingredients,
+                            len: 3,
+                            output: result,
+                        }))?;
+                    }
+                    if !sound {
+                        screen(ScreenItem::Skipped)?;
+                    }
+                    record(id, None, identity)?;
+                }
+                8 => {
+                    let mix = BrewingMix::Potion {
+                        input: BrewingMixItem {
+                            network_id: reader.int()?,
+                            aux: reader.int()?,
+                        },
+                        reagent: BrewingMixItem {
+                            network_id: reader.int()?,
+                            aux: reader.int()?,
+                        },
+                        output: BrewingMixItem {
+                            network_id: reader.int()?,
+                            aux: reader.int()?,
+                        },
+                    };
+                    screen(ScreenItem::Brewing(mix.screen_recipe()))?;
+                    brewing(mix)?;
+                }
+                9 => {
+                    let mix = BrewingMix::Container {
+                        input: reader.int()?,
+                        reagent: reader.int()?,
+                        output: reader.int()?,
+                    };
+                    screen(ScreenItem::Brewing(mix.screen_recipe()))?;
+                    brewing(mix)?;
+                }
+                10 => {
+                    reader.int()?;
+                    for _ in 0..reader.count(64)? {
+                        reader.int()?;
+                        reader.int()?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    let clear = reader.byte()? != 0;
+    reader.finish()?;
+    Ok((clear, total))
+}

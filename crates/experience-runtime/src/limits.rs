@@ -1,0 +1,179 @@
+//! Every resource limit of the Experience runtime. This file is the only source of truth.
+
+use std::time::Duration;
+
+use crate::protocol::INVENTORY_SLOTS;
+
+/// Fixed server simulation step, checked against the adapter clock fixture.
+pub const SIMULATION_STEP_NANOS: u64 = 50_000_000;
+
+/// Fuel granted to one callback.
+pub const CALLBACK_FUEL: u64 = 10_000_000;
+/// Fuel granted to `register`.
+pub const REGISTER_FUEL: u64 = 100_000_000;
+/// Epoch tick period, the wall-clock backstop for fuel.
+pub const EPOCH_PERIOD: Duration = Duration::from_millis(1);
+/// Wall-clock deadline for one callback.
+pub const CALLBACK_DEADLINE: Duration = Duration::from_millis(250);
+/// Wall-clock deadline for `register`.
+pub const REGISTER_DEADLINE: Duration = Duration::from_secs(2);
+/// Linear memory per instance.
+pub const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+/// Linear memories per instance.
+pub const MAX_MEMORIES: usize = 1;
+/// Table elements per instance.
+pub const MAX_TABLE_ELEMENTS: usize = 10_000;
+/// Core instances per component instance.
+pub const MAX_CORE_INSTANCES: usize = 16;
+/// Wasm stack.
+pub const MAX_WASM_STACK_BYTES: usize = 256 * 1024;
+/// Size of `server.wasm`.
+pub const MAX_COMPONENT_BYTES: usize = 16 * 1024 * 1024;
+/// Size of `experience.toml`, which the runtime reads once per load. Besides the identity it holds
+/// the `[client]` table, whose declarations the client part bounds; cinnabar-cxb's
+/// `both_halves_read_an_experience_declaring_every_action` checks that the client's every action
+/// at the longest identifier fits.
+pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+/// Size of `files.toml`, the artifact's index, which the runtime reads once per load: room for
+/// [`MAX_ARTIFACT_ENTRIES`] entries of 512 bytes, a 64-digit hash and a path of over 400 bytes
+/// each.
+pub const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
+/// Files and directories in an artifact, the manifest and the index included; the load walks no
+/// further. A block uses a geometry and some textures and an item an icon, so this leaves room
+/// for several files per block and item at [`MAX_BLOCKS`] and [`MAX_ITEMS`].
+pub const MAX_ARTIFACT_ENTRIES: usize = 8192;
+/// Bytes in an Experience's version; at least one is required, and none may be a control
+/// character.
+pub const MAX_VERSION_BYTES: usize = 64;
+/// Blocks one Experience may register. Registration costs the server little per block: 256
+/// blocks and 512 items register in under 0.4 s, and the palette and resource pack the server
+/// then builds take 1.3 s and 146 KiB of 16×16 textures. Every state of each block is a palette
+/// entry, so a block's states (`MAX_STATE_BITS`) weigh more than the count of blocks.
+pub const MAX_BLOCKS: usize = 256;
+/// Entity types, seats, properties and live instances are extension policy, not game limits.
+pub const MAX_ENTITY_TYPES: usize = 64;
+pub const MAX_ENTITY_SEATS: usize = 16;
+pub const MAX_ENTITY_PROPERTIES: usize = 32;
+pub const MAX_ENTITIES: usize = 256;
+/// Bytes in a block's name, the part of its id after `<experience id>:`; at least one is
+/// required.
+pub const MAX_BLOCK_NAME_BYTES: usize = 32;
+/// Bytes in a block's display name; at least one is required.
+pub const MAX_DISPLAY_NAME_BYTES: usize = 64;
+/// Bytes in a state's name after `<experience id>:`, a string state value, a material instance
+/// and a geometry's name after `geometry.<experience id>.`; at least one is required.
+pub const MAX_NAME_BYTES: usize = 64;
+/// Values one string state may take (`Values.json`: 1 to 16).
+pub const MAX_STATE_VALUES: usize = 16;
+/// State bits one block's states and placement traits take, each `ceil(log2(values))` bits and at
+/// least one, as the client packs them. It equals the client's `STATE_BITS` in
+/// `crates/protocol/src/world/custom_blocks/states.rs`, which a test checks.
+pub const MAX_STATE_BITS: u32 = 16;
+/// Bones whose visibility one visual or permutation sets (`Detailed Geometry.json`).
+pub const MAX_BONES: usize = 64;
+/// Permutations one block declares.
+pub const MAX_PERMUTATIONS: usize = 64;
+/// Materials one visual or permutation lists.
+pub const MAX_MATERIALS: usize = 32;
+/// State tests in one condition, summed over its clauses.
+pub const MAX_CONDITION_TESTS: usize = 64;
+/// Frames one flipbook lists.
+pub const MAX_FLIPBOOK_FRAMES: usize = 256;
+/// Size of one geometry file.
+pub const MAX_GEOMETRY_BYTES: usize = 1024 * 1024;
+/// Host calls per callback; logs are counted separately. A callback on a network reads every
+/// member, its id and then its states or data, and writes some of them, so the cap leaves room
+/// for that at the network bounds.
+pub const MAX_HOST_CALLS: usize = 4096;
+/// Staged ops per callback. Rewriting a block's data replaces its staged op instead of adding
+/// one.
+pub const MAX_STAGED_OPS: usize = 64;
+/// Bytes of block data one callback may stage, summed over its staged ops.
+pub const MAX_STAGED_DATA_BYTES: usize = 262_144;
+/// Tells per callback.
+pub const MAX_TELLS: usize = 4;
+/// UTF-8 bytes per tell.
+pub const MAX_TELL_BYTES: usize = 256;
+/// Client messages one callback may stage with `send-client`.
+pub const MAX_CLIENT_SENDS: usize = 8;
+/// Bytes of the client messages one callback may stage: their channels and their payloads as
+/// JSON, summed. The adapter applies the client channel's own limits as it sends each one; this
+/// leaves room for one message of the largest size that the client wire protocol carries, which
+/// the Go adapter's tests check against the wire's constants.
+pub const MAX_CLIENT_SEND_BYTES: usize = 65_536;
+/// Lists and records nest at most this deep in a client message's payload, a top-level one being
+/// level 1: the client wire protocol's `MAX_FIELD_DEPTH`, which the Go adapter's tests check.
+pub const MAX_VALUE_DEPTH: usize = 4;
+/// Bytes of data per block.
+pub const MAX_BLOCK_DATA_BYTES: usize = 65_536;
+/// UTF-8 bytes of a reason that reaches the adapter, a guest's error or why a load failed; the
+/// rest is cut off at a char boundary.
+pub const MAX_REASON_BYTES: usize = 512;
+/// Logs per callback or `register`.
+pub const MAX_LOGS: usize = 32;
+/// Bytes per log line.
+pub const MAX_LOG_BYTES: usize = 512;
+/// Items one Experience may register; see [`MAX_BLOCKS`] for their cost.
+pub const MAX_ITEMS: usize = 512;
+/// Overlay types one Experience may declare. Each registers with the server as a hidden block
+/// whose every state is a palette entry, so its states weigh as a block's do (see
+/// [`MAX_BLOCKS`]); they do not count against [`MAX_BLOCKS`]. AE2's per-side cable arms take 102
+/// types, and its other parts need room beside them.
+pub const MAX_OVERLAY_TYPES: usize = 256;
+/// Bytes of an Experience's own data on one item stack.
+pub const MAX_ITEM_DATA_BYTES: usize = 8192;
+/// Items the adapter may list as the server's when it loads an Experience.
+pub const MAX_SERVER_ITEMS: usize = 16_384;
+/// Crafting recipes the adapter may send when it loads an Experience.
+pub const MAX_RECIPES: usize = 8192;
+/// Items one recipe input may accept: an item tag's members.
+pub const MAX_RECIPE_INPUT_ITEMS: usize = 512;
+/// The most game ticks ahead `schedule-update` may schedule: an hour.
+pub const MAX_SCHEDULE_TICKS: u32 = 72_000;
+/// Updates one callback may schedule.
+pub const MAX_SCHEDULED_UPDATES: usize = 64;
+/// Members one callback's network holds; the adapter's flood stops there and marks the network
+/// truncated.
+pub const MAX_NETWORK_BLOCKS: usize = 1024;
+/// Bytes of block data one callback's network holds, summed over its members; the adapter's
+/// flood stops before a member that would pass it and marks the network truncated.
+pub const MAX_NETWORK_DATA_BYTES: usize = 524_288;
+/// Positions one callback's containers hold: the anchor's and its network's container blocks and
+/// unloaded neighbours, in the adapter's order; it stops there and marks them truncated.
+pub const MAX_CONTAINERS: usize = 64;
+/// Slots of the largest container, a double chest.
+pub const MAX_CONTAINER_SLOTS: usize = 54;
+/// Bytes of item data one callback's containers hold, summed over their stacks; the adapter
+/// stops before a container that would pass it and marks them truncated.
+pub const MAX_CONTAINER_DATA_BYTES: usize = 1024 * 1024;
+/// Encoded JSON bytes per IPC frame, excluding the 4-byte length prefix. The frame crosses a
+/// local pipe between the adapter and the runtime. A callback request carries a network and an
+/// inventory: at the network bounds a request measured 2.37 MB, and an inventory whose every
+/// slot holds MAX_ITEM_DATA_BYTES adds about 0.6 MB, 2.98 MB in all, which the Go adapter's
+/// TestNetworkAtItsBoundsFitsAFrame pins; truncating real AE2 networks at a smaller frame would
+/// be worse. The `loaded` answer carries every block, item and overlay definition: AE2's 13
+/// blocks answered 569 KB, 44 KB a block and 152 KB for its largest, and `MAX_BLOCKS` blocks and
+/// `MAX_OVERLAY_TYPES` overlay types shaped like its 38 KB cable, with `MAX_ITEMS` items, answer
+/// 18.7 MB, which a test pins.
+pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
+
+// Hex doubles staged data, which may fill at most half of a result frame; the other half is
+// room for the remaining ops, client messages included.
+const _: () = assert!(2 * MAX_STAGED_DATA_BYTES <= MAX_FRAME_BYTES / 2);
+const _: () = assert!(MAX_CLIENT_SEND_BYTES <= MAX_FRAME_BYTES / 8);
+// Hex doubles the network's data, which may fill at most half of a request frame; the other half
+// is room for its cells, which the Go adapter's tests check at the bounds, and the rest.
+const _: () = assert!(2 * MAX_NETWORK_DATA_BYTES <= MAX_FRAME_BYTES / 2);
+// Hex doubles item data: a result's staged item data, one stack per op, fits beside its staged
+// block data in half a result frame, and an inventory's in an eighth of a request frame.
+const _: () = assert!(
+    2 * (MAX_STAGED_DATA_BYTES + MAX_STAGED_OPS * MAX_ITEM_DATA_BYTES) <= MAX_FRAME_BYTES / 2
+);
+const _: () = assert!(2 * INVENTORY_SLOTS * MAX_ITEM_DATA_BYTES <= MAX_FRAME_BYTES / 4);
+// Hex doubles the containers' item data, which with their stacks fills at most a quarter of a
+// request frame; the Go adapter keeps that quarter from the network and checks it at the bounds.
+const _: () = assert!(2 * MAX_CONTAINER_DATA_BYTES <= MAX_FRAME_BYTES / 8);
+// A network-wide read: each member's id and its states or data, then the staged writes.
+const _: () = assert!(2 * MAX_NETWORK_BLOCKS + MAX_STAGED_OPS <= MAX_HOST_CALLS);
+// An index of MAX_ARTIFACT_ENTRIES entries of 512 bytes fits its file.
+const _: () = assert!(MAX_ARTIFACT_ENTRIES * 512 <= MAX_INDEX_BYTES);

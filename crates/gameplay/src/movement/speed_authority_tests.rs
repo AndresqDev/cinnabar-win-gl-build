@@ -1,0 +1,418 @@
+use super::{LocalMovementSpeedAuthority, preserve_effective_speed};
+use crate::test_support::movement_speed_attribute as attribute;
+
+/// Starts one authority with an admitted server attribute update.
+fn started(current: f32) -> LocalMovementSpeedAuthority {
+    let mut authority = LocalMovementSpeedAuthority::default();
+    authority.begin_session(7, 0);
+    assert!(authority.apply(7, 1, 0, attribute(f64::from(current), current, None)));
+    authority
+}
+
+/// Reporting invalidation follows arrival order and ends at a supported update or reset.
+#[test]
+fn unsupported_reporting_respects_scope_and_lifetimes() {
+    let mut authority = started(0.1);
+    for (session, sequence, dimension) in [(8, 2, 0), (7, 2, 1), (7, 1, 0)] {
+        authority.invalidate_reported(session, sequence, dimension);
+        assert_eq!(authority.reported_current(), authority.current());
+    }
+    authority.invalidate_reported(7, 2, 0);
+    assert_eq!(authority.reported_current(), None);
+    assert!(!authority.apply(7, 2, 0, attribute(0.2, 0.2, None)));
+    assert_eq!(authority.reported_current(), None);
+    authority.set_sprinting(true);
+    authority.apply_effect(
+        7,
+        3,
+        protocol::ActorEffectEvent {
+            dimension: 0,
+            actor_runtime_id: 7,
+            action: protocol::ActorEffectAction::Add,
+            effect_id: protocol_ids::Effect::Speed.wire_value(),
+            amplifier: 0,
+            particles: false,
+            ambient: false,
+            duration_ticks: 600,
+            tick: 0,
+        },
+    );
+    assert_eq!(authority.reported_current(), None);
+    assert!(authority.apply(7, 4, 0, attribute(f64::from(0.2_f32), 0.2, None)));
+    assert_eq!(authority.reported_current(), Some(f64::from(0.2_f32)));
+    authority.invalidate_reported(7, 5, 0);
+    authority.replace_dimension(7, 1);
+    assert!(authority.apply(7, 1, 1, attribute(f64::from(0.3_f32), 0.3, None)));
+    assert_eq!(authority.reported_current(), Some(f64::from(0.3_f32)));
+    authority.invalidate_reported(7, 2, 1);
+    authority.begin_session(8, 0);
+    assert!(authority.apply(8, 1, 0, attribute(f64::from(0.4_f32), 0.4, None)));
+    assert_eq!(authority.reported_current(), Some(f64::from(0.4_f32)));
+}
+
+#[test]
+fn server_effective_sprint_without_modifiers_is_never_boosted_twice() {
+    let mut authority = started(0.1);
+    authority.set_sprinting(true);
+    assert!(authority.apply(7, 2, 0, attribute(f64::from(0.13_f32), 0.1, None)));
+    authority.adopt_server_sprinting(Some(true));
+    for _ in 0..20 {
+        authority.set_sprinting(true);
+    }
+    assert_eq!(authority.current(), Some(f64::from(0.13_f32)));
+    assert_eq!(
+        authority.prediction_speed(),
+        Some(f64::from(0.13_f32 / sim::SPRINT_SPEED_MULTIPLIER as f32))
+    );
+
+    // The packet removed the local modifier: native sprint stop cannot remove it again.
+    authority.set_sprinting(false);
+    assert_eq!(authority.current(), Some(f64::from(0.13_f32)));
+    assert!(authority.apply(7, 3, 0, attribute(f64::from(0.1_f32), 0.1, None)));
+    assert_eq!(authority.prediction_speed(), Some(f64::from(0.1_f32)));
+}
+
+/// Restarting sprint after an effective-speed resend must not stack another boost.
+#[test]
+fn sprint_restart_after_attribute_resend_does_not_compound_speed() {
+    let mut authority = started(0.1);
+    authority.set_sprinting(true);
+    assert!(authority.apply(7, 2, 0, attribute(f64::from(0.13_f32), 0.1, None)));
+    authority.set_sprinting(false);
+    assert_eq!(authority.current(), Some(f64::from(0.13_f32)));
+    authority.set_sprinting(true);
+    assert_eq!(
+        authority.current(),
+        Some(f64::from(0.1_f32 * sim::SPRINT_SPEED_MULTIPLIER as f32))
+    );
+}
+
+#[test]
+fn local_edges_preserve_custom_speed_and_remove_only_installed_modifier() {
+    let mut authority = started(0.12);
+    let base = authority.current().unwrap() as f32;
+    authority.set_sprinting(true);
+    let boosted = base * sim::SPRINT_SPEED_MULTIPLIER as f32;
+    assert_eq!(authority.current(), Some(f64::from(boosted)));
+    authority.set_sprinting(true);
+    assert_eq!(authority.current(), Some(f64::from(boosted)));
+    authority.set_sprinting(false);
+    assert_eq!(
+        authority.current(),
+        Some(f64::from(boosted / sim::SPRINT_SPEED_MULTIPLIER as f32))
+    );
+
+    authority.adopt_server_sprinting(Some(true));
+    assert!(authority.apply(7, 2, 0, attribute(f64::from(0.18_f32), 0.12, Some(1.5))));
+    authority.set_sprinting(false);
+    assert_eq!(authority.current(), Some(f64::from(0.12_f32)));
+}
+
+#[test]
+fn metadata_adopts_sprint_without_modifying_attribute() {
+    let mut authority = started(0.12);
+    authority.adopt_server_sprinting(Some(true));
+    authority.set_sprinting(true);
+    assert_eq!(authority.current(), Some(f64::from(0.12_f32)));
+    authority.adopt_server_sprinting(Some(false));
+    authority.set_sprinting(false);
+    assert_eq!(authority.current(), Some(f64::from(0.12_f32)));
+}
+
+#[test]
+fn authority_obeys_session_fifo_dimension_and_replacement_ordering() {
+    let mut authority = started(0.25);
+    assert!(!authority.apply(6, 3, 0, attribute(0.5, 0.5, None)));
+    assert!(!authority.apply(7, 1, 0, attribute(0.5, 0.5, None)));
+    assert!(!authority.apply(7, 3, 1, attribute(0.5, 0.5, None)));
+    assert_eq!(authority.current(), Some(0.25));
+    authority.set_sprinting(true);
+    authority.replace_dimension(7, 1);
+    assert_eq!(authority.current(), None);
+    assert!(!authority.apply(7, 1, 0, attribute(0.75, 0.75, None)));
+    assert!(authority.apply(7, 1, 1, attribute(0.0, 0.0, None)));
+    authority.set_sprinting(false);
+    assert_eq!(authority.current(), Some(0.0));
+    authority.begin_session(8, -1);
+    assert_eq!(authority.current(), None);
+    assert!(!authority.apply(7, 2, -1, attribute(1.0, 1.0, None)));
+    assert!(authority.apply(8, 1, -1, attribute(0.1, 0.1, None)));
+}
+
+#[test]
+fn invalid_updates_are_consumed_without_overwriting_last_valid_authority() {
+    let mut authority = started(0.2);
+    for (sequence, value) in [(2, f64::NAN), (3, f64::INFINITY), (4, -0.1), (5, 1.0e6)] {
+        assert!(!authority.apply(7, sequence, 0, attribute(value, 0.1, None)));
+        assert_eq!(authority.current(), Some(f64::from(0.2_f32)));
+    }
+    assert!(!authority.apply(7, 5, 0, attribute(0.9, 0.9, None)));
+    for (sequence, factor) in [
+        (6, 0.0),
+        (7, f32::NAN),
+        (8, f32::INFINITY),
+        (9, 1.0 + (-0.999_999_94_f32)),
+    ] {
+        let mut invalid = attribute(0.3, 0.1, None);
+        invalid.sprint_modifier = Some(factor);
+        assert!(!authority.apply(7, sequence, 0, invalid));
+        assert_eq!(authority.current(), Some(f64::from(0.2_f32)));
+    }
+}
+
+#[test]
+fn processed_sprint_rewrites_keep_the_effective_attribute() {
+    let mut input = sim::MovementInput {
+        sprinting: true,
+        movement_speed: Some(f64::from(0.13_f32 / sim::SPRINT_SPEED_MULTIPLIER as f32)),
+        ..sim::MovementInput::default()
+    };
+    input.sprinting = false;
+    preserve_effective_speed(&mut input, true);
+    assert_eq!(input.movement_speed, Some(f64::from(0.13_f32)));
+    input.sprinting = true;
+    preserve_effective_speed(&mut input, false);
+    assert_eq!(
+        input.movement_speed,
+        Some(f64::from(0.13_f32 / sim::SPRINT_SPEED_MULTIPLIER as f32))
+    );
+}
+
+/// Server effect replacement keeps sprint held and obeys the same FIFO as attributes.
+#[test]
+fn speed_effect_replacement_resends_and_ordering_preserve_one_sprint_factor() {
+    use protocol::{
+        ActorEffectAction::{Add, Remove, Update},
+        ActorEffectEvent,
+    };
+    let mut authority = started(0.1);
+    authority.set_sprinting(true);
+    let mut event = ActorEffectEvent {
+        dimension: 0,
+        actor_runtime_id: 42,
+        action: Add,
+        effect_id: protocol_ids::Effect::Speed.wire_value(),
+        amplifier: 2,
+        particles: false,
+        ambient: false,
+        duration_ticks: 600,
+        tick: 100,
+    };
+    authority.apply_effect(7, 2, event);
+    let speed_iii = authority.current();
+    assert!((speed_iii.unwrap() - 0.208).abs() < 1e-7);
+    for (session, sequence, dimension) in [(6, 3, 0), (7, 2, 0), (7, 3, 1)] {
+        event.dimension = dimension;
+        event.amplifier = 1;
+        authority.apply_effect(session, sequence, event);
+        assert_eq!(authority.current(), speed_iii);
+    }
+    event.dimension = 0;
+    event.action = Remove;
+    authority.apply_effect(7, 3, event);
+    event.action = Add;
+    authority.apply_effect(7, 4, event);
+    authority.set_sprinting(true);
+    let speed_ii = authority.current();
+    assert!((speed_ii.unwrap() - 0.182).abs() < 1e-7);
+    assert!(!authority.apply(7, 3, 0, attribute(0.13, 0.1, None)));
+
+    event.action = Update;
+    event.amplifier = i32::MAX;
+    authority.apply_effect(7, 5, event);
+    assert_eq!(authority.current(), speed_ii);
+    // A later attribute packet replaces all effect and sprint modifiers.
+    assert!(authority.apply(7, 6, 0, attribute(f64::from(0.17_f32), 0.1, None)));
+    authority.set_sprinting(true);
+    assert_eq!(authority.current(), Some(f64::from(0.17_f32)));
+    authority.set_sprinting(false);
+    authority.set_sprinting(true);
+    assert!((authority.current().unwrap() - 0.13).abs() < 1e-7);
+}
+
+#[test]
+fn speed_effect_before_the_first_attribute_uses_the_default_and_local_sprint() {
+    let mut authority = LocalMovementSpeedAuthority::default();
+    authority.begin_session(7, 0);
+    authority.set_sprinting(true);
+    authority.apply_effect(
+        7,
+        1,
+        protocol::ActorEffectEvent {
+            dimension: 0,
+            actor_runtime_id: 42,
+            action: protocol::ActorEffectAction::Add,
+            effect_id: protocol_ids::Effect::Speed.wire_value(),
+            amplifier: 2,
+            particles: false,
+            ambient: false,
+            duration_ticks: 600,
+            tick: 100,
+        },
+    );
+    assert!((authority.current().unwrap() - 0.208).abs() < 1e-7);
+    authority.replace_dimension(7, 1);
+    assert_eq!(authority.current(), None);
+}
+
+/// Effect admission checks the actual sprint factor and retains the last safe state.
+#[test]
+fn speed_effect_rejects_an_unsafe_current_with_a_custom_sprint_factor() {
+    let mut authority = LocalMovementSpeedAuthority::default();
+    authority.begin_session(7, 0);
+    let default = super::MAX_SIMULABLE_MOVEMENT_SPEED as f32 / 4.0;
+    let current = f64::from(default * 3.0);
+    let received = attribute(current, default, Some(3.0));
+    assert!(authority.apply(7, 1, 0, received));
+    authority.adopt_server_sprinting(Some(true));
+    let mut event = protocol::ActorEffectEvent {
+        dimension: 0,
+        actor_runtime_id: 42,
+        action: protocol::ActorEffectAction::Add,
+        effect_id: protocol_ids::Effect::Speed.wire_value(),
+        amplifier: 4,
+        particles: false,
+        ambient: false,
+        duration_ticks: 600,
+        tick: 100,
+    };
+    authority.apply_effect(7, 2, event);
+    assert_eq!(authority.current(), Some(current));
+    assert_eq!(authority.active_speed_effect, None);
+    assert!(!authority.apply(7, 2, 0, received));
+
+    event.amplifier = 0;
+    authority.apply_effect(7, 3, event);
+    assert_eq!(authority.current(), Some(f64::from(default * 1.2 * 3.0)));
+}
+
+/// Liquid speeds arrive in the same attribute packet as movement and keep values a later update omits.
+#[test]
+fn liquid_speeds_order_independently_and_keep_omitted_values() {
+    let mut authority = LocalMovementSpeedAuthority::default();
+    authority.begin_session(1, 0);
+    assert!(authority.apply(1, 5, 0, attribute(0.1, 0.1, None)));
+    let update = authority.apply_liquid(1, 5, 0, Some(0.05), None).unwrap();
+    assert_eq!(update.underwater, Some(0.05));
+    authority.apply_liquid(1, 6, 0, None, Some(0.03)).unwrap();
+    assert_eq!(
+        authority.liquid(),
+        super::LiquidMovementSpeeds {
+            underwater: Some(0.05),
+            lava: Some(0.03),
+        }
+    );
+    assert!(authority.apply_liquid(1, 6, 0, Some(0.2), None).is_none());
+    let invalid = authority
+        .apply_liquid(1, 7, 0, Some(f64::NAN), None)
+        .unwrap();
+    assert_eq!(invalid.underwater, None);
+    assert_eq!(authority.liquid().underwater, Some(0.05));
+}
+
+/// Liquid speeds beyond the sweep-safe bounds are skipped; the largest admitted
+/// speeds keep worst-case liquid travel inside every simulator query budget.
+#[test]
+fn liquid_speed_admission_keeps_liquid_travel_simulable() {
+    let mut authority = LocalMovementSpeedAuthority::default();
+    authority.begin_session(1, 0);
+    let skipped = authority
+        .apply_liquid(1, 1, 0, Some(30.0), Some(30.0))
+        .unwrap();
+    assert_eq!((skipped.underwater, skipped.lava), (None, None));
+    assert_eq!(authority.liquid(), super::LiquidMovementSpeeds::default());
+    let underwater = super::MAX_SIMULABLE_UNDERWATER_SPEED;
+    let lava = super::MAX_SIMULABLE_LAVA_SPEED;
+    let admitted = authority
+        .apply_liquid(1, 2, 0, Some(underwater), Some(lava))
+        .unwrap();
+    assert_eq!(
+        (admitted.underwater, admitted.lava),
+        (Some(underwater), Some(lava))
+    );
+
+    struct Liquid(sim::BlockPhysicsFlags);
+    impl sim::CollisionWorld for Liquid {
+        fn collision_boxes(
+            &self,
+            _: sim::Aabb,
+        ) -> Result<sim::CollisionQuery<Vec<sim::Aabb>>, sim::WorldQueryError> {
+            Ok(sim::CollisionQuery::synthetic(Vec::new()))
+        }
+        fn block_physics(
+            &self,
+            _: [i32; 3],
+        ) -> Result<sim::BlockPhysicsSample, sim::WorldQueryError> {
+            Ok(sim::BlockPhysicsSample {
+                layers: Box::new([sim::BlockPhysicsFacts {
+                    friction: 0.6,
+                    horizontal_speed_factor: 1.0,
+                    vertical_speed_factor: 1.0,
+                    fluid_height_blocks: 1.0,
+                    flags: self.0,
+                    surface_response: sim::SurfaceResponse::None,
+                }]),
+                identity: sim::CollisionQuery::synthetic(()).identity,
+            })
+        }
+    }
+    let boosted = sim::MovementEffects {
+        dolphin_boost: true,
+        ..sim::MovementEffects::default()
+    };
+    // Diagonal sprint-swimming and lava wading, diving, level and climbing.
+    for (flags, mode, effects) in [
+        (
+            sim::BlockPhysicsFlags::WATER,
+            sim::MovementMode::Swimming,
+            boosted,
+        ),
+        (
+            sim::BlockPhysicsFlags::LAVA,
+            sim::MovementMode::Walking,
+            sim::MovementEffects::default(),
+        ),
+    ] {
+        for pitch in [-90.0, 0.0, 90.0] {
+            let mut state = sim::PlayerState::new(sim::Vec3::new(0.5, 5.0, 0.5));
+            state.swim_amount = 1.0;
+            state.swim_pose_active = mode == sim::MovementMode::Swimming;
+            let input = sim::MovementInput {
+                mode,
+                forward: 1.0,
+                strafe: 1.0,
+                yaw_degrees: 45.0,
+                pitch_degrees: pitch,
+                sprinting: true,
+                liquid_contact_height: Some(f64::from(sim::PLAYER_HEIGHT as f32)),
+                underwater_movement_speed: Some(underwater),
+                lava_movement_speed: Some(lava),
+                effects,
+                ..sim::MovementInput::default()
+            };
+            for tick in 0..300 {
+                sim::Simulator::default()
+                    .tick(&mut state, input, &Liquid(flags))
+                    .unwrap_or_else(|error| panic!("{mode:?} pitch {pitch} tick {tick}: {error}"));
+            }
+        }
+    }
+}
+
+/// Reporting accepts finite attributes beyond the query budget without admitting them to physics.
+#[test]
+fn sync_reported_speed_retains_large_attributes_and_local_sprint_edges() {
+    let mut authority = started(0.1);
+    assert!(!authority.apply(7, 2, 0, attribute(33.0, 33.0, None)));
+    assert_eq!(authority.current(), Some(f64::from(0.1_f32)));
+    assert_eq!(authority.reported_current(), Some(33.0));
+    authority.set_sprinting(true);
+    assert_eq!(
+        authority.reported_current(),
+        Some(f64::from(33.0_f32 * sim::SPRINT_SPEED_MULTIPLIER as f32))
+    );
+    authority.set_sprinting(false);
+    assert_eq!(authority.reported_current(), Some(33.0));
+    assert!(authority.apply(7, 3, 0, attribute(0.2, 0.2, None)));
+    assert_eq!(authority.reported_current(), authority.current());
+}

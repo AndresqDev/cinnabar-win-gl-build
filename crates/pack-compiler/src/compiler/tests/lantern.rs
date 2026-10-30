@@ -1,0 +1,141 @@
+use super::*;
+use assets::{CompiledBiomeAssets, NetworkIdMode, RuntimeAssets};
+
+#[test]
+fn every_pinned_lantern_samples_its_sprite_after_carrier_roundtrip() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let target: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../../../../assets/bedrock-target.json"))
+            .unwrap();
+    let protocol = target["wire_protocol"].as_u64().unwrap() as u32;
+    let registry_bytes =
+        fs::read(root.join(target["artifacts"]["block_registry"].as_str().unwrap())).unwrap();
+    let registry = assets::read_registry_for_protocol(&registry_bytes, protocol).unwrap();
+    let lights = assets::read_light_registry_for_protocol(
+        &fs::read(root.join(target["artifacts"]["light_registry"].as_str().unwrap())).unwrap(),
+        &registry_bytes,
+        registry.len(),
+        protocol,
+    )
+    .unwrap();
+    let records = registry
+        .into_vec()
+        .into_iter()
+        .filter(|record| {
+            matches!(record.name.as_ref(), "minecraft:air" | "minecraft:stone")
+                || (record.name.ends_with("lantern")
+                    && canonical_state_u32(&record.canonical_state, "hanging").is_some())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.name.as_ref() == "minecraft:copper_lantern")
+    );
+    let span = records
+        .iter()
+        .map(|record| record.sequential_id as usize + 1)
+        .max()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let blocks = records
+        .iter()
+        .map(|record| {
+            let name = record.name.strip_prefix("minecraft:").unwrap();
+            let texture = if name == "stone" { "stone" } else { "lantern" };
+            (name.to_owned(), serde_json::json!({"textures": texture}))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    write(
+        directory.path().join("blocks.json"),
+        serde_json::to_string(&blocks).unwrap(),
+    );
+    write(
+        directory.path().join("textures/terrain_texture.json"),
+        r#"{"texture_data":{"stone":{"textures":"textures/blocks/stone"},"lantern":{"textures":"textures/blocks/lantern"}}}"#,
+    );
+    write(
+        directory.path().join("textures/flipbook_textures.json"),
+        "[]",
+    );
+    write_png(
+        directory.path().join("textures/blocks/stone.png"),
+        TILE_SIZE,
+        TILE_SIZE,
+        &[100, 100, 100, 255].repeat((TILE_SIZE * TILE_SIZE) as usize),
+    );
+    let mut pixels = vec![0; (TILE_SIZE * TILE_SIZE * 4) as usize];
+    let body = [255, 120, 40, 255];
+    for y in 2..9 {
+        for x in 0..6 {
+            let offset = ((y * TILE_SIZE + x) * 4) as usize;
+            pixels[offset..offset + 4].copy_from_slice(&body);
+        }
+    }
+    write_png(
+        directory.path().join("textures/blocks/lantern.png"),
+        TILE_SIZE,
+        TILE_SIZE,
+        &pixels,
+    );
+    let (compiled, _) = super::super::compile_pack_inner(
+        directory.path(),
+        &records,
+        &lights[..span],
+        CompiledBiomeAssets::diagnostic(),
+        protocol,
+    )
+    .unwrap();
+    let runtime = RuntimeAssets::decode(&assets::encode_blob(&compiled).unwrap()).unwrap();
+    for record in records.iter().filter(|record| {
+        record.name.ends_with("lantern")
+            && canonical_state_u32(&record.canonical_state, "hanging").is_some()
+    }) {
+        let visual = runtime.resolve(NetworkIdMode::Sequential, record.sequential_id);
+        assert_eq!(visual.kind(), VisualKind::Model);
+        assert_eq!(visual.support(), VisualSupport::VanillaFallback);
+        assert_eq!(
+            runtime
+                .resolve(NetworkIdMode::Hashed, record.network_hash)
+                .model_template(),
+            visual.model_template()
+        );
+        let template = runtime.model_templates()[visual.model_template().unwrap() as usize];
+        let face = runtime.model_quads()[template.quad_start as usize];
+        assert_ne!(
+            runtime.material(face.material).flags & assets::MATERIAL_FLAG_ALPHA_CUTOUT,
+            0,
+            "{} keeps its transparent sprite pixels out of the model",
+            record.name,
+        );
+        let uv = [0, 1].map(|axis| face.uvs.iter().map(|uv| u32::from(uv[axis])).sum::<u32>() / 4);
+        let [x, y] = uv.map(|value| value * TILE_SIZE / 4096);
+        let offset = ((y * TILE_SIZE + x) * 4) as usize;
+        assert_eq!(
+            &pixels[offset..offset + 4],
+            &body,
+            "{} {}: body face samples an opaque lantern pixel",
+            record.name,
+            record.canonical_state,
+        );
+        assert!(
+            template.quad_count > 6,
+            "cap and handle survive compilation"
+        );
+        let quads =
+            &runtime.model_quads()[template.quad_start as usize..][..template.quad_count as usize];
+        assert!(
+            quads[..12]
+                .iter()
+                .all(|q| q.flags & assets::MODEL_QUAD_FLAG_INHERITED_SHADE == 0)
+        );
+        assert!(
+            quads[12..]
+                .iter()
+                .all(|q| q.flags & assets::MODEL_QUAD_FLAG_INHERITED_SHADE != 0),
+            "{}: handles keep the cap's shade",
+            record.name,
+        );
+    }
+}
+use crate::compiler::canonical_state_u32;

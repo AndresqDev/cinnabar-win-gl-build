@@ -1,0 +1,187 @@
+{
+  "documents": [
+    {
+      "name": "hello",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0}",
+      "accepted": true
+    },
+    {
+      "name": "duplicate",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0}",
+      "accepted": false
+    },
+    {
+      "name": "unknown",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0,\"extra\":0}",
+      "accepted": false
+    },
+    {
+      "name": "missing",
+      "document": "hello",
+      "json": "{\"version\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0}",
+      "accepted": false
+    },
+    {
+      "name": "fraction",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1.0,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0}",
+      "accepted": false
+    },
+    {
+      "name": "overflow",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":256}",
+      "accepted": false
+    },
+    {
+      "name": "surrogate",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"\\ud800\",\"subclient\":0}",
+      "accepted": false
+    },
+    {
+      "name": "trailing",
+      "document": "hello",
+      "json": "{\"version\":1,\"api\":1,\"capabilities\":[\"ui\"],\"offer_digest\":\"d\",\"client_challenge\":\"c\",\"connection\":\"n\",\"subclient\":0}null",
+      "accepted": false
+    },
+    {
+      "name": "scalar min",
+      "document": "scalar",
+      "json": "{\"type\":\"integer\",\"value\":-9223372036854775808}",
+      "accepted": true
+    },
+    {
+      "name": "scalar overflow",
+      "document": "scalar",
+      "json": "{\"type\":\"choice\",\"value\":65536}",
+      "accepted": false
+    },
+    {
+      "name": "unknown scalar",
+      "document": "scalar",
+      "json": "{\"type\":\"future\",\"value\":1}",
+      "accepted": false
+    },
+    {
+      "name": "duplicate scalar",
+      "document": "scalar",
+      "json": "{\"type\":\"text\",\"value\":\"a\",\"value\":\"b\"}",
+      "accepted": false
+    },
+    {
+      "name": "field list",
+      "document": "field",
+      "json": "{\"type\":\"list\",\"item\":{\"type\":\"bool\"},\"max_items\":3}",
+      "accepted": true
+    },
+    {
+      "name": "field extra",
+      "document": "field",
+      "json": "{\"type\":\"bool\",\"extra\":1}",
+      "accepted": false
+    },
+    {
+      "name": "unknown field",
+      "document": "field",
+      "json": "{\"type\":\"future\"}",
+      "accepted": false
+    },
+    {
+      "name": "disabled",
+      "document": "control",
+      "json": "{\"kind\":\"disabled\"}",
+      "accepted": true
+    },
+    {
+      "name": "control extra",
+      "document": "control",
+      "json": "{\"kind\":\"disabled\",\"extra\":1}",
+      "accepted": false
+    }
+  ],
+  "ingress": [
+    {
+      "name": "skip stale deliver replay quarantine",
+      "steps": [
+        {
+          "sequence": 1,
+          "accepted": true,
+          "delivered": false,
+          "schema": 65535
+        },
+        {
+          "sequence": 2,
+          "accepted": true,
+          "delivered": false,
+          "world_epoch": 0
+        },
+        {
+          "sequence": 3,
+          "accepted": true,
+          "delivered": true
+        },
+        {
+          "sequence": 3,
+          "accepted": false,
+          "delivered": false
+        },
+        {
+          "sequence": 4,
+          "accepted": false,
+          "delivered": false
+        }
+      ]
+    },
+    {
+      "name": "route failure quarantines",
+      "steps": [
+        {
+          "sequence": 1,
+          "accepted": false,
+          "delivered": false,
+          "connection": "other"
+        },
+        {
+          "sequence": 1,
+          "accepted": false,
+          "delivered": false
+        }
+      ]
+    },
+    {
+      "name": "gap quarantines",
+      "steps": [
+        {
+          "sequence": 2,
+          "accepted": false,
+          "delivered": false
+        },
+        {
+          "sequence": 1,
+          "accepted": false,
+          "delivered": false
+        }
+      ]
+    },
+    {
+      "name": "generation failure quarantines",
+      "steps": [
+        {
+          "sequence": 1,
+          "accepted": false,
+          "delivered": false,
+          "generation": 2
+        },
+        {
+          "sequence": 2,
+          "accepted": false,
+          "delivered": false
+        }
+      ]
+    }
+  ]
+}

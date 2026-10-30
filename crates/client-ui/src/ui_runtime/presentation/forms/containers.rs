@@ -1,0 +1,607 @@
+//! Projects the client's inventory authority and frame into the container screens: which screen
+//! the open window draws, its title and tooltip, and the cells its hits address.
+
+use std::{any::Any, sync::Arc};
+
+use protocol::{ScreenRecipe, WindowKind};
+use ui::{IconRef, UiNode};
+use ui_engine::engine::screen::{CustomRenderer, PaintFrame};
+use ui_engine::frame::EngineFrame;
+use ui_engine::text_metrics::TextMetrics;
+use ui_screens::container_actions::InventoryCellHit;
+use ui_screens::container_data::id_aux_icons;
+use ui_screens::container_kinds::{mount_kind, storage_kind, window_kind};
+use ui_screens::container_source::{
+    AnvilCost, BookView, ContainerFrame, ContainerSource, NameSources, ScreenView,
+};
+use ui_screens::containers::{ContainerInput, ScreenLayout};
+use ui_screens::furnace_book::Entries;
+use ui_screens::recipe_book::BookEntry;
+
+use super::super::{HudFrame, UiPresentationError, UiPresentationRuntime};
+use super::preview_renderer::PreviewRenderer;
+use crate::ui_runtime::{
+    UiRuntime, inventory_actions::recipe_book_entries,
+    presentation::inventory_pointer::InventoryScreen,
+};
+use assets::entity::mount::MountEquipment;
+
+/// The client's authority as the container screens read it.
+pub(crate) struct ContainerAuthority<'a> {
+    player: &'a player_state::PlayerState,
+    runtime: &'a UiRuntime,
+    screen: ScreenView<'a>,
+}
+
+impl<'a> ContainerAuthority<'a> {
+    pub(crate) fn new(player: &'a player_state::PlayerState, runtime: &'a UiRuntime) -> Self {
+        let state = runtime.screen_state();
+        let screen = ScreenView {
+            mount_equipment: state.mount_equipment,
+            anvil_name: &state.anvil_name,
+            anvil_cost: if runtime
+                .inventory_ledger(player)
+                .created_output_stack()
+                .is_some()
+            {
+                None
+            } else {
+                runtime.anvil_preview(player).map(|preview| AnvilCost {
+                    levels: preview.outcome.cost,
+                    too_expensive: preview.outcome.too_expensive,
+                    affordable: runtime.anvil_affordable(player, &preview),
+                })
+            },
+            recipe_choice: state.recipe_choice,
+            beacon: state.beacon,
+            beacon_level: state.beacon_level,
+            loom_pattern: state.loom_pattern.as_deref(),
+            crafter_disabled: std::array::from_fn(|slot| state.crafter.is_disabled(slot as u8)),
+            crafter_powered: state.crafter.powered,
+            furnace_book_open: runtime
+                .furnace_options(player)
+                .is_some_and(|options| options.layout == protocol::FurnaceLayout::RecipeBook),
+            furnace_tab: runtime
+                .furnace_options(player)
+                .map(|options| options.left_tab.index()),
+            inventory: runtime.inventory_controller(player).unwrap_or_else(|| {
+                inventory::InventoryController::new(
+                    Default::default(),
+                    inventory::InventoryContext::Personal,
+                    false,
+                )
+            }),
+            creative_expanded: &state.creative_expanded,
+            search: &state.search,
+            container_scroll: &state.container_scroll,
+            text_focused: state.text_focused(),
+            book: state.book.as_ref().map(|book| BookView {
+                pages: &book.pages,
+                page: book.page,
+                spread: book.spread(),
+                editable: book.editable,
+                signing: book.signing,
+                title: &book.title,
+                author: &book.author,
+                editing: book.editing,
+            }),
+        };
+        Self {
+            player,
+            runtime,
+            screen,
+        }
+    }
+}
+
+impl ContainerSource for ContainerAuthority<'_> {
+    fn player(&self) -> &player_state::PlayerState {
+        self.player
+    }
+
+    fn screen(&self) -> &ScreenView<'_> {
+        &self.screen
+    }
+
+    fn translation(&self, key: &str) -> Option<Arc<str>> {
+        self.runtime.translation(key)
+    }
+
+    fn experience_level(&self) -> u32 {
+        self.runtime.hud().experience().map_or(0, |xp| xp.level)
+    }
+
+    fn enchantment_name(&self, id: i16, level: u8) -> String {
+        super::super::inventory_tooltip::enchantment_name(self.runtime, id, level)
+    }
+
+    fn recipe_filtering(&self) -> bool {
+        self.runtime.recipe_filtering(self.player)
+    }
+
+    fn item_name_generation(&self) -> u64 {
+        self.runtime.item_name_generation()
+    }
+
+    fn book_entries(&self) -> Vec<BookEntry<'_>> {
+        recipe_book_entries(self.player, self.runtime)
+    }
+
+    fn furnace_entries(&self) -> Entries<'_> {
+        super::furnace_book::entries(self.player, self.runtime)
+    }
+
+    fn furnace_projection(&self) -> Arc<[usize]> {
+        super::furnace_book::projection(self.player, self.runtime)
+    }
+
+    fn furnace_category(&self, recipe: &ScreenRecipe) -> u8 {
+        super::furnace_book::category(self.player, self.runtime, recipe)
+    }
+
+    fn name_sources(&self) -> NameSources {
+        NameSources {
+            components: self
+                .runtime
+                .session
+                .session_items
+                .clone()
+                .map(|items| items as Arc<dyn Any + Send + Sync>),
+            lang: self.runtime.lang_catalog.clone(),
+        }
+    }
+}
+
+/// The frame's icons, durabilities and names as the container screens borrow them.
+pub(crate) fn container_frame(frame: &HudFrame) -> ContainerFrame<'_> {
+    ContainerFrame {
+        item_names: &frame.item_names,
+        inventory_icons: &frame.inventory_icons.0,
+        player_durability: &frame.durability.player,
+        hotbar_durability: &frame.hotbar_durability,
+        storage_icons: &frame.storage_icons.0,
+        storage_durability: &frame.durability.storage,
+        ui_icons: &frame.window_icons.ui,
+        ui_durability: &frame.durability.ui,
+        crafting: &frame.crafting,
+        armor_icons: &frame.armor_icons,
+        armor_durability: &frame.armor_durability,
+        offhand_icon: frame.offhand_icon,
+        offhand_durability: frame.offhand_durability,
+        cursor_icon: frame.cursor_icon,
+        cursor_durability: frame.cursor_durability,
+        recipe_icons: &frame.window_icons.recipe,
+        recipe_output: frame.window_icons.recipe_output.as_ref(),
+        book_entries: &frame.window_icons.book_entries,
+        furnace_entries: &frame.window_icons.furnace_entries,
+    }
+}
+
+/// The engine screen the open inventory or window draws; `block_entity` is the open block
+/// entity's NBT `id`, which picks the chest variant.
+pub(super) fn screen_layout(
+    player_runtime: &player_state::PlayerState,
+    runtime: &UiRuntime,
+    block_entity: Option<&str>,
+) -> Option<ScreenLayout> {
+    let book = super::recipe_book::recipe_book_shown(player_runtime, runtime);
+    Some(match InventoryScreen::of_runtime(player_runtime, runtime) {
+        InventoryScreen::Personal | InventoryScreen::Creative => ScreenLayout::Personal { book },
+        InventoryScreen::Workbench => ScreenLayout::Workbench { book },
+        InventoryScreen::Storage(slots) => ScreenLayout::Station(storage_kind(slots, block_entity)),
+        InventoryScreen::Window(WindowKind::Horse, _) => {
+            ScreenLayout::Station(mount_kind(runtime.screen_state().mount_equipment))
+        }
+        InventoryScreen::Window(kind, _) => ScreenLayout::Station(window_kind(kind)?),
+        InventoryScreen::Book => ScreenLayout::Book,
+    })
+}
+
+/// Whether the engine has a vanilla screen for the open inventory or window.
+pub fn engine_screen_for(player_runtime: &player_state::PlayerState, runtime: &UiRuntime) -> bool {
+    screen_layout(player_runtime, runtime, None).is_some()
+}
+
+/// The vanilla screen the open inventory or container draws, including the storage variant
+/// (barrel, shulker box, ender chest) its retained block entity selects.
+pub fn container_screen_reference(
+    player_runtime: &player_state::PlayerState,
+    runtime: &UiRuntime,
+) -> Option<&'static str> {
+    let block_entity = runtime
+        .session
+        .storage_block
+        .as_ref()
+        .filter(|(position, _)| {
+            runtime.inventory_ledger(player_runtime).window_position() == Some(*position)
+        })
+        .map(|(_, id)| &**id);
+    screen_layout(player_runtime, runtime, block_entity).map(|layout| layout.screen().0)
+}
+
+/// The player's main inventory and hotbar rows, as the container screens bind them.
+pub(super) fn player_rows(
+    player_runtime: &player_state::PlayerState,
+    frame: &HudFrame,
+    icons: &mut Vec<IconRef>,
+) -> [Vec<json_ui::CollectionItem>; 2] {
+    ui_screens::containers::player_rows(player_runtime, &container_frame(frame), icons)
+}
+
+/// The beacon pyramid level under `position`: how many full layers of base blocks, up to four,
+/// sit directly beneath it. `beacon_base` answers `None` for an unreadable cell, and the level
+/// is `None` when such a cell decides it.
+pub fn beacon_pyramid_level(
+    position: [i32; 3],
+    beacon_base: impl Fn([i32; 3]) -> Option<bool>,
+) -> Option<u8> {
+    let [x, y, z] = position;
+    for layer in 1..=4 {
+        let cells = (-layer..=layer)
+            .flat_map(|dx| (-layer..=layer).map(move |dz| [x + dx, y - layer, z + dz]));
+        let mut unknown = false;
+        for cell in cells {
+            match beacon_base(cell) {
+                Some(true) => {}
+                // Every lower layer is complete, so a known gap settles the level.
+                Some(false) => return u8::try_from(layer - 1).ok(),
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            return None;
+        }
+    }
+    Some(4)
+}
+
+/// Reads the open station's block for its screen: the beacon's pyramid level,
+/// the crafter's disabled slots and its `triggered_bit`.
+pub fn observe_station_block(
+    player_runtime: &player_state::PlayerState,
+    runtime: &mut UiRuntime,
+    world: Option<client_world::ui_read::InventoryUi<'_>>,
+    station_triggered: impl FnOnce([i32; 3]) -> Option<bool>,
+    beacon_level: impl FnOnce([i32; 3]) -> Option<u8>,
+    now_millis: u64,
+) {
+    let ledger = runtime.inventory_ledger(player_runtime);
+    let (Some(kind), Some(position), Some(world)) =
+        (ledger.window_kind(), ledger.window_position(), world)
+    else {
+        return;
+    };
+    if kind == WindowKind::Horse {
+        let identifier = ledger
+            .window_actor()
+            .and_then(|unique| world.container_actor(unique))
+            .and_then(|actor| match &actor.kind {
+                protocol::ActorKind::Entity { identifier } => Some(identifier.clone()),
+                protocol::ActorKind::Player { .. } => None,
+            });
+        let equipment = ledger
+            .window_actor()
+            .map_or(MountEquipment::Unresolved, |unique| {
+                world.actor_mount_equipment(unique)
+            });
+        runtime.screen_state_mut().mount_identifier = identifier;
+        runtime.screen_state_mut().mount_equipment = equipment;
+        return;
+    }
+    let nbt = world.block_entity_compound(position.into());
+    let integer = |key: &str| nbt.as_ref().and_then(|nbt| nbt.integer(key));
+    match kind {
+        // The level is not part of the beacon's block data; it comes from the blocks below.
+        WindowKind::Beacon => {
+            runtime.screen_state_mut().beacon_level = beacon_level(position)
+                .or_else(|| integer("Levels").and_then(|levels| u8::try_from(levels).ok()));
+        }
+        WindowKind::Crafter => {
+            let disabled = integer("disabled_slots").map_or(0, |mask| mask as u16);
+            let powered = station_triggered(position);
+            runtime
+                .screen_state_mut()
+                .crafter
+                .observe(disabled, powered, now_millis);
+        }
+        _ => {}
+    }
+}
+
+impl UiPresentationRuntime {
+    /// Draw the open inventory or container through the engine. `Ok(false)`
+    /// leaves the screen to the Java-styled path.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn append_engine_container(
+        &mut self,
+        player_runtime: &player_state::PlayerState,
+        runtime: &UiRuntime,
+        previous: Option<&EngineFrame>,
+        nodes: &mut Vec<UiNode>,
+        next: &mut u32,
+        metrics: TextMetrics,
+        width: f32,
+        height: f32,
+    ) -> Result<bool, UiPresentationError> {
+        if !self.hud_frame.engine_containers || !runtime.inventory_open() {
+            return Ok(false);
+        }
+        let window_text = &self.hud_frame.window_text;
+        let Some(layout) =
+            screen_layout(player_runtime, runtime, window_text.block_entity.as_deref())
+        else {
+            return Ok(false);
+        };
+        let size = [width, height];
+        match self.render_container(
+            player_runtime,
+            runtime,
+            layout,
+            previous,
+            nodes,
+            next,
+            metrics,
+            size,
+            false,
+        ) {
+            Some(frame) => {
+                self.projections.container = Some((frame, layout));
+                Ok(true)
+            }
+            // A screen the engine cannot draw hands containers back to the Java path.
+            None => {
+                self.hud_frame.engine_containers = false;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Prepares the closed inventory's resolution, layout and textures without painting it or
+    /// applying live bindings before the first open.
+    pub(in crate::ui_runtime::presentation) fn prewarm_engine_inventory(
+        &mut self,
+        player_runtime: &player_state::PlayerState,
+        runtime: &UiRuntime,
+        metrics: TextMetrics,
+        size: [f32; 2],
+    ) {
+        if !self.hud_frame.engine_containers || runtime.inventory_open() {
+            return;
+        }
+        let Some(renderer) = self.engine.as_deref() else {
+            return;
+        };
+        let source = ContainerAuthority::new(player_runtime, runtime);
+        if !self.screens.containers.prewarm_inventory(
+            renderer,
+            &source,
+            self.inventory_preparation_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            return;
+        }
+        let book = super::recipe_book::recipe_book_shown(player_runtime, runtime);
+        let layout = ScreenLayout::Personal { book };
+        // The scene policy reads the open screen's flags from the engine's own resolved roots.
+        renderer.scene_settings(layout.screen().0, renderer.context());
+        let (mut nodes, mut next) = (Vec::new(), 0);
+        let _ = self.render_container(
+            player_runtime,
+            runtime,
+            layout,
+            None,
+            &mut nodes,
+            &mut next,
+            metrics,
+            size,
+            true,
+        );
+    }
+
+    /// Requests closed-screen artwork only when its retained preparation sources changed.
+    pub(in crate::ui_runtime::presentation) fn inventory_preparation_needed(
+        &self,
+        player: &player_state::PlayerState,
+        runtime: &UiRuntime,
+    ) -> bool {
+        if !self.hud_frame.engine_containers || runtime.inventory_open() {
+            return false;
+        }
+        let Some(engine) = self.engine.as_deref() else {
+            return false;
+        };
+        self.screens.containers.needs_inventory_preparation(
+            engine,
+            &ContainerAuthority::new(player, runtime),
+            self.inventory_preparation_revision
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Prepares or paints `layout`; only a visible paint publishes frame geometry.
+    #[allow(clippy::too_many_arguments)]
+    fn render_container(
+        &mut self,
+        player_runtime: &player_state::PlayerState,
+        runtime: &UiRuntime,
+        layout: ScreenLayout,
+        previous: Option<&EngineFrame>,
+        nodes: &mut Vec<UiNode>,
+        next: &mut u32,
+        metrics: TextMetrics,
+        [width, height]: [f32; 2],
+        prepare: bool,
+    ) -> Option<EngineFrame> {
+        let window_text = &self.hud_frame.window_text;
+        let renderer = self.engine.as_deref()?;
+        let (_, title_key) = layout.screen();
+        // A mount's screen is titled with its own entity name.
+        let mount_key = runtime
+            .screen_state()
+            .mount_identifier
+            .as_deref()
+            .and_then(|id| id.strip_prefix("minecraft:"))
+            .map(|name| format!("entity.{name}.name"));
+        let title_key = mount_key.as_deref().unwrap_or(title_key);
+        // A custom name shows as stated, else the block's own title.
+        let title = window_text.custom_title.clone().unwrap_or_else(|| {
+            runtime
+                .translation(title_key)
+                .map_or_else(|| title_key.to_owned(), |title| title.to_string())
+        });
+        let source = ContainerAuthority::new(player_runtime, runtime);
+        let items = container_frame(&self.hud_frame);
+        let id_aux = id_aux_icons(&source, &items, |id| self.item_icon(id, 0));
+        // The hovered item's full tooltip (name, enchantments, lore) replaces its
+        // bound name, so hovering changes no data.
+        let tooltip = runtime
+            .screen_state()
+            .hover
+            .filter(|hit| hit.is_item_cell())
+            .and_then(|_| tooltip_text(&window_text.tooltip));
+        let preview_view = std::cell::Cell::new(None);
+        let mut preview = PreviewRenderer {
+            preview: self.hud_frame.player_preview,
+            view: Some(&preview_view),
+            ..PreviewRenderer::default()
+        };
+        let mut renderers: [&mut dyn CustomRenderer; 1] = [&mut preview];
+        let translate = |key: &str| runtime.translation(key);
+        let mut paint_frame = PaintFrame {
+            layouts: &mut self.layouts,
+            font: &self.font,
+            metrics,
+            solid_page: self.solid_texture_page,
+            safe_area: self.safe_area,
+            content: [width, height],
+            translate: &translate,
+            language: runtime.text_generation(),
+            now: self.menu_seconds,
+            nodes,
+            next,
+            renderers: &mut renderers,
+        };
+        let input = ContainerInput {
+            layout,
+            title: &title,
+            previous,
+            pointer: runtime.inventory_pointer_gui(),
+            tooltip: tooltip.as_deref(),
+            clocks: &self.scene_clock,
+            id_aux: &id_aux,
+        };
+        let drawn = if prepare {
+            let translator = runtime.translator();
+            let resources = ui_engine::engine::layout_task::LayoutResources {
+                font: Arc::clone(&self.font),
+                layouts: ui::TextLayoutCache::new(
+                    super::super::TEXT_CACHE_ENTRIES,
+                    super::super::TEXT_CACHE_BYTES,
+                ),
+                translate: Arc::new(move |key| translator.lookup(key)),
+            };
+            self.screens.containers.prepare(
+                renderer,
+                &source,
+                &items,
+                input,
+                &mut paint_frame,
+                resources,
+            );
+            None
+        } else {
+            self.screens
+                .containers
+                .paint(renderer, &source, &items, input, &mut paint_frame)
+        };
+        if let Some(view) = preview_view.get() {
+            self.player_preview_view = view;
+        }
+        drawn
+    }
+
+    /// Screens the container paints have resolved, for cache tests.
+    #[cfg(test)]
+    pub fn engine_container_resolves(&self) -> usize {
+        self.screens.containers.resolves()
+    }
+
+    /// Layouts the current container screen has run, for cache tests.
+    #[cfg(test)]
+    pub fn engine_container_layouts(&self) -> usize {
+        self.screens.containers.layouts()
+    }
+
+    /// Controls the current container screen's layouts placed rather than spliced, for cache
+    /// tests.
+    #[cfg(test)]
+    pub fn engine_container_placed(&self) -> usize {
+        self.screens.containers.placed()
+    }
+
+    /// Controls rebuilt over the personal inventory's retained lifetime, for work regressions.
+    #[cfg(test)]
+    pub fn engine_inventory_rebuilt(&self) -> usize {
+        self.screens.containers.inventory_rebuilt()
+    }
+
+    /// Keeps projected slot inputs until a pending or ready inventory has actually painted.
+    pub(in crate::ui_runtime::presentation) fn inventory_inputs_needed(
+        &self,
+        player: &player_state::PlayerState,
+        runtime: &UiRuntime,
+    ) -> bool {
+        self.inventory_preparation_needed(player, runtime)
+            || self.screens.containers.retains_prepared_inventory_inputs()
+    }
+
+    /// Whether the closed inventory still owns unfinished preparation work.
+    #[cfg(test)]
+    pub fn engine_inventory_preparation_pending(&self) -> bool {
+        self.screens.containers.inventory_preparation_pending()
+    }
+
+    /// The container frame the engine drew last build, if any.
+    pub fn engine_container_frame(&self) -> Option<&EngineFrame> {
+        self.projections.container.as_ref().map(|(frame, _)| frame)
+    }
+
+    /// The ledger cell under a container-screen point (virtual px equal GUI px).
+    pub fn engine_container_hit(&self, gui: [f32; 2]) -> Option<InventoryCellHit> {
+        let (frame, layout) = self.projections.container.as_ref()?;
+        layout.hit(frame, gui)
+    }
+}
+
+/// Tooltip lines as one `#hover_text`, each coloured by its format code.
+pub(super) fn tooltip_text(
+    lines: &[crate::ui_runtime::presentation::hud_layout::TooltipLine],
+) -> Option<String> {
+    (!lines.is_empty()).then(|| {
+        lines
+            .iter()
+            .map(|line| {
+                let rgb = [line.color[0], line.color[1], line.color[2]];
+                let descriptor = ui::FORMATTING_COLORS
+                    .iter()
+                    .find(|entry| entry.name.is_some() && entry.fallback_rgb == rgb);
+                // Each TooltipLine was independently styled. Reset before its
+                // prefix so a custom name's bold/italic/color cannot leak.
+                match descriptor {
+                    Some(entry) => format!("§r§{}{}", entry.code, line.text),
+                    None => format!("§r{}", line.text),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+#[cfg(test)]
+mod tooltip_tests;
+
+#[cfg(test)]
+mod book_order_tests;
+
+#[cfg(test)]
+mod beacon_level_tests;

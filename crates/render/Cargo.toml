@@ -1,0 +1,95 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+platform-specific = ["macos", "windows"]
+reads = [
+    "app/src",
+    "crates/shaderpack/tests/fixtures/geometry",
+    "assets/bedrock-target.json",
+    "crates/assets/data/block-registry-v1001.bin",
+    "crates/assets/data/block-registry-v2225.bin",
+    "packaging/windows/dxc.json",
+]
+
+[features]
+# Counts allocation requests and labelled GPU writes for diagnostic runs.
+alloc-stats = ["render-scene/alloc-stats"]
+tracy = ["bevy/trace", "dep:tracy-client", "render-scene/tracy"]
+publication-test-support = []
+# Compiles the hard-disabled Enhanced renderer.
+enhanced = []
+# Enables bounded development captures while the production switch stays disabled.
+enhanced-diagnostics = ["enhanced", "render-model/enhanced-diagnostics", "render-scene/enhanced-diagnostics"]
+
+[dependencies]
+web-time.workspace = true
+env-compat = { path = "../env-compat" }
+render-scene = { path = "../render-scene" }
+block-transform = { path = "../block-transform" }
+tracy-client = { version = "=0.19.0", default-features = false, features = ["enable", "only-localhost", "ondemand"], optional = true }
+mod-api = { path = "../mod-api" }
+mod-render = { path = "../mod-render" }
+assets = { path = "../assets" }
+far-terrain = { path = "../far-terrain" }
+bevy.workspace = true
+glam.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+render-api = { path = "../render-api" }
+render-model = { path = "../render-model" }
+meshing = { path = "../meshing" }
+particles = { path = "../particles" }
+rayon.workspace = true
+serde_json = "1"
+sha2.workspace = true
+world = { path = "../world" }
+wgpu = { workspace = true, features = ["naga-ir"] }
+shaderpack = { path = "../shaderpack" }
+naga.workspace = true
+png = "0.18"
+
+# ARM hardware dispatch keeps identical digests and falls back on CPUs without SHA2.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
+# Absolute monotonic waits for frame pacing.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Reads marker command-buffer host times for whole-frame GPU timing.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CABase", "objc2-core-foundation"] }
+objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLCommandBuffer", "objc2-core-foundation"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice", "MTLBuffer", "MTLBlitCommandEncoder", "MTLCommandEncoder", "MTLResource"] }
+
+[dev-dependencies]
+criterion.workspace = true
+test-alloc = { path = "../test-alloc" }
+render-model = { path = "../render-model", features = ["test-support"] }
+render-scene = { path = "../render-scene", features = ["publication-test-support"] }
+test-time = { path = "../test-time" }
+wgpu = { workspace = true, features = ["counters"] }
+pack-compiler = { path = "../pack-compiler" }
+image.workspace = true
+naga = { workspace = true, features = ["wgsl-out", "spv-out"] }
+wesl = "0.6.0"
+tempfile = "3"
+spirv = "0.4"
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "actor_artwork"
+harness = false
+required-features = ["publication-test-support"]

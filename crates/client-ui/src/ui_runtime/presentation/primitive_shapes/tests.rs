@@ -1,0 +1,274 @@
+use super::*;
+use render_api::primitive_shapes::{
+    PrimitiveShapeChange, PrimitiveShapeData, PrimitiveShapeKind, PrimitiveShapeUpdate,
+    PrimitiveShapesEvent,
+};
+
+/// Supplies native default text options with a caller-selected string.
+fn text(value: &str) -> PrimitiveText {
+    PrimitiveText {
+        text: value.into(),
+        use_rotation: false,
+        background_color: None,
+        line_gap_height: 0.0,
+        depth_test: false,
+        show_backface: true,
+        show_text_backface: false,
+    }
+}
+
+/// Creates one packet-like update without filling unrelated optional properties.
+fn update(id: u64, data: PrimitiveShapeData) -> PrimitiveShapeUpdate {
+    PrimitiveShapeUpdate {
+        network_id: id,
+        kind: PrimitiveShapeKind::Text,
+        location: None,
+        rotation: None,
+        scale: None,
+        color: None,
+        total_time_left: None,
+        maximum_render_distance: None,
+        dimension: None,
+        attached_actor: None,
+        data,
+    }
+}
+
+/// Sends one text patch through retained storage.
+fn apply(store: &mut PrimitiveShapeStore, update: PrimitiveShapeUpdate) {
+    store.apply(PrimitiveShapesEvent {
+        changes: vec![PrimitiveShapeChange::Upsert(update)],
+        skipped_entries: 0,
+    });
+}
+
+#[test]
+fn primitive_text_centers_lines_and_gives_each_its_own_background() {
+    let lines = [
+        AtlasLine {
+            cell: [0, 0, 24, 16],
+            width_px: 5.5,
+            top_px: -1.0,
+            ink_y_px: [-1.0, 7.0],
+        },
+        AtlasLine {
+            cell: [24, 0, 8, 16],
+            width_px: 2.0,
+            top_px: 0.0,
+            ink_y_px: [0.0, 8.0],
+        },
+    ];
+    let mut style = text("one\ntwo");
+    style.background_color = Some([0.1, 0.2, 0.3, 0.4]);
+    style.depth_test = true;
+    style.use_rotation = true;
+    let output = records(&style, &lines);
+    assert_eq!(output.len(), 4);
+    // The 5.5-pixel line rounds up to 6 before centring, keeping its right padding.
+    assert_eq!(
+        output[0].rect,
+        [-4.0, -1.0, 4.0, NAMETAG_LINE_PITCH_PX - 1.0]
+    );
+    assert_eq!(
+        output[1].rect,
+        [
+            -2.0,
+            NAMETAG_LINE_PITCH_PX - 1.0,
+            2.0,
+            2.0 * NAMETAG_LINE_PITCH_PX - 1.0
+        ]
+    );
+    assert_eq!(output[0].color, style.background_color.unwrap());
+    assert_eq!(output[1].color, style.background_color.unwrap());
+    assert_eq!(output[2].rect[0], -3.0);
+    assert_eq!(output[2].rect[1], -1.0);
+    assert_eq!(output[3].rect[0], -1.0);
+    assert_eq!(output[3].rect[1], NAMETAG_LINE_PITCH_PX);
+    assert_eq!(output[2].color, [1.0; 4]);
+    assert_eq!(output[2].meta[2], 1 | 2 | 8);
+    assert_eq!(f32::from_bits(output[2].meta[3]), EXTRA_LINE_LIFT);
+}
+
+#[test]
+fn primitive_text_resolves_text_objects_and_literal_escaped_lines() {
+    let runtime = UiRuntime::new(1);
+    assert_eq!(
+        resolve_text("first\\n\\nlast", &runtime),
+        ("first\n\nlast".into(), false)
+    );
+    assert_eq!(
+        resolve_text(
+            r#"{"rawtext":[{"text":"hello"},{"text":" world"}]}"#,
+            &runtime
+        ),
+        ("hello world".into(), true)
+    );
+    assert_eq!(
+        resolve_text("{literal}", &runtime),
+        ("{literal}".into(), false)
+    );
+}
+
+#[test]
+fn primitive_text_steady_and_movement_frames_keep_atlas_and_quad_slots() {
+    let font = ui_engine::test_support::fixture_font();
+    let mut presentation = UiPresentationRuntime::new(font).unwrap();
+    let runtime = UiRuntime::new(1);
+    let mut store = PrimitiveShapeStore::default();
+    apply(
+        &mut store,
+        update(1, PrimitiveShapeData::Text(text("A\\n\\nB"))),
+    );
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert_eq!(store.text_records.values.len(), 4);
+    let atlas = Arc::clone(&store.atlas);
+    let quads = store.text_records.values.clone();
+    store.drain_uploads(|_, _, _, _| {});
+    store.text_records.drain(|_, _| {});
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(Arc::ptr_eq(&atlas, &store.atlas));
+    assert!(store.text_records.is_clean());
+    let mut moved = update(1, PrimitiveShapeData::None);
+    moved.location = Some([2.0, 3.0, 4.0]);
+    apply(&mut store, moved);
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(Arc::ptr_eq(&atlas, &store.atlas));
+    assert_eq!(store.text_records.values, quads);
+    assert!(store.text_records.is_clean());
+}
+
+/// Changes one translated debug string without replacing the presentation font.
+fn set_translation(runtime: &mut UiRuntime, value: &str) {
+    let input = format!("shape.key={value}\n");
+    runtime.set_server_lang(assets::ServerLangOverlay::read(input.len(), |target| {
+        target.copy_from_slice(input.as_bytes());
+        true
+    }));
+}
+
+#[test]
+fn primitive_text_rawtext_refreshes_after_common_or_equal_patch_and_retains_steady_frames() {
+    let font = ui_engine::test_support::fixture_font();
+    let mut presentation = UiPresentationRuntime::new(font).unwrap();
+    let mut runtime = UiRuntime::new(1);
+    let mut store = PrimitiveShapeStore::default();
+    set_translation(&mut runtime, "A");
+    apply(
+        &mut store,
+        update(
+            1,
+            PrimitiveShapeData::Text(text(r#"{"rawtext":[{"translate":"shape.key"}]}"#)),
+        ),
+    );
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    let before_atlas = Arc::clone(&store.atlas);
+    let before_quads = store.text_records.values.clone();
+    store.drain_uploads(|_, _, _, _| {});
+    store.text_records.drain(|_, _| {});
+    set_translation(&mut runtime, "AAA");
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(Arc::ptr_eq(&before_atlas, &store.atlas));
+    assert_eq!(before_quads, store.text_records.values);
+    assert!(!store.has_changes());
+    let mut moved = update(1, PrimitiveShapeData::None);
+    moved.location = Some([1.0, 0.0, 0.0]);
+    apply(&mut store, moved);
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(!Arc::ptr_eq(&before_atlas, &store.atlas));
+    assert_ne!(before_quads, store.text_records.values);
+    let after_atlas = Arc::clone(&store.atlas);
+    store.drain_uploads(|_, _, _, _| {});
+    store.text_records.drain(|_, _| {});
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(Arc::ptr_eq(&after_atlas, &store.atlas));
+    assert!(!store.has_changes());
+    let previous_right = store.text_records.values[0].rect[2];
+    let rebuilds = store.instance_rebuilds;
+    set_translation(&mut runtime, "AAAAA");
+    let mut repeated = update(1, PrimitiveShapeData::None);
+    repeated.location = Some([1.0, 0.0, 0.0]);
+    apply(&mut store, repeated);
+    assert_eq!(store.instance_rebuilds, rebuilds);
+    assert_eq!(store.drain_uploads(|_, _, _, _| {}).bytes, 0);
+    presentation.prepare_primitive_text(&mut store, &runtime);
+    assert!(!Arc::ptr_eq(&after_atlas, &store.atlas));
+    assert!(store.text_records.values[0].rect[2] > previous_right);
+}
+
+#[test]
+fn primitive_text_keeps_smaller_misses_after_a_failed_line_and_rebuilds_on_the_next_update() {
+    use std::cell::Cell;
+    let font = ui_engine::test_support::fixture_font();
+    let glyphs = [
+        ('/', [NAMETAG_ATLAS_SIDE / 2; 2]),
+        ('2', [NAMETAG_ATLAS_SIDE; 2]),
+        (
+            '0',
+            [NAMETAG_ATLAS_SIDE / 16, ui::TEXT_LINE_HEIGHT_64 / 64 * 2],
+        ),
+    ]
+    .map(|(codepoint, size)| assets::SheetGlyph {
+        metrics: *font.glyph(codepoint).unwrap(),
+        draw_size_64: size.map(|value| value * 64),
+    });
+    let font = Arc::new(font.with_glyphs(&glyphs, |_| true));
+    let runtime = UiRuntime::new(1);
+    let mut rasterizer = PrimitiveTextRasterizer::default();
+    let mut layouts = TextLayoutCache::new(4, 1 << 20);
+    let mut store = PrimitiveShapeStore::default();
+    let reads = Cell::new(0);
+    let pages = |page| {
+        reads.set(reads.get() + 1);
+        font_page(&font, page)
+    };
+    apply(&mut store, update(1, PrimitiveShapeData::Text(text("/"))));
+    rasterizer.invalidate(&mut store, &font, FormattingPalette::default());
+    rasterizer.prepare(&mut store, &font, &mut layouts, &runtime, &pages);
+    let original = Arc::clone(&store.atlas);
+    let kept_records = store.text_records.values.clone();
+    reads.set(0);
+    apply(
+        &mut store,
+        update(2, PrimitiveShapeData::Text(text("2\n0"))),
+    );
+    rasterizer.prepare(&mut store, &font, &mut layouts, &runtime, &pages);
+    assert_eq!(
+        reads.get(),
+        1,
+        "the rejected full-size line must not sample glyph pages"
+    );
+    assert_eq!(store.atlas.len(), 2);
+    assert!(Arc::ptr_eq(&original[0].rgba8, &store.atlas[0].rgba8));
+    assert_eq!(
+        &store.text_records.values[..kept_records.len()],
+        kept_records.as_slice()
+    );
+    assert_eq!(store.text_records.values.len(), kept_records.len() * 2);
+    assert!(
+        !rasterizer.atlas.has_room_for(1),
+        "pixel exhaustion still requests a future rebuild"
+    );
+    let current = Arc::clone(&store.atlas);
+    let current_records = store.text_records.values.clone();
+    store.drain_uploads(|_, _, _, _| {});
+    store.text_records.drain(|_, _| {});
+    reads.set(0);
+    for _ in 0..3 {
+        rasterizer.prepare(&mut store, &font, &mut layouts, &runtime, &pages);
+        assert!(Arc::ptr_eq(&current, &store.atlas));
+        assert_eq!(store.text_records.values, current_records);
+        assert!(store.text_records.is_clean());
+        assert_eq!(reads.get(), 0);
+    }
+    apply(&mut store, update(2, PrimitiveShapeData::Text(text("0"))));
+    rasterizer.prepare(&mut store, &font, &mut layouts, &runtime, &pages);
+    assert!(!Arc::ptr_eq(&current, &store.atlas));
+    assert_eq!(
+        reads.get(),
+        2,
+        "the rebuild requeues both retained text shapes"
+    );
+    assert_eq!(store.atlas.len(), 2);
+    assert_eq!(store.text_records.values.len(), current_records.len());
+    assert!(rasterizer.atlas.has_room_for(1));
+}

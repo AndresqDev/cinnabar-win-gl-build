@@ -1,0 +1,651 @@
+//! Native local-mod composition and gameplay integration.
+
+use client_extensions::modding::{
+    font,
+    grants::environment_grants,
+    multi::{self, ModHosts},
+};
+
+use crate::semantic_controls::ReservedControls;
+use bevy::prelude::*;
+use {
+    crate::{environment::VisualTimeOverride, runtime::network::resource_packs::PackApplication},
+    bevy::{
+        ecs::system::SystemParam,
+        window::{CursorOptions, PrimaryWindow},
+    },
+    client_runtime::network::NetworkHandle,
+    client_shell::menu::MenuRuntime,
+    client_shell::ui_resources::{UiPresentationResource, UiRuntimeResource},
+    client_state::ClientFrameSet,
+    mod_host::{ModGrants, ModHost},
+    std::{path::Path, time::Duration},
+};
+
+const COMPONENT_ENV: &str = "CINNABAR_MOD_COMPONENT";
+/// A mod package directory (`mod.toml`, `mod.wasm`, templates, textures); it takes precedence
+/// over a bare component.
+const PACKAGE_ENV: &str = "CINNABAR_MOD_PACKAGE";
+const DEMO_KEY: KeyCode = KeyCode::F8;
+const RELOAD_INTERVAL: Duration = Duration::from_millis(500);
+
+mod action_filter;
+mod actor_lives;
+mod admission;
+pub(crate) mod anchors;
+pub(crate) mod bindings;
+pub(crate) mod block_geometry;
+mod block_search;
+pub(crate) mod drawing_policy;
+mod drive;
+
+use drive::drive_mod;
+mod environment_loader;
+mod library;
+mod native_camera;
+mod native_input;
+mod packet_highlights;
+mod packet_menu;
+mod packet_render;
+pub(crate) mod packets;
+pub(crate) mod registration;
+mod terrain;
+
+/// Every loaded mod's presentation cues committed this frame, in load order.
+#[derive(Resource, Default)]
+pub(crate) struct ModCueFeed(pub Vec<mod_host::ModCue>);
+
+/// Mods' control modes for this frame, replacing the player's toggle sprint, toggle sneak and
+/// always sprint settings while present.
+#[derive(Default, Resource)]
+pub(crate) struct ModControlModes(pub(crate) Option<mod_host::GameplayControlModes>);
+
+#[derive(Resource)]
+pub(crate) struct ModRuntime {
+    hosts: ModHosts,
+    /// One entry per host, kept in host order by the lifecycle methods.
+    metadata: Vec<registration::HostMetadata>,
+    /// Per-mod render generations behind the last merged scene.
+    render_sources: Vec<u64>,
+    render_merge: mod_render::RenderMerge,
+    controls: mod_host::ControlFrame,
+    /// Chat-action clicks since the last frame, for the chat-action owner's next callback.
+    chat_events: Vec<mod_host::ControlEvent>,
+    suspended: bool,
+    /// The screen owner's input and layout between frames, and which mod that is.
+    screens: screens::ScreenState,
+}
+
+impl ModRuntime {
+    /// Starts a runtime with one host and its stable presentation metadata.
+    fn new(host: ModHost, metadata: registration::HostMetadata) -> Self {
+        Self {
+            hosts: ModHosts::new(host, Vec::new()),
+            metadata: vec![metadata],
+            render_sources: Vec::new(),
+            render_merge: Default::default(),
+            controls: mod_host::empty_controls(),
+            chat_events: Vec::new(),
+            suspended: false,
+            screens: Default::default(),
+        }
+    }
+
+    /// Appends a guest with its metadata and invalidates the merged render output.
+    fn push_host(&mut self, host: ModHost, metadata: registration::HostMetadata) {
+        self.hosts.push(host);
+        self.metadata.push(metadata);
+        self.render_sources.clear();
+    }
+
+    /// Replaces an environment guest and its presentation resources, retiring its input state.
+    fn replace_host(
+        &mut self,
+        index: usize,
+        mut prepared: admission::PreparedMod,
+        presentation: &mut client_ui::ui_runtime::presentation::UiPresentationRuntime,
+    ) -> ModHost {
+        self.screens.replace_host(index);
+        prepared
+            .host
+            .activate_settings(Some(self.hosts.host_mut(index)));
+        let retired = std::mem::replace(self.hosts.host_mut(index), prepared.host);
+        let metadata = &mut self.metadata[index];
+        metadata.font = prepared.font;
+        metadata.branding = prepared.branding;
+        presentation
+            .mod_ui_mut()
+            .set_prepared_panel_ui(metadata.owner, prepared.panel_ui);
+        self.render_sources.clear();
+        retired
+    }
+
+    /// Moves metadata, guest and index-based input ownership together without a restart.
+    fn swap_hosts(&mut self, left: usize, right: usize) {
+        self.hosts.swap(left, right);
+        self.metadata.swap(left, right);
+        self.screens.swap_hosts(left, right);
+        self.render_sources.clear();
+    }
+    /// Removes one guest and adjusts the surviving input and presentation owners together.
+    fn remove_host(&mut self, index: usize) -> ModHost {
+        let host = self.hosts.remove(index);
+        self.metadata.remove(index);
+        self.screens.remove_host(index);
+        self.render_sources.clear();
+        self.controls = mod_host::empty_controls();
+        host
+    }
+    /// Maps a publishing host's runtime index to its stable panel catalog owner.
+    fn panel_ui_owner(&self, host: usize) -> mod_ui::PanelUiOwner {
+        self.metadata[host].owner
+    }
+
+    /// Each live guest's committed HUD surface in load order, with its stable UI owner and
+    /// the actors its projections may follow.
+    fn hud_surfaces(&self) -> impl Iterator<Item = mod_ui::PublishedHudSurface<'_>> {
+        (0..self.hosts.host_count()).filter_map(|index| {
+            let host = self.hosts.host(index);
+            let (surface, revision) = host.hud_surface()?;
+            Some(mod_ui::PublishedHudSurface {
+                owner: self.panel_ui_owner(index),
+                revision,
+                surface,
+                authority: actor_authority(host.grants()),
+            })
+        })
+    }
+
+    /// Existing mod order chooses one active, explicitly authorized local menu brand.
+    fn menu_branding(
+        &self,
+    ) -> Option<
+        std::sync::Arc<client_ui::ui_runtime::presentation::menu_branding::PreparedMenuBranding>,
+    > {
+        self.metadata
+            .iter()
+            .enumerate()
+            .find_map(|(index, metadata)| {
+                let host = self.hosts.host(index);
+                (host.is_active() && host.grants().environment)
+                    .then(|| metadata.branding.clone())
+                    .flatten()
+            })
+    }
+}
+
+/// The actors a mod's surface projections may follow under its grants.
+fn actor_authority(grants: &ModGrants) -> mod_ui::ActorAuthority {
+    mod_ui::ActorAuthority {
+        players: grants.players,
+        entities: grants.entities,
+    }
+}
+
+/// Bounded personal-extension diagnostics, only through the developer control endpoint.
+#[cfg(feature = "developer-control")]
+pub(crate) fn developer_state(world: &World) -> Option<serde_json::Value> {
+    let runtime = world.get_resource::<ModRuntime>()?;
+    let hosts: Vec<_> = (0..runtime.hosts.host_count())
+        .map(|index| {
+            let host = runtime.hosts.host(index);
+            serde_json::json!({
+                "index": index,
+                "active": host.is_active(),
+                "label": host.label(),
+                "panel_open": host.panel_open(),
+                "reserved_keys": host.reserved_keys(),
+                "movement_granted": host.grants().movement,
+                "refused_outputs": host.refused_outputs(),
+                "last_fuel_used": host.last_fuel_used(),
+                "hud_surface_revision": host.hud_surface().map(|(_, revision)| revision),
+                "hud_surface": host.hud_surface().map(|(surface, _)| surface.as_ref()),
+                "panel": host.panel(),
+            })
+        })
+        .collect();
+    Some(serde_json::json!({ "suspended": runtime.suspended, "hosts": hosts }))
+}
+
+/// Publishes personal and packet drawing before session-owned client-part drawing.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DrawingPublication;
+
+/// Installs the developer extension only when its component path is explicit.
+pub(crate) fn configure_from_environment(app: &mut App) {
+    let package = std::env::var_os(PACKAGE_ENV);
+    let path = std::env::var_os(COMPONENT_ENV);
+    if let Some(set) = std::env::var_os(multi::SET_ENV) {
+        match multi::read_set(Path::new(&set)) {
+            Ok(mods) => configure_entries(app, mods),
+            Err(error) => warn!("Local mod set disabled: {error}"),
+        }
+    } else if let Some(package) = package.as_deref() {
+        configure_package(app, Path::new(package));
+    } else if let Some(path) = path.as_deref() {
+        configure(app, Some(Path::new(path)));
+    }
+    {
+        let configured = app.world().contains_resource::<ModRuntime>();
+        let layout =
+            launcher::install_layout::InstallLayout::discover().map_err(|error| error.to_string());
+        match layout.and_then(|layout| {
+            registration::Watcher::start(layout.user_config_root.clone())
+                .map(|watcher| (layout, watcher))
+        }) {
+            Ok((layout, watcher)) => {
+                library::configure(
+                    app,
+                    layout.mods_dir(),
+                    layout.user_config_root,
+                    watcher.removal_client(),
+                );
+                app.insert_resource(watcher);
+                if configured {
+                    configure_registration_systems(app);
+                } else {
+                    configure_systems(app, true);
+                }
+            }
+            Err(error) => {
+                warn!("Local extension watcher unavailable: {error}");
+                if !configured && app.world().contains_resource::<packets::PacketMods>() {
+                    configure_systems(app, false);
+                }
+            }
+        }
+    }
+}
+
+/// Loads one optional component without changing the vanilla schedule on absence.
+fn configure(app: &mut App, path: Option<&Path>) {
+    configure_with_grants(app, path, environment_grants());
+}
+
+/// Loads one package with the developer profile: what its manifest asks for, plus the explicit
+/// opt-ins a bare component gets.
+fn configure_package(app: &mut App, dir: &Path) {
+    match ModHost::load_package(dir, environment_grants()) {
+        Ok(host) => install(app, vec![host]),
+        Err(error) => warn!("Cinnabar mod package {} disabled: {error:#}", dir.display()),
+    }
+}
+
+/// Grants are explicit and apply only to the selected personal component.
+fn configure_with_grants(app: &mut App, path: Option<&Path>, grants: ModGrants) {
+    if let Some(path) = path {
+        configure_set(app, vec![(path.to_owned(), grants)]);
+    }
+}
+
+/// Loads components in order, each with its own grants; one failing to load leaves the rest.
+fn configure_set(app: &mut App, mods: Vec<(std::path::PathBuf, ModGrants)>) {
+    let entries = mods
+        .into_iter()
+        .map(|(path, grants)| (multi::ModSource::Component(path), grants));
+    configure_entries(app, entries.collect());
+}
+
+/// Loads components and packages in order, each with its own grants; one failing to load
+/// leaves the rest.
+fn configure_entries(app: &mut App, mods: Vec<(multi::ModSource, ModGrants)>) {
+    if let Some(selection) = multi::packet_mod_entry(&mods) {
+        app.world_mut().init_resource::<packets::PacketMods>();
+        app.world_mut()
+            .resource_mut::<packets::PacketMods>()
+            .select_environment(selection);
+    }
+    install(app, multi::load_entries(mods));
+}
+
+/// Installs loaded mods in load order; none installs nothing.
+fn install(app: &mut App, mut hosts: Vec<ModHost>) {
+    if let Some(path) = std::env::var_os(client_extensions::modding::panel_ui::UI_ENV)
+        && let Some(host) = hosts.iter_mut().find(|host| host.grants().controls)
+    {
+        let result =
+            client_extensions::modding::panel_ui::load(Path::new(&path)).and_then(|json| {
+                host.set_panel_bundle(&json)
+                    .map_err(|error| format!("{error:#}"))
+            });
+        if let Err(error) = result {
+            warn!("Optional personal-panel catalog unavailable: {error}");
+        }
+    }
+    let override_font =
+        std::env::var_os(font::FONT_ENV).and_then(|path| match font::load(Path::new(&path)) {
+            Ok(font) => Some(std::sync::Arc::new(font)),
+            Err(error) => {
+                warn!("Optional personal-panel font unavailable: {error}");
+                None
+            }
+        });
+    let hosts: Vec<_> = hosts
+        .into_iter()
+        .filter_map(|host| {
+            let result = if host.grants().controls {
+                if let Some(font) = &override_font {
+                    Ok(Some(font.clone()))
+                } else {
+                    host.panel_font_source()
+                        .map(font::rasterize)
+                        .transpose()
+                        .map(|font| font.map(std::sync::Arc::new))
+                }
+            } else {
+                Ok(None)
+            };
+            match result {
+                Ok(font) => match admission::prepare_branding(&host) {
+                    Ok(branding) => Some((host, font, branding)),
+                    Err(error) => {
+                        warn!("Embedded menu branding rejected; component disabled: {error}");
+                        None
+                    }
+                },
+                Err(error) => {
+                    warn!("Embedded personal-panel font rejected; component disabled: {error}");
+                    None
+                }
+            }
+        })
+        .enumerate()
+        .map(|(index, (host, font, branding))| {
+            let mut metadata = registration::HostMetadata::environment(index);
+            metadata.font = font;
+            metadata.branding = branding;
+            (host, metadata)
+        })
+        .collect();
+    for (host, metadata) in &hosts {
+        if let Some(bundle) = host.panel_bundle() {
+            match mod_ui::PreparedPanelUi::prepare(bundle) {
+                Ok(prepared) => {
+                    if let Some(mut presentation) =
+                        app.world_mut().get_resource_mut::<UiPresentationResource>()
+                    {
+                        presentation
+                            .mod_ui_mut()
+                            .set_prepared_panel_ui(metadata.owner, Some(prepared));
+                    }
+                }
+                Err(error) => warn!("Optional personal-panel preparation unavailable: {error}"),
+            }
+        }
+    }
+    let first_controls = hosts.iter().position(|(host, _)| host.grants().controls);
+    let sources = hosts
+        .iter()
+        .enumerate()
+        .map(|(index, (host, metadata))| {
+            let mut source = environment_loader::Source::from_host(metadata.owner, host);
+            source.font = std::env::var_os(font::FONT_ENV).map(std::path::PathBuf::from);
+            source.ui = (Some(index) == first_controls)
+                .then(|| std::env::var_os(client_extensions::modding::panel_ui::UI_ENV))
+                .flatten()
+                .map(std::path::PathBuf::from);
+            source
+        })
+        .collect::<Vec<_>>();
+    if !sources.is_empty() {
+        match environment_loader::Loader::start(sources) {
+            Ok(loader) => {
+                app.insert_resource(loader);
+            }
+            Err(error) => warn!("Environment component worker unavailable: {error}"),
+        }
+    }
+    let mut hosts = hosts.into_iter();
+    let Some((host, metadata)) = hosts.next() else {
+        return;
+    };
+    app.init_resource::<client_presentation::actor_publication::ActorPresentationStyle>();
+    app.insert_resource(VisualTimeOverride(host.time_override()));
+    app.insert_resource(crate::environment::VisualWeatherOverride(
+        host.weather_override(),
+    ));
+    let mut runtime = ModRuntime::new(host, metadata);
+    for (host, metadata) in hosts {
+        runtime.push_host(host, metadata);
+    }
+    app.insert_resource(runtime)
+        .init_resource::<interaction::ModInteraction>();
+    registration::presentation::refresh_presentation(app.world_mut());
+    configure_systems(app, false);
+}
+
+fn configure_systems(app: &mut App, watching: bool) {
+    app.init_resource::<native_input::NativeInput>();
+    app.init_resource::<ModControlModes>();
+    app.init_resource::<packet_render::Drawing>();
+    app.init_resource::<render_scene::mod_scene::ActorCoverageRequests>();
+    app.add_systems(
+        Update,
+        packet_render::coverage_requests
+            .after(drive_mod)
+            .before(ClientFrameSet::ActorFinalization),
+    );
+    app.init_resource::<ReservedControls>();
+    app.init_resource::<client_presentation::actor_publication::ActorPresentationStyle>();
+    app.add_systems(Update, environment_loader::poll.before(begin_mod_frame));
+    app.add_systems(
+        Update,
+        anchors::publish
+            .in_set(DrawingPublication)
+            .after(ClientFrameSet::ActorPublication)
+            .after(drive_mod)
+            .before(ClientFrameSet::UiPublication),
+    );
+    fullbright::configure(app);
+    app.init_resource::<crate::item_use::ModItemUsePolicy>()
+        .init_resource::<ModCueFeed>()
+        .add_plugins(::render::ModRenderPlugin)
+        .add_systems(Update, render::grant_depth_sampling);
+    if watching {
+        configure_registration_systems(app);
+    }
+    app.add_systems(
+        Update,
+        (begin_mod_frame, input::prepare_mod_input)
+            .chain()
+            .before(ClientFrameSet::RawInput),
+    );
+    app.add_systems(
+        Update,
+        drive_mod
+            .in_set(client_state::ModCameraInputSet)
+            .after(ClientFrameSet::SemanticFinalize)
+            .before(ClientFrameSet::UiPublication)
+            .before(crate::environment::update_atmosphere_frame),
+    );
+    app.init_resource::<packet_delay::RealPositionSnapshot>()
+        .add_systems(Update, packet_delay::publish_packet_delay.after(drive_mod))
+        .add_systems(Update, inventory::apply_inventory_requests.after(drive_mod));
+}
+
+/// Starts the shared callback allowance before any input or event reaches a guest.
+fn begin_mod_frame(
+    extension: Option<ResMut<ModRuntime>>,
+    gameplay: gameplay::GameplayContext,
+    actors: Option<Res<render_scene::ActorRenderFrame>>,
+    mut drawing: ResMut<packet_render::Drawing>,
+) {
+    if drawing.needs_targets() {
+        drawing.targets(
+            actors
+                .as_deref()
+                .map(render_scene::mod_scene::mask_targets)
+                .unwrap_or_default(),
+        );
+    }
+    if let Some(mut extension) = extension {
+        drawing_policy::bind(&mut extension.hosts, &gameplay);
+        anchors::reconcile(&mut extension.hosts, &gameplay);
+        let needs_targets = (0..extension.hosts.host_count())
+            .any(|index| extension.hosts.host(index).grants().entity_highlight);
+        let targets = actors
+            .as_deref()
+            .filter(|_| needs_targets)
+            .map(render_scene::mod_scene::mask_targets)
+            .unwrap_or_default();
+        for index in 0..extension.hosts.host_count() {
+            extension
+                .hosts
+                .host_mut(index)
+                .publish_mask_targets(&targets);
+        }
+        extension.hosts.begin_frame();
+    }
+}
+
+/// Flushes registration transitions before the shared physical-input router.
+fn configure_registration_systems(app: &mut App) {
+    app.add_systems(
+        Update,
+        (registration::install_pending, ApplyDeferred)
+            .chain()
+            .before(begin_mod_frame),
+    );
+}
+
+/// Runs the bounded guest and publishes only its validated presentation output.
+/// Where a mod's network, camera and cue output lands.
+type ModOutputs<'w> = (
+    Option<Res<'w, NetworkHandle<PackApplication>>>,
+    Option<ResMut<'w, client_presentation::camera::CameraSettingsAuthority>>,
+    Option<ResMut<'w, ModCueFeed>>,
+    Option<ResMut<'w, crate::item_use::ModItemUsePolicy>>,
+);
+
+/// Granted commands travel the session-fenced UI packet lane as vanilla command requests.
+fn send_commands(
+    network: Option<&NetworkHandle<PackApplication>>,
+    session: u64,
+    commands: Vec<String>,
+) {
+    let Some(network) = network else { return };
+    for command in commands {
+        if network
+            .send_form_packet(session, protocol::command_request_packet(&command))
+            .is_err()
+        {
+            warn!("Cinnabar extension command dropped: the session is not accepting packets");
+            return;
+        }
+    }
+}
+
+fn camera_rig(rig: mod_host::GameplayCameraRig) -> client_presentation::camera::CameraRig {
+    client_presentation::camera::CameraRig {
+        offset: Vec3::new(rig.offset.x, rig.offset.y, rig.offset.z),
+        roll_radians: rig.roll,
+        fov_delta_degrees: rig.fov_delta,
+    }
+}
+
+/// A mod keybind is unavailable while another UI or an unfocused window owns input.
+fn keybind_allowed(window_focused: bool, input_absorbed: bool) -> bool {
+    window_focused && !input_absorbed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client_ui::ui_runtime::UiRuntime;
+
+    #[test]
+    fn no_mod_path_registers_no_runtime_or_systems() {
+        let mut app = App::new();
+        configure(&mut app, None);
+        assert!(!app.world().contains_resource::<ModRuntime>());
+        assert!(!app.world().contains_resource::<VisualTimeOverride>());
+        // Any extension system would fail here: none of its required resources exist.
+        app.update();
+    }
+
+    #[test]
+    fn keybind_respects_existing_input_authority() {
+        assert!(keybind_allowed(true, false));
+        assert!(!keybind_allowed(false, false));
+        assert!(!keybind_allowed(true, true));
+    }
+
+    #[test]
+    fn configured_sample_drives_the_app_adapter_offline() {
+        if std::env::var_os(COMPONENT_ENV).is_none() {
+            eprintln!(
+                "skipping configured_sample_drives_the_app_adapter_offline: fixture unavailable; requires CINNABAR_MOD_COMPONENT and installed UI carrier (make assets)"
+            );
+            return;
+        }
+        let Some(presentation) = client_ui::test_support::pack_harness::engine_presentation()
+        else {
+            return;
+        };
+        let mut app = App::new();
+        app.insert_resource(UiPresentationResource(presentation))
+            .insert_resource(UiRuntimeResource(UiRuntime::new(1)))
+            .insert_resource(client_state::PlayerRuntime(
+                ::player_state::PlayerState::new(1),
+            ))
+            .insert_resource(ButtonInput::<KeyCode>::default());
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let vanilla = sample_frame(&mut app);
+        configure_from_environment(&mut app);
+        assert!(app.world().contains_resource::<ModRuntime>());
+        app.update();
+        let initial = sample_frame(&mut app);
+        assert_ne!(vanilla, initial);
+
+        app.world_mut().get_mut::<Window>(window).unwrap().focused = false;
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(DEMO_KEY);
+        app.update();
+        assert_eq!(initial, sample_frame(&mut app));
+        app.world_mut().get_mut::<Window>(window).unwrap().focused = true;
+        app.update();
+        assert_ne!(initial, sample_frame(&mut app));
+        assert!(
+            app.world()
+                .resource::<ButtonInput<KeyCode>>()
+                .just_pressed(DEMO_KEY)
+        );
+    }
+
+    /// Renders the adapter's retained state without a window or network session.
+    fn sample_frame(app: &mut App) -> render_model::UiRenderInput {
+        let player_runtime = app
+            .world()
+            .resource::<client_state::PlayerRuntime>()
+            .clone();
+        app.world_mut()
+            .resource_mut::<UiPresentationResource>()
+            .build(
+                &player_runtime,
+                &UiRuntime::new(1),
+                0,
+                [1280, 720],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod time_changer_tests;
+
+pub(super) mod fullbright;
+mod gameplay;
+mod input;
+use crate::interaction_override as interaction;
+mod inventory;
+mod module_observations;
+pub(crate) mod packet_delay;
+mod render;
+mod screens;
+
+mod presentation_facts;

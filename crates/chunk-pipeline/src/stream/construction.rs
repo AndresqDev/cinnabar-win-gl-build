@@ -1,0 +1,557 @@
+use {super::*, client_world::ingestion::WorldStreamError};
+
+impl WorldStream {
+    /// Last sequence whose complete ordered mutation has been applied.
+    #[must_use]
+    pub fn committed_sequence(&self) -> u64 {
+        self.order.committed_sequence()
+    }
+
+    pub fn new(bootstrap: WorldBootstrap) -> Self {
+        Self::new_with_assets(
+            bootstrap,
+            Arc::new(RuntimeAssets::diagnostic()),
+            [0.0, crate::server_position::SAFE_SERVER_HEIGHT, 0.0],
+            None,
+        )
+    }
+    pub fn new_with_assets(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        Self::with_first_sequence_and_recovery(
+            bootstrap,
+            runtime_assets,
+            1,
+            current_position,
+            existing_anchor,
+        )
+    }
+    pub fn new_with_asset_sets(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        entity_assets: impl Into<actor_animation::ActorAnimationCatalog>,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        Self::with_first_sequence_and_asset_sets(
+            bootstrap,
+            runtime_assets,
+            Some(entity_assets.into()),
+            1,
+            current_position,
+            existing_anchor,
+        )
+    }
+    pub(super) fn with_first_sequence_and_recovery(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        first_sequence: u64,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        Self::with_first_sequence_and_asset_sets(
+            bootstrap,
+            runtime_assets,
+            None,
+            first_sequence,
+            current_position,
+            existing_anchor,
+        )
+    }
+    fn with_first_sequence_and_asset_sets(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        entity_assets: Option<actor_animation::ActorAnimationCatalog>,
+        first_sequence: u64,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        let _ = &*workers::WORKERS;
+        warm_block_mutation_facts();
+        let (decode_tx, decode_rx) = bounded(WORK_RESULT_CAPACITY);
+        let (mesh_tx, mesh_rx) = bounded(WORK_RESULT_CAPACITY);
+        let authority = client_world::WorldAuthority::new_with_actor_catalog(
+            bootstrap,
+            runtime_assets,
+            entity_assets,
+            current_position,
+            existing_anchor,
+        );
+        let air_network_id = authority.air_block_id();
+        let publisher_center = Some(
+            authority
+                .resolved_server_position()
+                .position
+                .map(floor_to_i32),
+        );
+        Self {
+            light_diagnostics: light_diagnostics::LightingDiagnostics::new(bootstrap.dimension),
+            mesh_memory: meshing::memory::MeshMemoryBudget::new(authority.runtime_assets()),
+            authority,
+            order: client_world::ingestion::OrderedCommitState::new(first_sequence),
+            block_cracks: block_cracks::BlockCracks::default(),
+            block_entity_visuals: BlockEntityVisualDiagnostics::default(),
+            classifier: BlockClassifier::new(air_network_id),
+            mesh_render_settings: ::meshing::MeshRenderSettings::default(),
+            mesh_render_revision: 0,
+            startup_terrain_announced: true,
+            java_meshing: None,
+            seasonal_foliage: seasonal_foliage::SeasonalFoliage::default(),
+            ingress_dimension: bootstrap.dimension,
+            deferred_ingress: VecDeque::new(),
+            pending_decode: VecDeque::new(),
+            in_flight_decode_jobs: 0,
+            predictions: prediction::DeferredPredictions::default(),
+            decode_tx,
+            decode_rx,
+            biome_records: None,
+            mesh_tx,
+            mesh_rx,
+            lighting: lighting::Lighting::new(),
+            fatal_error: None,
+            revisions: RevisionTracker::default(),
+            applied_mesh_generations: HashMap::new(),
+            withdrawn_meshes: HashSet::new(),
+            actor_block_syncs: actor_block_sync::ActorBlockSyncs::default(),
+            mesh_dependency_masks: HashMap::new(),
+            mesh_jobs: Default::default(),
+            view_forward: None,
+            startup_priority: false,
+            dimension_transfer_priority: None,
+            admitted_mesh_jobs: Arc::new(AtomicUsize::new(0)),
+            mesh_cancellations: HashMap::new(),
+            air_removals: BTreeMap::new(),
+            air_removal_cursor: None,
+            air_requeued: BTreeMap::new(),
+            air_requeue_cursor: None,
+            urgent_mesh_in_flight: HashSet::new(),
+            staged_mesh_completions: VecDeque::new(),
+            staged_mesh_bytes: 0,
+            resident: ColumnSubChunkSet::default(),
+            known_air: ColumnSubChunkSet::default(),
+            loaded_columns: BTreeSet::new(),
+            connectivity: crate::culling::ConnectivityGrid::default(),
+            connectivity_generation: 0,
+            requests: Default::default(),
+            unsent_column_deadlines: BTreeMap::new(),
+            arrival_cohort: None,
+            poll_deadline: None,
+            #[cfg(test)]
+            urgent_pass_budget: URGENT_PASS_BUDGET,
+            frame_deadline: None,
+            poll_budget: commit_budget::WORLD_POLL_BUDGET,
+            polling: false,
+            poll_heavy_guarantee: false,
+            worker_service_due: false,
+            service_yield: None,
+            between_frames_service: false,
+            service_poll_time: Duration::ZERO,
+            retention_due: false,
+            retention_cursor: None,
+            maintenance_items: 0,
+            service_item_max: Duration::ZERO,
+            #[cfg(test)]
+            after_service_item: None,
+            maintenance_guarantee: true,
+            chunk_data_offloaded: false,
+            commit_steps: 0,
+            last_camera_position: [0.0; 3],
+            urgent_work_due: false,
+            publication_allowance: None,
+            mesh_changes: MeshChangeQueue::default(),
+            publisher: cohort::PublisherScope {
+                center: publisher_center,
+                ..Default::default()
+            },
+            chunk_radius: None,
+            requested_radius: None,
+            last_retention_center: None,
+            last_retention_radius: None,
+            local_player_chunk: None,
+            far_terrain: far_summaries::FarTerrainFeed::default(),
+            full_detail: full_detail::FullDetail::default(),
+            near_drawn: near_drawn::NearDrawn::default(),
+            stats: WorldStreamStats::default(),
+        }
+    }
+    pub(super) fn enqueue_decode_job(&mut self, job: DecodeJob) {
+        self.pending_decode.push_back(QueuedDecodeJob {
+            queued_at: Instant::now(),
+            job,
+        });
+    }
+    /// Commits an app-owned inventory or equipment event's position in the shared network
+    /// FIFO without duplicating that event in world-owned state.
+    pub fn commit(&mut self, sequence: u64) -> Result<(), WorldStreamError> {
+        self.commit_with(sequence, Footprint::inventory())
+    }
+
+    /// Commits an app-owned marker that no later event may overtake.
+    pub fn commit_barrier(&mut self, sequence: u64) -> Result<(), WorldStreamError> {
+        self.commit_with(sequence, Footprint::barrier())
+    }
+
+    fn commit_with(&mut self, sequence: u64, footprint: Footprint) -> Result<(), WorldStreamError> {
+        self.order.validate_sequence(sequence)?;
+        let retained_commits = self.authority.retained_commit_count();
+        self.order.admit(sequence, footprint, retained_commits)?;
+        if let Err(error) = self
+            .order
+            .insert_ready(sequence, PreparedWorldEvent::CommitOnly)
+        {
+            self.order.cancel_admission(sequence);
+            return Err(error);
+        }
+        self.apply_ready();
+        Ok(())
+    }
+
+    pub fn submit(&mut self, sequence: u64, event: WorldEvent) -> Result<(), WorldStreamError> {
+        self.submit_with_level_chunk_payload(sequence, event, None)
+    }
+
+    /// Additive zero-copy ingress used by the app's private LevelChunk lane.
+    pub fn submit_level_chunk_bytes(
+        &mut self,
+        sequence: u64,
+        mut event: LevelChunkEvent,
+        payload: Bytes,
+    ) -> Result<(), WorldStreamError> {
+        event.payload.clear();
+        self.submit_with_level_chunk_payload(sequence, WorldEvent::LevelChunk(event), Some(payload))
+    }
+
+    pub(super) fn lane_context(&self) -> LaneContext {
+        LaneContext {
+            local_runtime_id: self.authority.local_player_runtime_id(),
+            local_unique_id: self.authority.local_player_unique_id(),
+            dimension: self.ingress_dimension,
+        }
+    }
+
+    /// Describes the dependencies used by both ingress lookahead and ordered commits.
+    pub fn ingress_footprint(&self, event: &WorldEvent) -> Footprint {
+        client_world::ingestion::classify(event, self.lane_context())
+    }
+
+    /// Records a retained payload, returning whether its lane has credit for further lookahead.
+    pub fn retain_ingress(
+        &mut self,
+        sequence: u64,
+        footprint: Footprint,
+        capacity: usize,
+    ) -> Result<bool, WorldStreamError> {
+        self.order.retain_ingress(
+            sequence,
+            footprint,
+            capacity,
+            self.authority.retained_commit_count(),
+        )
+    }
+
+    /// Reserves light credit before later packets may pass a retained payload.
+    pub fn reserve_ingress_light(&mut self, sequence: u64) -> bool {
+        self.order
+            .reserve_ingress_light(sequence, self.authority.retained_commit_count())
+    }
+
+    /// Reports light headroom including this retained payload's own reserved credit.
+    pub fn retained_ingress_light_capacity(&self, sequence: u64) -> usize {
+        self.order
+            .retained_ingress_light_capacity(sequence, self.authority.retained_commit_count())
+    }
+
+    /// Borrows a retained payload's dependencies without classifying or copying its columns.
+    /// Panics if the sequence does not hold an ingress reservation.
+    pub fn retained_ingress_footprint(&self, sequence: u64) -> &Footprint {
+        self.order.retained_ingress_footprint(sequence)
+    }
+
+    /// Removes a retained payload's reservation immediately before normal submission.
+    pub fn release_ingress(&mut self, sequence: u64) {
+        self.order.release_ingress(sequence);
+    }
+
+    fn submit_with_level_chunk_payload(
+        &mut self,
+        sequence: u64,
+        event: WorldEvent,
+        level_chunk_payload: Option<Bytes>,
+    ) -> Result<(), WorldStreamError> {
+        self.order.validate_sequence(sequence)?;
+        let footprint = self.ingress_footprint(&event);
+        if let WorldEvent::ChangeDimension(change) = &event {
+            self.ingress_dimension = change.dimension;
+        }
+        // Admit against the state the caller's `can_admit` saw: promotion below may commit
+        // events whose retained deltas take the light credit this event was promised.
+        let retained_commits = self.authority.retained_commit_count();
+        if self.defers_preparation(&event, &footprint) {
+            self.order
+                .admit_deferred(sequence, footprint, retained_commits)?;
+            self.deferred_ingress
+                .push_back((sequence, event, level_chunk_payload));
+            self.promote_deferred_ingress();
+            return Ok(());
+        }
+        self.order.admit(sequence, footprint, retained_commits)?;
+        self.promote_deferred_ingress();
+        self.prepare_admitted(sequence, event, level_chunk_payload)
+    }
+
+    /// Reports headroom for this event's lane, independently of unrelated full lanes.
+    pub fn can_admit(&self, event: &WorldEvent) -> bool {
+        if self.remaining_admission_capacity() > 0 {
+            return true;
+        }
+        let footprint = self.ingress_footprint(event);
+        self.can_admit_with_footprint(event, &footprint)
+    }
+
+    /// Reports lane headroom using this event's freshly classified or retained footprint.
+    pub fn can_admit_with_footprint(&self, event: &WorldEvent, footprint: &Footprint) -> bool {
+        if self.remaining_admission_capacity() > 0 {
+            return true;
+        }
+        if footprint.heavy {
+            if self.defers_preparation(event, footprint) {
+                self.order.deferred_capacity() > 0
+            } else {
+                self.order.heavy_capacity() > 0
+            }
+        } else {
+            self.light_admission_capacity() > 0
+        }
+    }
+
+    /// Keeps terrain and definitions in preparation order while session events may pass.
+    fn defers_preparation(&self, event: &WorldEvent, footprint: &Footprint) -> bool {
+        let ordered_preparation = footprint.heavy
+            || footprint.barrier
+            || matches!(event, WorldEvent::SubChunkReplyAdmission(_));
+        ordered_preparation
+            && (!self.deferred_ingress.is_empty()
+                || (footprint.heavy
+                    && (self.order.heavy_capacity() == 0
+                        || (creates_request(event)
+                            && self.requests.queue.len() >= OUTBOUND_REQUEST_CAPACITY))))
+    }
+
+    /// Prepares deferred terrain in wire order while decode and request capacity allow.
+    pub(super) fn promote_deferred_ingress(&mut self) {
+        let mut promoted = 0;
+        while let Some((sequence, event, _)) = self.deferred_ingress.front() {
+            if self.service_yield_requested()
+                || (self.polling && promoted != 0 && self.poll_budget_exhausted())
+            {
+                return;
+            }
+            // Light events reserved their slot when deferred. Heavy terrain waits only on
+            // earlier decodes and sent requests; at the frontier it may exceed the decode bound.
+            let ready = !self.order.is_deferred_heavy(*sequence)
+                || ((self.order.heavy_capacity() > 0 || self.order.is_frontier(*sequence))
+                    && (!creates_request(event)
+                        || self.requests.queue.len() < OUTBOUND_REQUEST_CAPACITY));
+            if !ready {
+                return;
+            }
+            let (sequence, event, payload) = self
+                .deferred_ingress
+                .pop_front()
+                .expect("the front was inspected");
+            self.order.promote_deferred(sequence);
+            let result = self.service_item("ingress_preparation", |stream| {
+                stream.prepare_admitted(sequence, event, payload)
+            });
+            promoted += 1;
+            if let Err(error) = result {
+                self.record_normalization_error(
+                    NormalizationErrorReason::OrderedCompletionRejection,
+                );
+                tracing::debug!(%error, sequence, "deferred world event was rejected");
+            }
+        }
+    }
+
+    fn prepare_admitted(
+        &mut self,
+        sequence: u64,
+        event: WorldEvent,
+        mut level_chunk_payload: Option<Bytes>,
+    ) -> Result<(), WorldStreamError> {
+        if creates_request(&event) {
+            self.requests.queue.reserve(sequence);
+        }
+
+        // Immutable definitions precede later decode snapshots; admitted dimensions retain their range.
+        match &event {
+            WorldEvent::DimensionHeights(heights) => {
+                self.authority.apply_dimension_heights(heights)
+            }
+            WorldEvent::SubChunks(batch) => {
+                self.authority.admit_dimension_range(batch.dimension);
+            }
+            WorldEvent::BlockUpdates(updates) => {
+                for update in updates {
+                    self.authority.admit_dimension_range(update.dimension);
+                }
+            }
+            WorldEvent::SyncedBlockUpdates(updates) => {
+                for update in updates {
+                    self.authority
+                        .admit_dimension_range(update.update.dimension);
+                }
+            }
+            WorldEvent::BlockEntityUpdate(update) => {
+                self.authority.admit_dimension_range(update.dimension);
+            }
+            WorldEvent::ChunkResync(event) => {
+                self.authority.admit_dimension_range(event.dimension);
+            }
+            _ => {}
+        }
+
+        match event {
+            WorldEvent::LevelChunk(
+                mut event @ LevelChunkEvent {
+                    mode: LevelChunkMode::Inline { count },
+                    ..
+                },
+            ) => {
+                let Some(range) = self.authority.admit_dimension_range(event.dimension) else {
+                    self.order.normalize(sequence);
+                    self.order
+                        .insert_ready(sequence, PreparedWorldEvent::NormalizationFailure)?;
+                    self.apply_ready();
+                    return Ok(());
+                };
+                let ids = self.decode_ids(event.dimension);
+                let previous = self
+                    .authority
+                    .terrain()
+                    .chunk(ChunkKey::new(event.dimension, event.x, event.z))
+                    .map(world::Chunk::shared_sub_chunks);
+                self.enqueue_decode_job(DecodeJob::InlineLevelChunk {
+                    sequence,
+                    previous,
+                    payload: level_chunk_payload
+                        .take()
+                        .unwrap_or_else(|| Bytes::from(std::mem::take(&mut event.payload))),
+                    event,
+                    slots: dimension_slots(range),
+                    count,
+                    ids,
+                });
+            }
+            WorldEvent::LevelChunk(
+                mut event @ LevelChunkEvent {
+                    mode: LevelChunkMode::LimitedRequests { .. } | LevelChunkMode::LimitlessRequests,
+                    ..
+                },
+            ) => {
+                let Some(range) = self.authority.admit_dimension_range(event.dimension) else {
+                    self.order.normalize(sequence);
+                    self.order
+                        .insert_ready(sequence, PreparedWorldEvent::NormalizationFailure)?;
+                    self.apply_ready();
+                    return Ok(());
+                };
+                let ids = self.decode_ids(event.dimension);
+                self.enqueue_decode_job(DecodeJob::RequestLevelChunk {
+                    sequence,
+                    payload: level_chunk_payload
+                        .take()
+                        .unwrap_or_else(|| Bytes::from(std::mem::take(&mut event.payload))),
+                    event,
+                    slots: dimension_slots(range),
+                    ids,
+                });
+            }
+            WorldEvent::SubChunks(batch) => {
+                if batch.entries.is_empty() {
+                    self.order.normalize(sequence);
+                    self.order
+                        .insert_ready(sequence, PreparedWorldEvent::NormalizationFailure)?;
+                    self.apply_ready();
+                    return Ok(());
+                }
+                self.record_sub_chunk_reply_admissions(&batch);
+                let ids = self.decode_ids(batch.dimension);
+                self.enqueue_decode_job(DecodeJob::SubChunks {
+                    sequence,
+                    batch,
+                    ids,
+                });
+            }
+            WorldEvent::SubChunkReplyAdmission(admission) => {
+                self.record_sub_chunk_reply_admission(&admission);
+                if let Err(error) = self
+                    .order
+                    .insert_ready(sequence, PreparedWorldEvent::CommitOnly)
+                {
+                    self.order.cancel_admission(sequence);
+                    return Err(error);
+                }
+                self.apply_ready();
+            }
+            WorldEvent::BlockEntityUpdate(event) => {
+                self.enqueue_decode_job(DecodeJob::BlockEntityUpdate { sequence, event });
+            }
+            immediate => {
+                if let Err(error) = self
+                    .order
+                    .insert_ready(sequence, PreparedWorldEvent::Immediate(immediate))
+                {
+                    self.cancel_request_reservation(sequence);
+                    return Err(error);
+                }
+                self.apply_ready();
+            }
+        }
+        Ok(())
+    }
+    /// Headroom for any next event; request-creating terrain defers instead of failing.
+    pub fn remaining_admission_capacity(&self) -> usize {
+        self.order
+            .remaining_admission_capacity(self.authority.retained_commit_count())
+    }
+
+    /// Headroom for light events alone, independent of terrain admission.
+    pub fn light_admission_capacity(&self) -> usize {
+        self.order
+            .light_capacity(self.authority.retained_commit_count())
+    }
+}
+
+fn creates_request(event: &WorldEvent) -> bool {
+    match event {
+        WorldEvent::LevelChunk(LevelChunkEvent {
+            mode: LevelChunkMode::LimitedRequests { highest },
+            ..
+        }) => *highest != 0,
+        WorldEvent::LevelChunk(LevelChunkEvent {
+            mode: LevelChunkMode::LimitlessRequests,
+            ..
+        }) => true,
+        WorldEvent::ChunkResync(event) => event
+            .requested_sub_chunk_ys
+            .as_ref()
+            .map_or(event.requested_sub_chunks != Some(0), |ys| !ys.is_empty()),
+        _ => false,
+    }
+}
+
+/// Builds the pinned liquid facts every block mutation reads, once per process and off the
+/// commit thread. Built on first use instead, they decode the whole pinned block registry,
+/// about 50 ms, inside the frame that commits the session's first block update.
+fn warm_block_mutation_facts() {
+    static WARMING: std::sync::Once = std::sync::Once::new();
+    WARMING.call_once(|| {
+        workers::detach(|| {
+            let _ = assets::facts::liquid::pinned_facts(assets::NetworkIdMode::Sequential, 0);
+        });
+    });
+}

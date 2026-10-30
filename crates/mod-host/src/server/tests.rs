@@ -1,0 +1,1166 @@
+use super::*;
+use server_experience::manifest::{Permission, Scope};
+use std::collections::BTreeSet;
+
+/// Supplies an empty, bound native context for guests that do not observe actors.
+pub(super) fn drawing_context(epoch: u64) -> crate::presentation::Context {
+    crate::presentation::Context {
+        connection: 1,
+        epoch,
+        ..Default::default()
+    }
+}
+
+/// Creates the host import state with worst-case serialized identity and epoch fields.
+fn state() -> State {
+    let mut state = State {
+        scene: Default::default(),
+        scene_revision: mod_render::next_owner(),
+        presentation: crate::runtime::State::new(
+            Default::default(),
+            String::new(),
+            Default::default(),
+        ),
+        session: Arc::default(),
+        limits: StoreLimitsBuilder::new().build(),
+        owner: Principal {
+            session: "\\\"".repeat(MAX_IDENTIFIER_BYTES),
+            bundle: "b".repeat(MAX_IDENTIFIER_BYTES),
+            generation: u64::MAX,
+        },
+        epoch: u64::MAX,
+        capabilities: Capabilities {
+            scope: Scope {
+                permissions: BTreeSet::from([Permission::Ui]),
+                origins: BTreeSet::new(),
+                memory_bytes: 0,
+                gpu_bytes: 0,
+                personal_mods: Default::default(),
+            },
+            assets: BTreeSet::new(),
+            templates: BTreeSet::new(),
+            channels: Vec::new(),
+            actions: BTreeSet::new(),
+            max_message_bytes: MAX_MESSAGE_BYTES as u32,
+        },
+        action: None,
+        gui: None,
+        commands: Vec::new(),
+        bytes: 0,
+        calls: 0,
+        initializing: false,
+        negotiation: None,
+    };
+    state.begin_output().unwrap();
+    state
+}
+
+#[test]
+fn staged_output_at_the_transaction_boundary_round_trips_through_ipc() {
+    let mut state = state();
+    let command = Command::Widget {
+        id: "w".repeat(MAX_IDENTIFIER_BYTES),
+        text: "x".repeat(MAX_WIDGET_TEXT_BYTES),
+    };
+    let widget = |text: usize| Command::Widget {
+        id: "w".repeat(MAX_IDENTIFIER_BYTES),
+        text: "x".repeat(text),
+    };
+    let empty = widget(0);
+    let overhead = serde_json::to_vec(&empty).unwrap().len() + 1;
+    // Each filler leaves room for at least one more command, so the last fits exactly.
+    while MAX_HOST_OUTPUT - state.bytes > overhead + MAX_WIDGET_TEXT_BYTES {
+        let room = MAX_HOST_OUTPUT - state.bytes - 2 * overhead;
+        state
+            .stage(widget(room.min(MAX_WIDGET_TEXT_BYTES)))
+            .unwrap()
+            .unwrap();
+    }
+    let text = "x".repeat(MAX_HOST_OUTPUT - state.bytes - overhead);
+    assert!(text.len() <= MAX_WIDGET_TEXT_BYTES);
+    state
+        .stage(Command::Widget {
+            id: "w".repeat(MAX_IDENTIFIER_BYTES),
+            text,
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.bytes, MAX_HOST_OUTPUT);
+    let count = state.commands.len();
+    assert!(state.stage(empty).unwrap().is_err());
+    assert_eq!(state.commands.len(), count);
+    let transaction = Transaction {
+        owner: state.owner.clone(),
+        epoch: state.epoch,
+        commands: state.commands.clone(),
+    };
+    assert_eq!(
+        serde_json::to_vec(&transaction).unwrap().len(),
+        MAX_HOST_OUTPUT
+    );
+    let mut frame = Vec::new();
+    crate::helper::write_frame(&mut frame, &transaction, MAX_HOST_OUTPUT).unwrap();
+    let decoded: Transaction =
+        crate::helper::read_frame(&mut frame.as_slice(), MAX_HOST_OUTPUT).unwrap();
+    assert_eq!(decoded.owner, transaction.owner);
+    assert_eq!(decoded.commands.len(), count);
+    state.epoch = 0;
+    state.begin_output().unwrap();
+    state.stage(command).unwrap().unwrap();
+    let transaction = Transaction {
+        owner: state.owner,
+        epoch: state.epoch,
+        commands: state.commands,
+    };
+    assert_eq!(serde_json::to_vec(&transaction).unwrap().len(), state.bytes);
+}
+
+/// `items` reads the session the client last sent, and only under the `items` permission.
+#[test]
+fn items_read_the_sent_session_only_when_granted() {
+    use items::Host as _;
+    use server_experience::session_data::{Item, SessionItems};
+    let stone = Item {
+        key: ItemKey {
+            identifier: "minecraft:stone".into(),
+            aux: 0,
+        },
+        icon: SessionData::icon_key(1, 0),
+        name: "Stone".into(),
+        group: None,
+        category: None,
+        max_stack: 64,
+        tags: Vec::new(),
+    };
+    let mut state = state();
+    state.session = Arc::new(
+        SessionItems {
+            revision: 3,
+            items: vec![stone],
+            tags: Default::default(),
+        }
+        .into(),
+    );
+    let key = || items::ItemKey {
+        identifier: "minecraft:stone".into(),
+        aux: 0,
+    };
+    assert!(state.revision().unwrap().is_err());
+    assert!(state.lookup(key()).unwrap().is_err());
+    state
+        .capabilities
+        .scope
+        .permissions
+        .insert(Permission::Items);
+    assert_eq!(state.revision().unwrap(), Ok(3));
+    let found = state.lookup(key()).unwrap().unwrap().unwrap();
+    assert_eq!(found.icon, SessionData::icon_key(1, 0));
+}
+
+/// The 1.1 test guest, as a component built against 1.1.0 imports it: from the package the host
+/// binds, at 1.1.0.
+fn guest_1_1(template: &str) -> String {
+    let source =
+        include_str!("../../../experience-sdk/wit/client/deps/server-experience/capabilities.wit");
+    let package = source
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("package ")
+        .trim_end_matches(';');
+    let (name, _) = package.split_once('@').unwrap();
+    let version = "1.1.0";
+    include_str!("guest_1_1.wat")
+        .replace("$UI", &format!("{name}/ui@{version}"))
+        .replace("$INPUT", &format!("{name}/input@{version}"))
+        .replace("$TEMPLATE_LENGTH", &template.len().to_string())
+        .replace("$TEMPLATE", template)
+}
+
+pub(super) fn owner() -> Principal {
+    Principal {
+        session: "s".into(),
+        bundle: "demo".into(),
+        generation: 1,
+    }
+}
+
+pub(super) fn screen_capabilities(permissions: &[Permission]) -> Capabilities {
+    Capabilities {
+        scope: Scope {
+            permissions: permissions.iter().copied().collect(),
+            origins: BTreeSet::new(),
+            memory_bytes: 1 << 20,
+            gpu_bytes: 0,
+            personal_mods: Default::default(),
+        },
+        assets: BTreeSet::from(["ui/terminal.json".to_owned()]),
+        templates: BTreeSet::from(["ui/terminal.json".to_owned()]),
+        channels: Vec::new(),
+        actions: BTreeSet::from(["demo.pick".to_owned()]),
+        max_message_bytes: MAX_MESSAGE_BYTES as u32,
+    }
+}
+
+fn text(value: &str) -> screen::Value {
+    screen::Value::Text(value.to_owned())
+}
+
+#[test]
+fn component_built_against_1_0_still_links_and_skips_newer_events() {
+    let mut host = BundleHost::launch(
+        include_bytes!("guest_1_0.wat"),
+        owner(),
+        screen_capabilities(&[Permission::Ui, Permission::Input]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    let init = host.take_transaction();
+    assert!(matches!(
+        init.commands.as_slice(),
+        [Command::Widget { id, text }] if id == "status" && text == "ready"
+    ));
+    let message = Event::Message {
+        channel: "demo.items".into(),
+        record: b"[]".to_vec(),
+    };
+    assert!(
+        host.dispatch(&message, 1, &drawing_context(1))
+            .unwrap()
+            .into_transaction()
+            .commands
+            .is_empty()
+    );
+    let epoch = host
+        .dispatch(&Event::Epoch, 2, &drawing_context(2))
+        .unwrap()
+        .into_transaction();
+    assert_eq!(epoch.epoch, 2);
+    assert!(epoch.commands.is_empty());
+    let action = Event::Action {
+        id: "demo.pick".into(),
+        index: Some(1),
+    };
+    assert!(
+        host.dispatch(&action, 2, &drawing_context(2))
+            .unwrap()
+            .into_transaction()
+            .commands
+            .is_empty()
+    );
+}
+
+#[test]
+fn modal_calls_and_callbacks_cross_the_1_1_component_boundary() {
+    let mut host = BundleHost::launch(
+        guest_1_1("ui/terminal.json").as_bytes(),
+        owner(),
+        screen_capabilities(&[Permission::ModalUi, Permission::Input]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.take_transaction().commands.as_slice(),
+        [Command::Screen { template: Some(template) }] if template == "ui/terminal.json"
+    ));
+    let rows = br##"[{"#name":{"type":"text","value":"Stone"}}]"##.to_vec();
+    let message = Event::Message {
+        channel: "demo.items".into(),
+        record: rows,
+    };
+    match host
+        .dispatch(&message, 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [Command::Collection { name, rows }] => {
+            assert_eq!(name, "items");
+            assert_eq!(rows[0]["#name"], text("Stone"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let pick = Event::Action {
+        id: "demo.pick".into(),
+        index: Some(3),
+    };
+    assert!(matches!(
+        host.dispatch(&pick, 1, &drawing_context(1)).unwrap().into_transaction().commands.as_slice(),
+        [Command::Value { name, value: screen::Value::Integer(3) }] if name == "#row"
+    ));
+    let undeclared = Event::Action {
+        id: "demo.other".into(),
+        index: None,
+    };
+    assert!(host.dispatch(&undeclared, 1, &drawing_context(1)).is_err());
+    let epoch = host
+        .dispatch(&Event::Epoch, 5, &drawing_context(5))
+        .unwrap()
+        .into_transaction();
+    assert_eq!(epoch.epoch, 5);
+    assert!(matches!(
+        epoch.commands.as_slice(),
+        [Command::Screen { template: None }]
+    ));
+    // 1.2's events skip a 1.1 component.
+    let secondary = Event::SecondaryAction {
+        id: "demo.pick".into(),
+        index: Some(1),
+    };
+    for event in [resized(320.0), typed("demo.pick", "iron"), secondary] {
+        assert!(
+            host.dispatch(&event, 5, &drawing_context(5))
+                .unwrap()
+                .into_transaction()
+                .commands
+                .is_empty()
+        );
+    }
+    let malformed = Event::Message {
+        channel: "demo.items".into(),
+        record: b"[{\"name\":1}]".to_vec(),
+    };
+    assert!(
+        host.dispatch(&malformed, 5, &drawing_context(5))
+            .unwrap()
+            .into_transaction()
+            .commands
+            .is_empty()
+    );
+}
+
+#[test]
+fn modal_screens_need_their_grants_and_an_indexed_template() {
+    let mut unindexed = BundleHost::launch(
+        guest_1_1("ui/other.json").as_bytes(),
+        owner(),
+        screen_capabilities(&[Permission::ModalUi, Permission::Input]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    assert!(unindexed.take_transaction().commands.is_empty());
+    let mut denied = BundleHost::launch(
+        guest_1_1("ui/terminal.json").as_bytes(),
+        owner(),
+        screen_capabilities(&[Permission::Ui]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    assert!(denied.take_transaction().commands.is_empty());
+    let pick = Event::Action {
+        id: "demo.pick".into(),
+        index: None,
+    };
+    assert!(denied.dispatch(&pick, 1, &drawing_context(1)).is_err());
+}
+
+/// Builds the terminal fixture with its real SDK bindings for host callback tests.
+fn terminal_component() -> Vec<u8> {
+    guests::component("experience-terminal-client")
+}
+
+/// A list record the size of SP3's terminal, about 22 KB of wire JSON in 144 records of an id, a
+/// count and a display name, decodes through the SDK and binds within one callback's
+/// `CALLBACK_FUEL`; at the earlier 100,000 it trapped and took the helper with it.
+#[test]
+fn terminal_sized_list_record_dispatches_within_callback_fuel() {
+    let item = |i: i64| {
+        format!(
+            r#"{{"type":"record","value":[{{"type":"text","value":"minecraft:polished_blackstone_brick_{i}"}},{{"type":"integer","value":{}}},{{"type":"text","value":"Polished Blackstone Brick {i}"}}]}}"#,
+            i * 37
+        )
+    };
+    let items: Vec<String> = (0..144).map(item).collect();
+    let record = format!(r#"[{{"type":"list","value":[{}]}}]"#, items.join(","));
+    assert!(
+        (20_000..=MAX_MESSAGE_BYTES).contains(&record.len()),
+        "{} bytes",
+        record.len()
+    );
+    let mut capabilities = screen_capabilities(&[Permission::ModalUi]);
+    capabilities.scope.memory_bytes = MAX_GUEST_MEMORY;
+    let mut host = BundleHost::launch(
+        &terminal_component(),
+        owner(),
+        capabilities,
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    host.take_transaction();
+    let message = Event::Message {
+        channel: "benergistics.items".into(),
+        record: record.into_bytes(),
+    };
+    match host
+        .dispatch(&message, 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [Command::Collection { name, rows }] => {
+            assert_eq!(name, "items");
+            assert_eq!(rows.len(), 144);
+            assert_eq!(rows[143]["#count"], screen::Value::Integer(143 * 37));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A launched terminal guest with the grants its callbacks use.
+fn terminal() -> BundleHost {
+    let mut capabilities = screen_capabilities(&[Permission::ModalUi]);
+    capabilities.scope.memory_bytes = MAX_GUEST_MEMORY;
+    let mut host = BundleHost::launch(
+        &terminal_component(),
+        owner(),
+        capabilities,
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    host.take_transaction();
+    host
+}
+
+/// An empty record on `channel`, which selects the terminal guest's behavior.
+pub(super) fn on(channel: &str) -> Event {
+    Event::Message {
+        channel: channel.into(),
+        record: b"[]".to_vec(),
+    }
+}
+
+/// The count the terminal guest binds for a `terminal.count` call.
+fn count(host: &mut BundleHost) -> i64 {
+    match host
+        .dispatch(&on("terminal.count"), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [Command::Collection { name, rows }] if name == "count" => match rows[0]["#count"] {
+            screen::Value::Integer(count) => count,
+            ref other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A trap fails only its own call, publishing nothing: the next call runs on a fresh instance,
+/// whose guest memory starts over.
+#[test]
+fn a_trapped_dispatch_fails_alone_and_the_next_runs_on_a_fresh_instance() {
+    let mut host = terminal();
+    assert_eq!((count(&mut host), count(&mut host)), (1, 2));
+    let error = host
+        .dispatch(&on("terminal.panic"), 1, &drawing_context(1))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::UnreachableCodeReached)
+        ),
+        "{error:?}"
+    );
+    assert!(host.take_transaction().commands.is_empty());
+    assert_eq!(count(&mut host), 1);
+}
+
+/// Restart messages belong to the fresh initializer, without replaying presentation or
+/// publishing the failed callback's staged send, even when no further event arrives.
+#[test]
+fn restarted_guest_publishes_initialization_messages_without_another_callback() {
+    use server_experience::wire::{Channel, Direction, Field, Scalar};
+
+    let mut capabilities = screen_capabilities(&[Permission::Ui, Permission::Messaging]);
+    capabilities.channels.push(Channel {
+        id: "demo.request".into(),
+        schema: 1,
+        direction: Direction::ToServer,
+        fields: vec![Field::Bool {}],
+    });
+    let mut host = BundleHost::launch(
+        include_bytes!("guest_recovery.wat"),
+        owner(),
+        capabilities,
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    assert_eq!(host.take_transaction().commands.len(), 2);
+    for epoch in 2..=3 {
+        assert!(
+            host.dispatch(&on("demo.fail"), epoch, &drawing_context(epoch))
+                .is_err()
+        );
+        let recovery = host.take_transaction();
+        assert_eq!(recovery.owner, owner());
+        assert_eq!(recovery.epoch, epoch);
+        assert!(
+            matches!(recovery.commands.as_slice(), [Command::Send { channel, schema: 1, record }]
+                if channel == "demo.request" && record == &[Scalar::Bool(false)]),
+            "restart must publish only the fresh initializer's message: {recovery:?}"
+        );
+        assert!(host.take_transaction().commands.is_empty());
+    }
+}
+
+/// Running out of fuel is a trap like any other: reported, and survived.
+#[test]
+fn fuel_exhaustion_fails_its_call_and_the_guest_restarts() {
+    let mut host = terminal();
+    assert_eq!(count(&mut host), 1);
+    let error = host
+        .dispatch(&on("terminal.spin"), 1, &drawing_context(1))
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<wasmtime::Trap>(),
+            Some(wasmtime::Trap::OutOfFuel)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(count(&mut host), 1);
+}
+
+/// Each callback reports the fuel it consumed, a failed one included: all of it when it ran out.
+#[test]
+fn the_fuel_each_callback_used_is_reported() {
+    let mut host = terminal();
+    assert!(host.last_fuel_used() > 0, "init");
+    count(&mut host);
+    let used = host.last_fuel_used();
+    assert!(0 < used && used < CALLBACK_FUEL, "{used}");
+    host.dispatch(&on("terminal.spin"), 1, &drawing_context(1))
+        .unwrap_err();
+    assert_eq!(host.last_fuel_used(), CALLBACK_FUEL);
+}
+
+/// A modal size of `width` × 240 GUI units at GUI scale 2.
+fn resized(width: f64) -> Event {
+    Event::Resized {
+        size: screen::GuiSize {
+            width,
+            height: 240.0,
+            scale: 2.0,
+        },
+    }
+}
+
+/// Typed text in the modal's edit box `control`.
+pub(super) fn typed(control: &str, text: &str) -> Event {
+    Event::Text {
+        control: control.into(),
+        text: text.into(),
+    }
+}
+
+/// The terminal guest with `input` and its search box declared as an action.
+fn searching_terminal() -> BundleHost {
+    let mut capabilities = screen_capabilities(&[Permission::ModalUi, Permission::Input]);
+    capabilities.scope.memory_bytes = MAX_GUEST_MEMORY;
+    capabilities.actions.insert("terminal.search".to_owned());
+    let mut host = BundleHost::launch(
+        &terminal_component(),
+        owner(),
+        capabilities,
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    host.take_transaction();
+    host
+}
+
+/// `modal-resized` gets the modal's size, which `ui.modal-size` reads back in that callback and
+/// in later ones, until the host says the modal closed.
+#[test]
+fn modal_resized_reports_the_size_modal_size_reads() {
+    let mut host = searching_terminal();
+    let size = [320.0, 240.0, 2.0];
+    match host
+        .dispatch(&resized(320.0), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [
+            Command::Value {
+                name: given,
+                value: screen::Value::Numbers(given_size),
+            },
+            Command::Value {
+                name: read,
+                value: screen::Value::Numbers(read_size),
+            },
+        ] => {
+            assert_eq!((given.as_str(), read.as_str()), ("#size", "#read"));
+            assert_eq!(
+                (given_size.as_slice(), read_size.as_slice()),
+                (&size[..], &size[..])
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    host.set_modal_size(None);
+    match host
+        .dispatch(&on("terminal.size"), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [
+            Command::Value {
+                name,
+                value: screen::Value::Bool(false),
+            },
+        ] => {
+            assert_eq!(name, "#read");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `text-changed` delivers a declared edit box's text, and `ui.set-text` stages the guest's
+/// answer for a box; an undeclared box's text is refused before the guest runs.
+#[test]
+fn text_changed_reaches_the_guest_and_set_text_stages_text() {
+    let mut host = searching_terminal();
+    match host
+        .dispatch(&typed("terminal.search", "iron"), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [Command::Text { control, text }] => {
+            assert_eq!((control.as_str(), text.as_str()), ("terminal.echo", "IRON"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        host.dispatch(&typed("terminal.other", "iron"), 1, &drawing_context(1))
+            .is_err()
+    );
+    assert!(typed("terminal.search", "tab\t").check().is_err());
+    let long = "x".repeat(MAX_EDIT_TEXT_BYTES + 1);
+    assert!(typed("terminal.search", &long).check().is_err());
+}
+
+/// A secondary press (a right click) on a declared action reaches `secondary-action` with its
+/// row, and an undeclared one is refused before the guest runs.
+#[test]
+fn secondary_presses_reach_secondary_action() {
+    let mut host = searching_terminal();
+    let press = |id: &str| Event::SecondaryAction {
+        id: id.into(),
+        index: Some(3),
+    };
+    match host
+        .dispatch(&press("terminal.search"), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [
+            Command::Value {
+                name,
+                value: screen::Value::Text(text),
+            },
+        ] => {
+            assert_eq!(
+                (name.as_str(), text.as_str()),
+                ("#secondary", "terminal.search 3")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        host.dispatch(&press("terminal.other"), 1, &drawing_context(1))
+            .is_err()
+    );
+}
+
+/// `shift-changed` tells a guest granted `input` whether Shift is held; one without `input` is
+/// refused before it runs.
+#[test]
+fn shift_changed_reaches_the_guest() {
+    let mut host = searching_terminal();
+    match host
+        .dispatch(&Event::Shift { held: true }, 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [
+            Command::Value {
+                name,
+                value: screen::Value::Bool(held),
+            },
+        ] => {
+            assert_eq!((name.as_str(), *held), ("#shift", true));
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut capabilities = screen_capabilities(&[Permission::ModalUi]);
+    capabilities.scope.memory_bytes = MAX_GUEST_MEMORY;
+    let mut blind = BundleHost::launch(
+        &terminal_component(),
+        owner(),
+        capabilities,
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    blind.take_transaction();
+    assert!(
+        blind
+            .dispatch(&Event::Shift { held: true }, 1, &drawing_context(1))
+            .is_err()
+    );
+}
+
+/// `scroll-changed` delivers a declared scroll view's range; an undeclared view, or a range
+/// that is not finite and non-negative, is refused before the guest runs, and a component
+/// built before 1.3 never sees it.
+#[test]
+fn scroll_changed_reaches_the_guest() {
+    let mut host = searching_terminal();
+    let scrolled = |view: &str, offset: f64| Event::Scrolled {
+        view: view.into(),
+        range: screen::ScrollRange {
+            offset,
+            viewport: 72.0,
+            content: 1800.0,
+        },
+    };
+    match host
+        .dispatch(&scrolled("terminal.search", 36.0), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction()
+        .commands
+        .as_slice()
+    {
+        [
+            Command::Value {
+                name: view_name,
+                value: screen::Value::Text(view),
+            },
+            Command::Value {
+                name: range_name,
+                value: screen::Value::Numbers(range),
+            },
+        ] => {
+            assert_eq!(
+                (view_name.as_str(), view.as_str(), range_name.as_str()),
+                ("#scrolled", "terminal.search", "#scroll")
+            );
+            assert_eq!(range.as_slice(), &[36.0, 72.0, 1800.0]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        host.dispatch(&scrolled("terminal.other", 0.0), 1, &drawing_context(1))
+            .is_err()
+    );
+    assert!(scrolled("terminal.search", f64::NAN).check().is_err());
+    assert!(scrolled("terminal.search", -1.0).check().is_err());
+
+    let mut old = BundleHost::launch(
+        guest_1_1("ui/terminal.json").as_bytes(),
+        owner(),
+        {
+            let mut capabilities = screen_capabilities(&[Permission::ModalUi, Permission::Input]);
+            capabilities.actions.insert("terminal.search".to_owned());
+            capabilities
+        },
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    old.take_transaction();
+    let skipped = old
+        .dispatch(&scrolled("terminal.search", 0.0), 1, &drawing_context(1))
+        .unwrap()
+        .into_transaction();
+    assert!(skipped.commands.is_empty());
+}
+
+/// `name` keyed by this worktree. Cargo judges freshness by modification time alone and its
+/// dep-info paths are relative to the workspace, so two worktrees building into one target would
+/// silently reuse each other's guests; keying the guests' target directory by worktree keeps
+/// each worktree's guests its own.
+fn worktree_dir(name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    env!("CARGO_MANIFEST_DIR").hash(&mut hasher);
+    format!("{name}-{:016x}", hasher.finish())
+}
+
+/// The bundle imports call the same host that personal mods use, with bundle-scoped grants.
+#[test]
+fn client_part_drawing_and_sky_commit_together_and_revoke() {
+    use crate::runtime::cinnabar::{extension::environment, world_draw::drawing as draw};
+    use draw::Host as _;
+    use environment::Host as _;
+    let mut state = state();
+    assert!(
+        state
+            .presentation
+            .create_geometry(draw::GeometrySpec::Triangles(draw::Mesh {
+                vertices: Vec::new(),
+                indices: Vec::new()
+            }))
+            .unwrap()
+            .is_err()
+    );
+    state
+        .capabilities
+        .scope
+        .permissions
+        .insert(Permission::WorldDraw);
+    state.presentation.grants = drawing_grants(&state.capabilities);
+    let mesh = draw::Mesh {
+        vertices: [(0., 0., 0.), (1., 0., 0.), (0., 1., 0.)]
+            .map(|position| draw::Vertex {
+                position,
+                color: (1., 1., 1., 1.),
+                uv: (0., 0.),
+                data: (0., 0., 0., 0.),
+            })
+            .to_vec(),
+        indices: vec![0, 1, 2],
+    };
+    state
+        .presentation
+        .create_geometry(draw::GeometrySpec::Triangles(mesh))
+        .unwrap()
+        .unwrap();
+    state
+        .presentation
+        .set_time_override(Some(18_000))
+        .unwrap()
+        .unwrap();
+    assert!(
+        state
+            .presentation
+            .presentation_output()
+            .drawing
+            .geometry
+            .is_empty()
+    );
+    state.presentation.commit_presentation();
+    assert_eq!(
+        state
+            .presentation
+            .presentation_output()
+            .drawing
+            .geometry
+            .len(),
+        1
+    );
+    assert_eq!(state.presentation.presentation_output().time, Some(18_000));
+    state.presentation.reset_presentation();
+    assert!(
+        state
+            .presentation
+            .presentation_output()
+            .drawing
+            .geometry
+            .is_empty()
+    );
+    assert_eq!(state.presentation.presentation_output().time, None);
+}
+
+#[test]
+fn signed_asset_reads_deny_foreign_files_and_charge_the_callback() {
+    use crate::runtime::cinnabar::world_draw::assets::Host as _;
+    let mut state = state();
+    state.presentation.asset_files.insert(
+        "models/planet.json".into(),
+        vec![1; mod_api::MAX_DRAW_MUTATION_BYTES],
+    );
+    assert!(
+        state
+            .presentation
+            .read("models/planet.json".into())
+            .unwrap()
+            .is_err()
+    );
+    state.presentation.grants.world_draw = true;
+    assert!(
+        state
+            .presentation
+            .read("models/other.json".into())
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        state
+            .presentation
+            .read("models/planet.json".into())
+            .unwrap()
+            .unwrap()
+            .len(),
+        mod_api::MAX_DRAW_MUTATION_BYTES
+    );
+    assert!(
+        state
+            .presentation
+            .read("models/planet.json".into())
+            .unwrap()
+            .is_err()
+    );
+    state.presentation.begin_presentation();
+    assert!(
+        state
+            .presentation
+            .read("models/planet.json".into())
+            .unwrap()
+            .is_ok()
+    );
+    state.presentation.begin_presentation();
+    state.presentation.asset_files.insert(
+        "models/stream.bin".into(),
+        vec![7; mod_api::MAX_DRAW_MUTATION_BYTES + 8],
+    );
+    assert_eq!(
+        state
+            .presentation
+            .length("models/stream.bin".into())
+            .unwrap()
+            .unwrap(),
+        (mod_api::MAX_DRAW_MUTATION_BYTES + 8) as u64
+    );
+    assert_eq!(
+        state
+            .presentation
+            .read_range(
+                "models/stream.bin".into(),
+                mod_api::MAX_DRAW_MUTATION_BYTES as u64,
+                8
+            )
+            .unwrap()
+            .unwrap(),
+        vec![7; 8]
+    );
+    assert!(
+        state
+            .presentation
+            .read_range("models/stream.bin".into(), u64::MAX, 8)
+            .unwrap()
+            .is_err()
+    );
+}
+
+/// Rebuilt SDKs may add imports without making older compiled client parts unusable.
+#[test]
+fn a_client_part_built_against_1_3_keeps_its_existing_callbacks() {
+    let guest = guest_1_1("ui/terminal.json").replace("@1.1.0", "@1.3.0");
+    let mut host = BundleHost::launch(
+        guest.as_bytes(),
+        owner(),
+        screen_capabilities(&[Permission::ModalUi, Permission::Input]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    let initial = host.take_transaction();
+    assert!(!initial.commands.is_empty());
+    assert!(
+        host.dispatch(&Event::Frame, 1, &drawing_context(1))
+            .unwrap()
+            .into_transaction()
+            .commands
+            .is_empty()
+    );
+    host.dispatch(&Event::Epoch, 2, &drawing_context(2))
+        .unwrap()
+        .into_transaction();
+}
+
+/// Exercises the real canonical import and the optional frame callback through Wasmtime.
+#[test]
+fn canonical_drawing_import_reports_only_bundle_grants() {
+    for (permissions, expected) in [
+        (vec![], 0),
+        (vec![Permission::WorldDraw, Permission::RenderMaterial], 17),
+    ] {
+        let guest = format!(
+            r#"(component
+            (import "cinnabar:world-draw/drawing@0.2.0" (instance $drawing
+                (type $flags (flags "world-draw" "entity-observe" "entity-highlight" "render-through-walls" "render-material" "render-post"))
+                (export "permissions" (type $permissions (eq $flags)))
+                (export "capabilities" (func (result $permissions)))))
+            (alias export $drawing "capabilities" (func $capabilities))
+            (core func $capabilities-low (canon lower (func $capabilities)))
+            (core module $memory (memory (export "memory") 1) (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096))
+            (core instance $mem (instantiate $memory))
+            (alias core export $mem "memory" (core memory $memory-ref))
+            (alias core export $mem "realloc" (core func $realloc))
+            (core module $code
+                (import "host" "capabilities" (func $capabilities (result i32)))
+                (func (export "init") call $capabilities i32.const {expected} i32.ne if unreachable end)
+                (func (export "frame") call $capabilities i32.const {expected} i32.ne if unreachable end)
+                (func (export "dispatch") (param i32 i32 i32 i32)))
+            (core instance $host (export "capabilities" (func $capabilities-low)))
+            (core instance $run (instantiate $code (with "host" (instance $host))))
+            (func (export "init") (canon lift (core func $run "init")))
+            (func (export "frame") (canon lift (core func $run "frame")))
+            (func (export "dispatch") (param "channel" string) (param "record-json" (list u8)) (canon lift (core func $run "dispatch") (memory $memory-ref) (realloc $realloc))))"#
+        );
+        let mut host = BundleHost::launch(
+            guest.as_bytes(),
+            owner(),
+            screen_capabilities(&permissions),
+            1,
+            Default::default(),
+            drawing_context(1),
+        )
+        .unwrap();
+        host.dispatch(&Event::Frame, 1, &drawing_context(1))
+            .unwrap()
+            .into_transaction();
+    }
+}
+
+/// The epoch export resolves both observation and highlighting imports after its reset.
+#[test]
+fn epoch_callback_observes_entities_and_resolves_mask_targets() {
+    let guest = r#"(component
+        (import "cinnabar:world-draw/drawing@0.2.0" (instance $drawing
+            (type $handle (record (field "owner" u64) (field "generation" u64) (field "slot" u64)))
+            (export "handle" (type $h (eq $handle)))
+            (type $code (enum "denied" "invalid" "budget-exceeded" "stale-handle" "unsupported" "in-use"))
+            (export "error-code" (type $c (eq $code)))
+            (type $error (record (field "code" $c) (field "detail" string)))
+            (export "draw-error" (type $e (eq $error)))
+            (type $observed (record (field "entity" $h) (field "runtime-id" u64)))
+            (export "observed-entity" (type $o (eq $observed)))
+            (export "observe-entities" (func (result (result (list $o) (error $e)))))))
+        (alias export $drawing "handle" (type $h))
+        (alias export $drawing "draw-error" (type $e))
+        (import "cinnabar:world-draw/masks@0.2.0" (instance $masks
+            (export "handle" (type (eq $h)))
+            (export "draw-error" (type (eq $e)))
+            (export "entity" (func (param "runtime-id" u64) (result (result $h (error $e)))))))
+        (core module $memory
+            (memory (export "memory") 1)
+            (global $next (mut i32) (i32.const 4096))
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                (local $old i32) global.get $next local.tee $old local.get 3 i32.add global.set $next local.get $old))
+        (core instance $mem (instantiate $memory))
+        (alias core export $mem "memory" (core memory $memory-ref))
+        (alias core export $mem "realloc" (core func $realloc))
+        (alias export $drawing "observe-entities" (func $observe))
+        (alias export $masks "entity" (func $entity))
+        (core func $observe-low (canon lower (func $observe) (memory $memory-ref) (realloc $realloc)))
+        (core func $entity-low (canon lower (func $entity) (memory $memory-ref) (realloc $realloc)))
+        (core module $code
+            (import "host" "observe" (func $observe (param i32)))
+            (import "host" "entity" (func $entity (param i64 i32)))
+            (import "host" "memory" (memory 1))
+            (func (export "init"))
+            (func (export "action") (param i32 i32 i32 i32))
+            (func (export "epoch")
+                i32.const 128 call $observe
+                i32.const 128 i32.load if unreachable end
+                i32.const 136 i32.load i32.const 1 i32.ne if unreachable end
+                i64.const 42 i32.const 256 call $entity
+                i32.const 256 i32.load if unreachable end)
+            (func (export "dispatch") (param i32 i32 i32 i32)))
+        (core instance $host
+            (export "observe" (func $observe-low)) (export "entity" (func $entity-low)) (export "memory" (memory $memory-ref)))
+        (core instance $run (instantiate $code (with "host" (instance $host))))
+        (func (export "init") (canon lift (core func $run "init")))
+        (func (export "epoch") (canon lift (core func $run "epoch")))
+        (func (export "action") (param "id" string) (param "index" (option u32))
+            (canon lift (core func $run "action") (memory $memory-ref) (realloc $realloc)))
+        (func (export "dispatch") (param "channel" string) (param "record-json" (list u8))
+            (canon lift (core func $run "dispatch") (memory $memory-ref) (realloc $realloc))))"#;
+    let mut host = BundleHost::launch(
+        guest.as_bytes(),
+        owner(),
+        screen_capabilities(&[
+            Permission::WorldDraw,
+            Permission::EntityObserve,
+            Permission::EntityHighlight,
+            Permission::RenderThroughWalls,
+        ]),
+        1,
+        Default::default(),
+        drawing_context(1),
+    )
+    .unwrap();
+    let actor = mod_render::retained::EntityKey {
+        session: 1,
+        dimension: 0,
+        runtime_id: 42,
+        spawn_revision: 3,
+    };
+    let target = mod_api::drawing::MaskEntity {
+        connection: 1,
+        dimension: 0,
+        runtime_id: 42,
+        spawn_revision: 3,
+    };
+    for _ in 0..2 {
+        let context = crate::presentation::Context {
+            epoch: 2,
+            connection: 1,
+            dimension: 0,
+            candidates: vec![actor],
+            live: vec![actor],
+            targets: vec![(target, 3)],
+            blocks: Vec::new(),
+        };
+        host.dispatch(&Event::Epoch, 2, &context)
+            .unwrap()
+            .into_transaction();
+        assert_eq!(host.drawing_references(), [actor]);
+    }
+    let first = host.take_presentation(1).unwrap().unwrap();
+    assert!(first.bytes.len() < first.total as usize);
+    let mut context = drawing_context(2);
+    context.live.push(actor);
+    host.dispatch(&Event::Frame, 2, &context)
+        .unwrap()
+        .into_transaction();
+    assert_eq!(host.drawing_references(), [actor]);
+    let next = host.take_presentation(1).unwrap().unwrap();
+    assert_eq!(first.revision, next.revision);
+    assert_eq!(next.offset, 1);
+    context.live.clear();
+    host.dispatch(&Event::Frame, 2, &context)
+        .unwrap()
+        .into_transaction();
+    assert!(host.drawing_references().is_empty());
+}
+
+mod binding;
+mod guests;
+mod scene;
+mod space;

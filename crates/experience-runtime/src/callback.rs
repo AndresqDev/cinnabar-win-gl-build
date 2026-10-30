@@ -1,0 +1,702 @@
+//! One callback: a fresh instance of the guest runs one export against the request's snapshot.
+//! What the guest stages through its borrowed `callback` becomes the outcome, or nothing does.
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::sync::Arc;
+
+use anyhow::{Result, bail};
+use serde::Serialize;
+use wasmtime::{Engine, Trap};
+
+use crate::hex::{self, HexError};
+use crate::host::cinnabar::experience_server::types::{
+    self as wit, CallbackInfo, ChangeCause, GuestError, ValueNode, WorldError,
+};
+use crate::host::{HostState, LimitExceeded};
+use crate::limits::{
+    CALLBACK_DEADLINE, CALLBACK_FUEL, MAX_BLOCK_DATA_BYTES, MAX_CLIENT_SEND_BYTES,
+    MAX_CLIENT_SENDS, MAX_HOST_CALLS, MAX_STAGED_DATA_BYTES, MAX_STAGED_OPS, MAX_TELL_BYTES,
+    MAX_TELLS,
+};
+use crate::load::{Catalog, Loaded, holds};
+use crate::protocol::{
+    self, BlockPos, BlockState, FailKind, Inventory, Network, Op, Outcome, Request, Scalar,
+    StateDef, StateValue, StateValues, bounded_reason,
+};
+use crate::value::{self, Refusal};
+use prepare::{player_id, prepare};
+
+/// The one block id outside its own namespace that an Experience may place.
+const AIR: &str = "minecraft:air";
+/// Starts a Minecraft formatting code, so tells may not contain it.
+const FORMATTING_PREFIX: char = '§';
+
+/// Runs `request` on a fresh instance of `loaded` under the callback fuel, deadline and store
+/// limits. The guest sees the snapshot through a borrowed `callback`, and its staged ops commit
+/// only if the export returns `ok`. A request that is not a well-formed callback runs nothing
+/// and is rejected.
+pub fn run(engine: &Engine, loaded: &Loaded, request: &Request) -> Outcome {
+    run_metered(engine, loaded, request).0
+}
+
+/// [`run`], which also returns the fuel that the callback consumed.
+pub fn run_metered(engine: &Engine, loaded: &Loaded, request: &Request) -> (Outcome, u64) {
+    let (res, export) = match prepare(&loaded.catalog, request) {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            let reason = format!("malformed callback request: {reason}");
+            return (Outcome::Rejected { reason }, 0);
+        }
+    };
+    if let Some(missing) = invoke::unsupported(&loaded.pre, &export, res.focus.is_some()) {
+        let reason = format!(
+            "malformed callback request: api {} has {missing}",
+            loaded.manifest.api
+        );
+        return (Outcome::Rejected { reason }, 0);
+    }
+    let id = &loaded.manifest.id;
+    let mut store = match HostState::store(engine, id, CALLBACK_FUEL, CALLBACK_DEADLINE) {
+        Ok(store) => store,
+        Err(error) => return (failed(&error), 0),
+    };
+    let outcome = match invoke::invoke(&mut store, loaded, res, &export) {
+        Ok((Ok(()), ops)) => Outcome::Committed { ops },
+        Ok((Err(GuestError::Rejected(reason) | GuestError::Failed(reason)), _)) => {
+            Outcome::Rejected {
+                reason: bounded_reason(reason),
+            }
+        }
+        Err(error) => failed(&error),
+    };
+    // The store meters fuel, so it always reports what is left.
+    let fuel = store.get_fuel().map_or(0, |left| CALLBACK_FUEL - left);
+    (outcome, fuel)
+}
+
+/// The outcome of a callback that trapped or could not start: fuel, the deadline and limits
+/// each have their own kind, and anything else is a trap. The reason is the root cause alone,
+/// which stays short whatever wraps it.
+fn failed(error: &anyhow::Error) -> Outcome {
+    let kind = match error.downcast_ref::<Trap>() {
+        Some(Trap::OutOfFuel) => FailKind::Fuel,
+        Some(Trap::Interrupt) => FailKind::Deadline,
+        _ if error.is::<LimitExceeded>() => FailKind::Limit,
+        _ => FailKind::Trap,
+    };
+    Outcome::Failed {
+        kind,
+        reason: error.root_cause().to_string(),
+    }
+}
+
+/// The host value behind the guest's `callback` handle: what one callback may see, what it has
+/// staged, and how much of its caps it has used.
+pub struct CallbackRes {
+    info: CallbackInfo,
+    context: Option<protocol::WorldContext>,
+    simulation: Option<protocol::SimulationContext>,
+    actor: Option<String>,
+    player_store: bool,
+    /// The actor's focus, which a client message or an epoch may have; its snapshot is the one
+    /// its anchor would have.
+    focus: Option<BlockPos>,
+    /// Whether a break callback harvests, so that drops its blocks leave to the guest are due.
+    harvest: bool,
+    /// Whether this is an interaction, whose click the guest may pass on.
+    interact: bool,
+    /// This Experience's blocks and items and the server's items.
+    own: Arc<Catalog>,
+    snapshot: Snapshot,
+    /// The anchor's network when the anchor is a member, as the adapter snapshotted it.
+    network: Option<Network>,
+    /// The actor's inventory with the staged slots applied; none without an actor.
+    inventory: Option<Inventory>,
+    /// The containers in reach of the anchor and its network, with the staged slots applied.
+    containers: containers::Reachable,
+    /// In the order they commit. A position has at most one `SetBlockData`, and it comes after
+    /// any `SetBlock` there.
+    ops: Vec<Op>,
+    /// Successful spawn reservations, unaffected by coalesced block writes or despawns.
+    spawned_entities: u64,
+    /// Bytes this Experience may still add to its block data.
+    budget: u64,
+    /// Bytes the staged writes add to this Experience's block data; negative when they free
+    /// more than they add.
+    added: i64,
+    /// Bytes of data in the staged `SetBlockData` ops.
+    staged_data: usize,
+    host_calls: usize,
+    tells: usize,
+    client_sends: usize,
+    /// Bytes of the staged `SendClient` ops, as [`MAX_CLIENT_SEND_BYTES`] counts them.
+    client_send_bytes: usize,
+}
+
+/// The snapshot cells by position, with staged writes applied.
+struct Snapshot {
+    cells: HashMap<BlockPos, Slot>,
+    min_y: i32,
+    max_y: i32,
+    /// The anchor's chunk column, which writes stay inside; a callback without an anchor writes
+    /// nothing.
+    column: Option<(i32, i32)>,
+    /// The members of the anchor's network, whose data and states may be written wherever they
+    /// are.
+    members: HashSet<BlockPos>,
+}
+
+/// Where a write may reach: blocks stay in the anchor's chunk column, data and states also reach
+/// the anchor's network.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    Column,
+    Network,
+}
+
+/// One snapshot cell. `owned` means it holds this Experience's block, which alone has data,
+/// states, overlays and redstone power.
+struct Slot {
+    loaded: bool,
+    id: String,
+    owned: bool,
+    data: Option<Vec<u8>>,
+    states: Vec<BlockState>,
+    overlays: Vec<protocol::Overlay>,
+    /// The redstone power a redstone block receives.
+    power: u8,
+}
+
+/// The export a callback calls, with its arguments.
+enum Export<'a> {
+    Entity {
+        handle: wit::EntityHandle,
+        event: wit::EntityEvent,
+    },
+    Tick(wit::SimulationStep),
+    Timer {
+        handle: wit::ScheduleHandle,
+        step: wit::SimulationStep,
+    },
+    Player {
+        player: &'a wit::PlayerId,
+        event: wit::PlayerEvent,
+    },
+    Place(wit::BlockChange),
+    Break(wit::BlockChange),
+    Interact {
+        player: &'a wit::PlayerId,
+        pos: wit::BlockPos,
+        face: wit::Face,
+        hit: Option<wit::Pixel>,
+        target: Option<u8>,
+    },
+    Neighbor {
+        pos: wit::BlockPos,
+        neighbor: wit::BlockPos,
+    },
+    /// The payload stays in the protocol's form until the world it goes to is known.
+    ClientMessage {
+        player: &'a wit::PlayerId,
+        channel: &'a str,
+        schema: u16,
+        payload: &'a [Scalar],
+    },
+    Epoch {
+        player: &'a wit::PlayerId,
+    },
+    ScheduledUpdate {
+        pos: wit::BlockPos,
+    },
+}
+
+fn decode(data: Option<&str>) -> Result<Option<Vec<u8>>, HexError> {
+    data.map(hex::decode).transpose()
+}
+
+/// The 16×16 chunk column holding `pos`; the arithmetic shift rounds negative coordinates down.
+fn column(pos: BlockPos) -> (i32, i32) {
+    (pos.x >> 4, pos.z >> 4)
+}
+
+impl Snapshot {
+    /// A loaded snapshot cell within the world height, which the guest may read.
+    fn read(&self, pos: BlockPos) -> Result<&Slot, WorldError> {
+        self.within_height(pos)?;
+        let slot = self.cells.get(&pos).ok_or(WorldError::Denied)?;
+        if slot.loaded {
+            Ok(slot)
+        } else {
+            Err(WorldError::Unavailable)
+        }
+    }
+
+    /// A cell the guest may read that is also in the anchor's chunk column, or with
+    /// [`Reach::Network`] a member of its network, so it may write it.
+    fn write(&mut self, pos: BlockPos, reach: Reach) -> Result<&mut Slot, WorldError> {
+        self.within_height(pos)?;
+        let member = reach == Reach::Network && self.members.contains(&pos);
+        if self.column != Some(column(pos)) && !member {
+            return Err(WorldError::Denied);
+        }
+        let slot = self.cells.get_mut(&pos).ok_or(WorldError::Denied)?;
+        if slot.loaded {
+            Ok(slot)
+        } else {
+            Err(WorldError::Unavailable)
+        }
+    }
+
+    fn within_height(&self, pos: BlockPos) -> Result<(), WorldError> {
+        if (self.min_y..=self.max_y).contains(&pos.y) {
+            Ok(())
+        } else {
+            Err(WorldError::OutOfBounds)
+        }
+    }
+}
+
+/// The world-access methods. Each counts as a host call; the outer error is a trap, and the
+/// inner one is a refusal that leaves everything staged as it was.
+impl CallbackRes {
+    pub(crate) fn info(&mut self) -> Result<CallbackInfo> {
+        self.host_call()?;
+        Ok(self.info.clone())
+    }
+
+    /// The actor's focus, which only a client message or an epoch may have.
+    pub(crate) fn focus(&mut self) -> Result<Option<BlockPos>> {
+        self.host_call()?;
+        Ok(self.focus)
+    }
+
+    /// Stages passing this interaction's click on, once; only an interaction may.
+    pub(crate) fn pass_interaction(&mut self) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        if !self.interact {
+            return Ok(Err(WorldError::Denied));
+        }
+        if !self
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::PassInteraction {}))
+        {
+            stage(&mut self.ops, Op::PassInteraction {})?;
+        }
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn get_block(&mut self, pos: BlockPos) -> Result<Result<String, WorldError>> {
+        self.host_call()?;
+        Ok(self.snapshot.read(pos).map(|slot| slot.id.clone()))
+    }
+
+    /// Replaces air or an own block with air or an own block. The position loses its data,
+    /// states, overlays and redstone power, so what is staged for them there is dropped; it is
+    /// owned exactly when the new block is this Experience's, which starts with its default
+    /// states.
+    pub(crate) fn set_block(
+        &mut self,
+        pos: BlockPos,
+        id: String,
+    ) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        let slot = match self.snapshot.write(pos, Reach::Column) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        if slot.id != AIR && !slot.owned {
+            return Ok(Err(WorldError::NotOwned));
+        }
+        let axes = match self.own.blocks.get(&id) {
+            Some(axes) => axes.as_slice(),
+            None if id == AIR => &[],
+            None => return Ok(Err(WorldError::UnknownBlock)),
+        };
+        let owned = id != AIR;
+        if let Some(index) = data_op(&self.ops, pos) {
+            self.staged_data -= staged_len(&self.ops.remove(index));
+        }
+        if let Some(index) = state_op(&self.ops, pos) {
+            self.ops.remove(index);
+        }
+        if let Some(index) = overlays::overlay_op(&self.ops, pos) {
+            self.ops.remove(index);
+        }
+        if let Some(index) = redstone::redstone_op(&self.ops, pos) {
+            self.ops.remove(index);
+        }
+        stage(
+            &mut self.ops,
+            Op::SetBlock {
+                pos,
+                id: id.clone(),
+            },
+        )?;
+        self.added -= len(slot.data.as_deref());
+        slot.states = default_states(axes);
+        slot.id = id;
+        slot.owned = owned;
+        slot.data = None;
+        slot.overlays.clear();
+        Ok(Ok(()))
+    }
+
+    /// The anchor's network, none when the anchor is not a member.
+    pub(crate) fn network(&mut self) -> Result<Result<Option<Network>, WorldError>> {
+        self.host_call()?;
+        Ok(Ok(self.network.clone()))
+    }
+
+    /// The states of the block at `pos`, which only this Experience's blocks have.
+    pub(crate) fn block_states(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Result<Vec<BlockState>, WorldError>> {
+        self.host_call()?;
+        Ok(self.snapshot.read(pos).map(|slot| slot.states.clone()))
+    }
+
+    /// Sets some states of an own block, keeping its data and generation: each named once,
+    /// among the block's states, with a value it takes, else `unsupported-state`. Every write
+    /// to one position merges into the one op staged for it.
+    pub(crate) fn set_block_state(
+        &mut self,
+        pos: BlockPos,
+        states: Vec<BlockState>,
+    ) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        let slot = match self.snapshot.write(pos, Reach::Network) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        let Some(axes) = self.own.blocks.get(&slot.id).filter(|_| slot.owned) else {
+            return Ok(Err(WorldError::NotOwned));
+        };
+        for (i, state) in states.iter().enumerate() {
+            let axis = axes.iter().find(|axis| axis.name == state.name);
+            let repeated = states[..i].iter().any(|earlier| earlier.name == state.name);
+            if repeated || !axis.is_some_and(|axis| holds(axis, &state.value)) {
+                return Ok(Err(WorldError::UnsupportedState));
+            }
+        }
+        if states.is_empty() {
+            return Ok(Ok(()));
+        }
+        match state_op(&self.ops, pos) {
+            Some(index) => {
+                if let Op::SetBlockState { states: staged, .. } = &mut self.ops[index] {
+                    merge(staged, &states);
+                }
+            }
+            None => stage(
+                &mut self.ops,
+                Op::SetBlockState {
+                    pos,
+                    states: states.clone(),
+                },
+            )?,
+        }
+        merge(&mut slot.states, &states);
+        Ok(Ok(()))
+    }
+
+    pub(crate) fn block_data(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Result<Option<Vec<u8>>, WorldError>> {
+        self.host_call()?;
+        Ok(self.snapshot.read(pos).and_then(|slot| {
+            if slot.owned {
+                Ok(slot.data.clone())
+            } else {
+                Err(WorldError::NotOwned)
+            }
+        }))
+    }
+
+    /// Writes or, with `None`, deletes an own block's data, within the size limits and the data
+    /// budget. A rewrite replaces the op staged for the block in place.
+    pub(crate) fn set_block_data(
+        &mut self,
+        pos: BlockPos,
+        data: Option<Vec<u8>>,
+    ) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        let slot = match self.snapshot.write(pos, Reach::Network) {
+            Ok(slot) => slot,
+            Err(error) => return Ok(Err(error)),
+        };
+        if !slot.owned {
+            return Ok(Err(WorldError::NotOwned));
+        }
+        let size = data.as_ref().map_or(0, Vec::len);
+        let earlier = data_op(&self.ops, pos);
+        let staged =
+            self.staged_data + size - earlier.map_or(0, |index| staged_len(&self.ops[index]));
+        if size > MAX_BLOCK_DATA_BYTES || staged > MAX_STAGED_DATA_BYTES {
+            return Ok(Err(WorldError::TooLarge));
+        }
+        let added = self.added + len(data.as_deref()) - len(slot.data.as_deref());
+        if u64::try_from(added).is_ok_and(|added| added > self.budget) {
+            return Ok(Err(WorldError::QuotaExceeded));
+        }
+        let op = Op::SetBlockData {
+            pos,
+            data: data.as_deref().map(hex::encode),
+        };
+        match earlier {
+            Some(index) => self.ops[index] = op,
+            None => stage(&mut self.ops, op)?,
+        }
+        self.staged_data = staged;
+        self.added = added;
+        slot.data = data;
+        Ok(Ok(()))
+    }
+
+    /// Tells the event's actor `text`; the tell past [`MAX_TELLS`] traps.
+    pub(crate) fn tell(&mut self, player: String, text: String) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        if let Err(error) = self.actor_is(&player) {
+            return Ok(Err(error));
+        }
+        if text.len() > MAX_TELL_BYTES {
+            return Ok(Err(WorldError::TooLarge));
+        }
+        if text
+            .chars()
+            .any(|c| c.is_control() || c == FORMATTING_PREFIX)
+        {
+            return Ok(Err(WorldError::InvalidText));
+        }
+        if self.tells == MAX_TELLS {
+            return Err(LimitExceeded(format!("more than {MAX_TELLS} tells")).into());
+        }
+        stage(&mut self.ops, Op::Tell { player, text })?;
+        self.tells += 1;
+        Ok(Ok(()))
+    }
+
+    /// Stages `payload`, its values' pre-order nodes, for the event's actor's client part on
+    /// `channel`. Lists and records nest at most
+    /// [`MAX_VALUE_DEPTH`](crate::limits::MAX_VALUE_DEPTH) deep, and the callback's
+    /// channels and payloads may hold [`MAX_CLIENT_SEND_BYTES`] in all, else it is `too-large`; a
+    /// header that counts more items than follow it traps, and so does the send past
+    /// [`MAX_CLIENT_SENDS`]. Which channels the client part declares is the adapter's to check.
+    pub(crate) fn send_client(
+        &mut self,
+        player: String,
+        channel: String,
+        schema: u16,
+        payload: Vec<ValueNode>,
+    ) -> Result<Result<(), WorldError>> {
+        self.stage_client(player, channel, schema, payload, false)
+    }
+
+    /// Stages a reply for the adapter's retained control delivery using the same send limits.
+    pub(crate) fn send_control(
+        &mut self,
+        player: String,
+        channel: String,
+        schema: u16,
+        payload: Vec<ValueNode>,
+    ) -> Result<Result<(), WorldError>> {
+        self.stage_client(player, channel, schema, payload, true)
+    }
+
+    /// Validates and stages one actor message with its selected delivery mode.
+    fn stage_client(
+        &mut self,
+        player: String,
+        channel: String,
+        schema: u16,
+        payload: Vec<ValueNode>,
+        control: bool,
+    ) -> Result<Result<(), WorldError>> {
+        self.host_call()?;
+        if let Err(error) = self.actor_is(&player) {
+            return Ok(Err(error));
+        }
+        let payload = match value::decode(payload) {
+            Ok(payload) => payload,
+            Err(Refusal::TooDeep) => return Ok(Err(WorldError::TooLarge)),
+            Err(Refusal::Malformed) => {
+                bail!("a send-client list or record counts more items than follow it")
+            }
+        };
+        let bytes = self.client_send_bytes + channel.len() + json_len(&payload);
+        if bytes > MAX_CLIENT_SEND_BYTES {
+            return Ok(Err(WorldError::TooLarge));
+        }
+        if self.client_sends == MAX_CLIENT_SENDS {
+            let sends = format!("more than {MAX_CLIENT_SENDS} client messages");
+            return Err(LimitExceeded(sends).into());
+        }
+        let op = Op::SendClient {
+            control,
+            player,
+            channel,
+            schema,
+            payload,
+        };
+        stage(&mut self.ops, op)?;
+        self.client_sends += 1;
+        self.client_send_bytes = bytes;
+        Ok(Ok(()))
+    }
+
+    /// Whether `player` may be told or sent to: only the event's actor may.
+    fn actor_is(&self, player: &str) -> Result<(), WorldError> {
+        match &self.actor {
+            None => Err(WorldError::PlayerUnavailable),
+            Some(actor) if actor != player => Err(WorldError::Denied),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Counts one host call; the call past [`MAX_HOST_CALLS`] traps.
+    fn host_call(&mut self) -> Result<()> {
+        if self.host_calls == MAX_HOST_CALLS {
+            return Err(LimitExceeded(format!("more than {MAX_HOST_CALLS} host calls")).into());
+        }
+        self.host_calls += 1;
+        Ok(())
+    }
+}
+
+/// Appends `op`; the op past [`MAX_STAGED_OPS`] traps.
+fn stage(ops: &mut Vec<Op>, op: Op) -> Result<()> {
+    if ops.iter().any(|op| matches!(op, Op::World { .. })) {
+        bail!("a world lifecycle operation must be the only staged operation");
+    }
+    if ops.len() == MAX_STAGED_OPS {
+        return Err(LimitExceeded(format!("more than {MAX_STAGED_OPS} staged ops")).into());
+    }
+    ops.push(op);
+    Ok(())
+}
+
+/// The index of the staged `SetBlockState` at `pos`.
+fn state_op(ops: &[Op], pos: BlockPos) -> Option<usize> {
+    ops.iter()
+        .position(|op| matches!(op, Op::SetBlockState { pos: at, .. } if *at == pos))
+}
+
+/// Gives each state in `into` that `states` names its new value, and adds the others.
+fn merge(into: &mut Vec<BlockState>, states: &[BlockState]) {
+    for state in states {
+        match into.iter_mut().find(|current| current.name == state.name) {
+            Some(current) => current.value = state.value.clone(),
+            None => into.push(state.clone()),
+        }
+    }
+}
+
+/// A block's states when it is set without placement: the first value of each, `false` for a
+/// bool.
+fn default_states(axes: &[StateDef]) -> Vec<BlockState> {
+    axes.iter()
+        .map(|axis| BlockState {
+            name: axis.name.clone(),
+            value: match &axis.values {
+                StateValues::Bool => StateValue::Bool(false),
+                StateValues::Choices(choices) => StateValue::Choice(choices[0].clone()),
+            },
+        })
+        .collect()
+}
+
+/// The index of the staged `SetBlockData` at `pos`.
+fn data_op(ops: &[Op], pos: BlockPos) -> Option<usize> {
+    ops.iter()
+        .position(|op| matches!(op, Op::SetBlockData { pos: at, .. } if *at == pos))
+}
+
+/// The bytes of data that a staged op writes; its hex has two digits per byte.
+fn staged_len(op: &Op) -> usize {
+    match op {
+        Op::SetBlockData {
+            data: Some(hex), ..
+        }
+        | Op::StoreWrite {
+            data: Some(hex), ..
+        } => hex.len() / 2,
+        _ => 0,
+    }
+}
+
+/// The length of some data; absent data has none. A slice holds at most `isize::MAX` bytes, so
+/// the length fits.
+fn len(data: Option<&[u8]>) -> i64 {
+    data.map_or(0, |data| data.len() as i64)
+}
+
+/// The bytes of `value` as JSON, counted without building the JSON.
+fn json_len(value: &impl Serialize) -> usize {
+    struct Count(usize);
+    impl io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).expect("protocol values serialize");
+    count.0
+}
+
+impl From<BlockPos> for wit::BlockPos {
+    fn from(BlockPos { x, y, z }: BlockPos) -> Self {
+        Self { x, y, z }
+    }
+}
+
+impl From<wit::BlockPos> for BlockPos {
+    fn from(wit::BlockPos { x, y, z }: wit::BlockPos) -> Self {
+        Self { x, y, z }
+    }
+}
+
+impl From<protocol::Face> for wit::Face {
+    fn from(face: protocol::Face) -> Self {
+        match face {
+            protocol::Face::Down => Self::Down,
+            protocol::Face::Up => Self::Up,
+            protocol::Face::North => Self::North,
+            protocol::Face::South => Self::South,
+            protocol::Face::West => Self::West,
+            protocol::Face::East => Self::East,
+        }
+    }
+}
+
+impl From<protocol::Cause> for ChangeCause {
+    fn from(cause: protocol::Cause) -> Self {
+        match cause {
+            protocol::Cause::Player => Self::Player,
+            protocol::Cause::Guest => Self::Guest,
+            protocol::Cause::Environment => Self::Environment,
+        }
+    }
+}
+
+mod containers;
+mod craft;
+mod entities;
+mod invoke;
+mod items;
+mod overlays;
+mod prepare;
+mod redstone;
+#[cfg(test)]
+mod tests;
+
+mod worlds;
+
+mod simulation;

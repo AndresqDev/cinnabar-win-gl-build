@@ -1,0 +1,153 @@
+use super::*;
+#[cfg(test)]
+use bedrock_protocol_1_26_60::packets::ClientCacheBlobStatus;
+
+/// The sealed classification of one cached packet's unique blob references.
+///
+/// Callers cannot shorten the public classified sets after classification:
+///
+/// ```compile_fail
+/// fn omit_reference(status: &mut protocol::BlobCacheStatus) {
+///     status.missing.clear();
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobCacheStatus {
+    missing: Vec<u64>,
+    have: Vec<u64>,
+    outstanding: Vec<u64>,
+    pub recovery: Option<ChunkResyncEvent>,
+    admission: Option<SubChunkReplyAdmissionEvent>,
+    classified_hashes: usize,
+    staged_bytes: usize,
+    pub(super) accepted: bool,
+    _classified: ClassifiedStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClassifiedStatus;
+
+impl BlobCacheStatus {
+    pub(super) fn classify<T: ReferencedBlobHashes>(
+        cache: &ClientBlobCache,
+        packet: &T,
+        recovery: Option<ChunkResyncEvent>,
+        pin: bool,
+    ) -> Self {
+        let referenced_hashes = stable_unique(&packet.referenced_blob_hashes());
+        let (have, missing, staged_bytes) = cache.classify(&referenced_hashes, pin);
+        let classified_hashes = have.len() + missing.len();
+        debug_assert_eq!(classified_hashes, referenced_hashes.len());
+        Self {
+            missing,
+            have,
+            outstanding: Vec::new(),
+            recovery,
+            admission: None,
+            classified_hashes,
+            staged_bytes,
+            accepted: false,
+            _classified: ClassifiedStatus,
+        }
+    }
+
+    /// Unique referenced hashes absent from the cache and not already outstanding when
+    /// classification completed.
+    #[must_use]
+    pub fn missing(&self) -> &[u64] {
+        &self.missing
+    }
+
+    /// Unique referenced hashes present in the cache when classification completed.
+    #[must_use]
+    pub fn have(&self) -> &[u64] {
+        &self.have
+    }
+
+    /// Number of unique referenced hashes classified, including omitted outstanding hashes.
+    #[must_use]
+    pub const fn classified_hashes(&self) -> usize {
+        self.classified_hashes
+    }
+
+    pub(super) fn omit_outstanding(&mut self, pending_by_hash: &mut HashMap<u64, PendingBlob>) {
+        let missing = std::mem::take(&mut self.missing);
+        let mut outstanding = Vec::new();
+        let mut still_missing = Vec::with_capacity(missing.len());
+        for hash in missing {
+            if pending_by_hash
+                .get(&hash)
+                .is_some_and(|pending| pending.status_outstanding)
+            {
+                outstanding.push(hash);
+            } else {
+                if let Some(pending) = pending_by_hash.get_mut(&hash) {
+                    pending.status_outstanding = true;
+                }
+                still_missing.push(hash);
+            }
+        }
+        self.missing = still_missing;
+        self.outstanding = outstanding;
+    }
+
+    pub(super) fn outstanding(&self) -> &[u64] {
+        &self.outstanding
+    }
+
+    pub(super) const fn staged_bytes(&self) -> usize {
+        self.staged_bytes
+    }
+
+    /// Whether this candidate survived classification and reconstruction instead of recovery.
+    pub(crate) const fn accepted(&self) -> bool {
+        self.accepted
+    }
+
+    pub(super) fn set_recovery(&mut self, recovery: Option<ChunkResyncEvent>) {
+        self.recovery = recovery;
+    }
+
+    pub(crate) fn set_admission(&mut self, admission: Option<SubChunkReplyAdmissionEvent>) {
+        self.admission = admission;
+    }
+
+    pub(crate) fn take_admission(&mut self) -> Option<SubChunkReplyAdmissionEvent> {
+        self.admission.take()
+    }
+
+    #[must_use]
+    pub fn take_recovery(&mut self) -> Option<ChunkResyncEvent> {
+        self.recovery.take()
+    }
+
+    /// Transfers the sealed wire sets to the session outbox, omitting outstanding references.
+    pub(crate) fn into_hashes(self) -> (Vec<u64>, Vec<u64>) {
+        (self.missing, self.have)
+    }
+
+    /// Splits the missing and have protocol sets. Outstanding hashes are intentionally omitted.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn into_packets(self) -> Vec<ClientCacheBlobStatus> {
+        let mut missing = self.missing.into_iter().peekable();
+        let mut have = self.have.into_iter().peekable();
+        let mut packets = Vec::new();
+        while missing.peek().is_some() || have.peek().is_some() {
+            let mut packet = ClientCacheBlobStatus::default();
+            while packet.missing_ids.len() + packet.found_ids.len()
+                < MAX_CLIENT_BLOB_HASHES_PER_PACKET
+            {
+                if let Some(hash) = missing.next() {
+                    packet.missing_ids.push(wire::U64LE(hash));
+                } else if let Some(hash) = have.next() {
+                    packet.found_ids.push(wire::U64LE(hash));
+                } else {
+                    break;
+                }
+            }
+            packets.push(packet);
+        }
+        packets
+    }
+}

@@ -1,0 +1,394 @@
+//! Physical input and preference handoff for the native JSON-UI emote wheel.
+mod controls;
+use super::interaction::input_capture::ordered_pointer_presses;
+use super::interaction::{chat_modifiers, command_macros};
+use bevy::{
+    ecs::message::{MessageCursor, Messages},
+    ecs::system::SystemParam,
+    input::{
+        ButtonState,
+        gamepad::{Gamepad, GamepadButton},
+        keyboard::KeyboardInput,
+        mouse::AccumulatedMouseMotion,
+    },
+    prelude::*,
+    time::Real,
+    window::{CursorOptions, PrimaryWindow, WindowEvent},
+};
+use client_shell::physical_input::set_cursor_capture;
+use launcher::menu::settings_options::EMOTE_SLOT_COUNT;
+use ui::{UiAction, UiPoint};
+use ui_screens::emote_screen::EmoteHit;
+
+use client_shell::ui_resources::{UiPresentationResource, UiRuntimeResource};
+use client_ui::ui_runtime::{UiRuntime, scene_stack::Scene};
+use launcher::menu::settings_options::BindingId;
+use {
+    crate::runtime::world::ClientWorld,
+    client_shell::menu::{
+        MenuRuntime,
+        settings_options::control_bindings::{
+            binding_gamepad, binding_key, gamepad_button, menu_cancel_key, menu_cancel_mouse,
+        },
+    },
+    client_state::{PlayerRuntime, SemanticInputSnapshot},
+};
+
+use controls::{should_stop_emote, slot_key, wheel_key};
+type SlotPreferences = [Option<String>; EMOTE_SLOT_COUNT];
+
+#[derive(Default)]
+pub(crate) struct ObservedEmotes {
+    identity: Option<(u64, u64, i32, u64)>,
+    preferences: Option<Option<SlotPreferences>>,
+    catalog_generation: u64,
+    pointer: Option<UiPoint>,
+    modifiers: ButtonInput<KeyCode>,
+}
+
+use client_state::ScreenInputConsumed;
+
+#[derive(SystemParam)]
+pub(crate) struct EmoteInput<'w, 's> {
+    time: Res<'w, Time<Real>>,
+    window: Single<'w, 's, (&'static Window, &'static mut CursorOptions), With<PrimaryWindow>>,
+    keys: ResMut<'w, ButtonInput<KeyCode>>,
+    mouse: ResMut<'w, ButtonInput<MouseButton>>,
+    motion: ResMut<'w, AccumulatedMouseMotion>,
+    keyboard: MessageReader<'w, 's, KeyboardInput>,
+    window_events: Option<Res<'w, Messages<WindowEvent>>>,
+    window_cursor: Local<'s, MessageCursor<WindowEvent>>,
+    pads: Query<'w, 's, &'static Gamepad>,
+    menu: Option<ResMut<'w, MenuRuntime>>,
+    consent: Option<Res<'w, client_state::ConsentInput>>,
+    world: Option<Res<'w, ClientWorld>>,
+    player: Res<'w, PlayerRuntime>,
+    runtime: ResMut<'w, UiRuntimeResource>,
+    presentation: Option<ResMut<'w, UiPresentationResource>>,
+    observed: Local<'s, ObservedEmotes>,
+    consumed: ResMut<'w, ScreenInputConsumed>,
+    focus: Option<ResMut<'w, client_state::CursorFocus>>,
+    driven: Option<Res<'w, client_state::DrivenInput>>,
+}
+
+/// Runs before chat/menu adapters and before semantic gameplay is finalized.
+pub(crate) fn drive_emote_input(mut input: EmoteInput) {
+    input.consumed.0 = false;
+    let pointer_presses = if let Some(events) = input.window_events.as_deref() {
+        ordered_pointer_presses(input.window_cursor.read(events))
+    } else {
+        Vec::new()
+    };
+    let mut owned = input.runtime.emotes().is_open();
+    let runtime_id = input.runtime.local_runtime_id(&input.player);
+    let stream = input
+        .world
+        .as_deref()
+        .and_then(|world| world.stream.as_ref());
+    let rig = runtime_id.and_then(|id| stream.and_then(|stream| stream.authority().actor_rig(id)));
+    let identity = runtime_id.map(|id| {
+        (
+            input.runtime.session_id(),
+            id,
+            stream.map_or(0, |stream| stream.current_dimension()),
+            rig.map_or(0, |rig| rig.reset_generation),
+        )
+    });
+    if identity != input.observed.identity {
+        input.runtime.emotes_mut().close();
+        input.runtime.emotes_mut().stop();
+        input.observed.identity = identity;
+        input.observed.preferences = None;
+        input.observed.pointer = None;
+    }
+    if let Some(menu) = input.menu.as_deref() {
+        let preferences = menu.settings_snapshot().0.emote_slots().cloned();
+        let generation = cosmetics::emotes::Item::generation();
+        if input.observed.preferences.as_ref() != Some(&preferences)
+            || input.observed.catalog_generation != generation
+        {
+            input.observed.catalog_generation = generation;
+            input
+                .runtime
+                .emotes_mut()
+                .apply_preferences(preferences.as_ref());
+            input.observed.preferences = Some(preferences);
+        }
+    }
+    let actor_unavailable = runtime_id.is_none()
+        || (input.world.is_some() && stream.is_none())
+        || runtime_id
+            .and_then(|id| stream.and_then(|stream| stream.authority().actor(id)))
+            .is_some_and(|actor| actor.status.dead);
+    let blocked = input.consent.as_ref().is_some_and(|consent| consent.0)
+        || input.menu.as_ref().is_some_and(|menu| menu.is_visible())
+        || input
+            .runtime
+            .screen_open_besides(&input.player, Some(Scene::Emote))
+        || actor_unavailable;
+    if blocked {
+        input.observed.modifiers.reset_all();
+        input.keyboard.clear();
+        input.runtime.emotes_mut().close();
+        input.runtime.emotes_mut().stop();
+        if let Some(presentation) = input.presentation.as_deref_mut() {
+            presentation.set_emote_pointer(None);
+        }
+        return;
+    }
+    if input.driven.is_none()
+        && (!input.window.0.focused || input.focus.as_ref().is_some_and(|focus| !focus.available()))
+    {
+        input.keyboard.clear();
+        input.observed.modifiers.reset_all();
+        input.keys.reset_all();
+        input.mouse.reset_all();
+        input.motion.delta = Vec2::ZERO;
+        input.observed.pointer = None;
+        input.consumed.0 = owned;
+        set_cursor_capture(&mut input.window.1, false);
+        if let Some(presentation) = input.presentation.as_deref_mut() {
+            presentation.set_emote_pointer(None);
+        }
+        return;
+    }
+    let now = u64::try_from(input.time.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let pointer = input
+        .window
+        .0
+        .cursor_position()
+        .and_then(|position| UiPoint::new(position.x, position.y).ok());
+    let keyboard: Vec<_> = input.keyboard.read().cloned().collect();
+    chat_modifiers::capture_before_events(&mut input.observed.modifiers, &input.keys, &keyboard);
+    let mouse_toggled = input.mouse.get_just_pressed().any(|button| {
+        if !client_shell::menu::settings_options::control_bindings::binding_mouse_button(
+            input.menu.as_deref(),
+            BindingId::Emote,
+            *button,
+        ) {
+            return false;
+        }
+        let macro_matches = |held: &ButtonInput<KeyCode>| {
+            command_macros::command(
+                input.menu.as_deref(),
+                &input.runtime,
+                &input.player,
+                chat_modifiers::held_chord(held),
+                client_shell::physical_input::mouse_button_code(*button)
+                    .map(semantic_input::PhysicalControl::MouseButton),
+            )
+            .is_some()
+        };
+        let macro_owns_press = if pointer_presses.is_empty() {
+            macro_matches(&input.keys)
+        } else {
+            pointer_presses
+                .iter()
+                .filter(|(_, candidate)| candidate == button)
+                .any(|(before, _)| {
+                    let mut held = input.observed.modifiers.clone();
+                    for event in keyboard.iter().take(*before) {
+                        chat_modifiers::track(&mut held, event);
+                    }
+                    macro_matches(&held)
+                })
+        };
+        !macro_owns_press
+    });
+    // An open wheel owns D-pad selection, including the default opening button.
+    let navigating =
+        input.runtime.emotes().is_open() && controls::directional_navigation(&input.pads);
+    let gamepad_toggled =
+        !navigating && binding_gamepad(input.menu.as_deref(), BindingId::Emote, &input.pads);
+    let toggled = mouse_toggled || gamepad_toggled;
+    let mut dismissed = false;
+    if toggled {
+        if let Some(presentation) = input.presentation.as_deref_mut() {
+            presentation.set_emote_input_mode(if gamepad_toggled {
+                json_ui::InputMode::Gamepad
+            } else {
+                json_ui::InputMode::Mouse
+            });
+        }
+        let was_open = input.runtime.emotes().is_open();
+        toggle(&mut input.runtime);
+        dismissed |= was_open && !input.runtime.emotes().is_open();
+        owned = true;
+    }
+    for event in &keyboard {
+        chat_modifiers::track(&mut input.observed.modifiers, event);
+        if event.state != ButtonState::Pressed || event.repeat {
+            continue;
+        }
+        if binding_key(input.menu.as_deref(), BindingId::Emote, event.key_code)
+            && command_macros::command(
+                input.menu.as_deref(),
+                &input.runtime,
+                &input.player,
+                chat_modifiers::held_chord(&input.observed.modifiers),
+                client_shell::physical_input::keyboard_usage(event.key_code)
+                    .map(semantic_input::PhysicalControl::KeyboardUsage),
+            )
+            .is_some()
+        {
+            continue;
+        }
+        if binding_key(input.menu.as_deref(), BindingId::Emote, event.key_code) {
+            if let Some(presentation) = input.presentation.as_deref_mut() {
+                presentation.set_emote_input_mode(json_ui::InputMode::Mouse);
+            }
+            let was_open = input.runtime.emotes().is_open();
+            toggle(&mut input.runtime);
+            dismissed |= was_open && !input.runtime.emotes().is_open();
+            owned = true;
+            continue;
+        }
+        if !input.runtime.emotes().is_open() {
+            continue;
+        }
+        owned = true;
+        if let Some(presentation) = input.presentation.as_deref_mut() {
+            presentation.set_emote_input_mode(json_ui::InputMode::Mouse);
+        }
+        if menu_cancel_key(input.menu.as_deref(), event.key_code) {
+            input
+                .runtime
+                .emotes_mut()
+                .handle_action(UiAction::Cancel, now);
+        } else if event.key_code == KeyCode::KeyC {
+            input.runtime.emotes_mut().change_emotes();
+        } else if event.key_code == KeyCode::Tab && input.runtime.emotes().is_choosing() {
+            input.runtime.emotes_mut().next_catalog_page();
+        } else if let Some(slot) = slot_key(event.key_code) {
+            input.runtime.emotes_mut().activate_slot(slot, now);
+        } else if let Some(action) = wheel_key(event.key_code) {
+            input.runtime.emotes_mut().handle_action(action, now);
+        }
+        dismissed |= !input.runtime.emotes().is_open();
+    }
+    if input.runtime.emotes().is_open() {
+        let hit = if let Some(presentation) = input.presentation.as_deref_mut() {
+            presentation.set_emote_pointer(pointer);
+            pointer.and_then(|point| presentation.hit_test_emote(point))
+        } else {
+            None
+        };
+        // A stationary pointer must not undo keyboard/controller navigation.
+        if (pointer != input.observed.pointer && input.motion.delta != Vec2::ZERO)
+            || input.mouse.just_pressed(MouseButton::Left)
+        {
+            if (input.motion.delta != Vec2::ZERO || input.mouse.just_pressed(MouseButton::Left))
+                && let Some(presentation) = input.presentation.as_deref_mut()
+            {
+                presentation.set_emote_input_mode(json_ui::InputMode::Mouse);
+            }
+            input.runtime.emotes_mut().hover_slot(match hit {
+                Some(EmoteHit::Slot(slot)) => Some(slot),
+                _ => None,
+            });
+        }
+        input.observed.pointer = pointer;
+        // A button that also toggled the wheel this frame does not cancel it again.
+        if menu_cancel_mouse(input.menu.as_deref(), &input.mouse).is_some_and(|button| {
+            !(mouse_toggled
+                && client_shell::menu::settings_options::control_bindings::binding_mouse_button(
+                    input.menu.as_deref(),
+                    BindingId::Emote,
+                    button,
+                ))
+        }) {
+            input
+                .runtime
+                .emotes_mut()
+                .handle_action(UiAction::Cancel, now);
+            dismissed |= !input.runtime.emotes().is_open();
+        } else if input.mouse.just_pressed(MouseButton::Left) {
+            match hit {
+                Some(EmoteHit::Slot(slot)) => {
+                    input.runtime.emotes_mut().activate_slot(slot, now);
+                }
+                Some(EmoteHit::ChangeEmotes) => input.runtime.emotes_mut().change_emotes(),
+                Some(EmoteHit::Close) => {
+                    input
+                        .runtime
+                        .emotes_mut()
+                        .handle_action(UiAction::Cancel, now);
+                }
+                None => {}
+            }
+            dismissed |= !input.runtime.emotes().is_open();
+        }
+        for pad in input.pads.iter().filter(|_| !toggled) {
+            let mapped = |button| {
+                input.menu.as_deref().map_or(button, |menu| {
+                    gamepad_button(&menu.settings_snapshot().0, button)
+                })
+            };
+            if pad.just_pressed(mapped(GamepadButton::North)) {
+                input.runtime.emotes_mut().change_emotes();
+            }
+            if pad.just_pressed(GamepadButton::RightTrigger) {
+                input.runtime.emotes_mut().next_catalog_page();
+            }
+            for (button, action) in [
+                (GamepadButton::South, UiAction::Accept),
+                (GamepadButton::East, UiAction::Cancel),
+                (GamepadButton::DPadUp, UiAction::Navigate([0, -1])),
+                (GamepadButton::DPadRight, UiAction::Navigate([1, 0])),
+                (GamepadButton::DPadDown, UiAction::Navigate([0, 1])),
+                (GamepadButton::DPadLeft, UiAction::Navigate([-1, 0])),
+            ] {
+                let button = mapped(button);
+                if pad.just_pressed(button) {
+                    if let Some(presentation) = input.presentation.as_deref_mut() {
+                        presentation.set_emote_input_mode(json_ui::InputMode::Gamepad);
+                    }
+                    let was_open = input.runtime.emotes().is_open();
+                    input.runtime.emotes_mut().handle_action(action, now);
+                    dismissed |= was_open && !input.runtime.emotes().is_open();
+                }
+            }
+        }
+    } else if let Some(presentation) = input.presentation.as_deref_mut() {
+        presentation.set_emote_pointer(None);
+        input.observed.pointer = None;
+    }
+    if let Some(preferences) = input.runtime.emotes_mut().take_preferences()
+        && let Some(menu) = input.menu.as_deref_mut()
+    {
+        menu.set_emote_slot_preferences(preferences.clone());
+        input.observed.preferences = Some(Some(preferences));
+    }
+    if dismissed && let Some(focus) = input.focus.as_deref_mut() {
+        focus.authorize_screen_return();
+    }
+    if owned {
+        input.consumed.0 = true;
+        input.observed.modifiers.reset_all();
+        input.keys.reset_all();
+        input.mouse.reset_all();
+        input.motion.delta = Vec2::ZERO;
+        set_cursor_capture(&mut input.window.1, !input.runtime.emotes().is_open());
+    }
+}
+
+/// The current gameplay snapshot is available after UI authority has finalized.
+pub(crate) fn cancel_emote_from_gameplay(
+    semantic: Res<SemanticInputSnapshot>,
+    mut runtime: ResMut<UiRuntimeResource>,
+) {
+    if should_stop_emote(&semantic) {
+        runtime.emotes_mut().stop();
+    }
+}
+
+fn toggle(runtime: &mut UiRuntime) {
+    if runtime.emotes().is_open() {
+        runtime.emotes_mut().close();
+    } else {
+        runtime.emotes_mut().open();
+    }
+}
+
+#[cfg(test)]
+mod tests;

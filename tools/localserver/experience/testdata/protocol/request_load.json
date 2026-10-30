@@ -1,0 +1,71 @@
+{
+  "type": "load",
+  "dir": "/srv/experiences/benergistics",
+  "items": [
+    {
+      "id": "minecraft:stone",
+      "metadata": 0,
+      "max_count": 64,
+      "off_hand": false,
+      "plain": true
+    },
+    {
+      "id": "minecraft:ender_pearl",
+      "metadata": 0,
+      "max_count": 16,
+      "off_hand": false,
+      "plain": true
+    }
+  ],
+  "recipes": [
+    {
+      "shape": [
+        1,
+        2
+      ],
+      "inputs": [
+        [
+          {
+            "id": "minecraft:oak_planks",
+            "metadata": null
+          },
+          {
+            "id": "minecraft:spruce_planks",
+            "metadata": null
+          }
+        ],
+        [
+          {
+            "id": "minecraft:oak_planks",
+            "metadata": null
+          },
+          {
+            "id": "minecraft:spruce_planks",
+            "metadata": null
+          }
+        ]
+      ],
+      "output": {
+        "id": "minecraft:stick",
+        "metadata": 0,
+        "count": 4
+      }
+    },
+    {
+      "shape": null,
+      "inputs": [
+        [
+          {
+            "id": "minecraft:red_flower",
+            "metadata": 0
+          }
+        ]
+      ],
+      "output": {
+        "id": "minecraft:red_dye",
+        "metadata": 0,
+        "count": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,343 @@
+use {super::*, ui::IconRef};
+
+#[test]
+fn held_block_is_the_shared_six_face_cube_not_a_gui_thumbnail() {
+    let source = IconRef {
+        color_mask: None,
+        page: 7,
+        uv: [
+            10,
+            20,
+            10 + assets::BLOCK_ITEM_SHEET_SIZE[0],
+            20 + assets::BLOCK_ITEM_SHEET_SIZE[1],
+        ],
+        glint: false,
+    };
+    let model = block(source, [[0.0; 3]; 2]);
+    assert_eq!(model.source, source);
+    assert_eq!(model.vertices.len(), 36);
+    for axis in 0..3 {
+        assert!(
+            model
+                .vertices
+                .iter()
+                .any(|vertex| vertex.position[axis] == -0.5)
+        );
+        assert!(
+            model
+                .vertices
+                .iter()
+                .any(|vertex| vertex.position[axis] == 0.5)
+        );
+    }
+    assert!(
+        model
+            .placements
+            .iter()
+            .all(|placement| matches!(placement, PreviewHeldPlacement::Block))
+    );
+    for (face, vertices) in model.vertices.as_chunks::<6>().0.iter().enumerate() {
+        let icon = super::super::sheet_faces(source)[face];
+        assert_eq!(
+            vertices[0].uv,
+            [
+                f32::from(icon.uv[0] - source.uv[0]) / f32::from(assets::BLOCK_ITEM_SHEET_SIZE[0]),
+                f32::from(icon.uv[1] - source.uv[1]) / f32::from(assets::BLOCK_ITEM_SHEET_SIZE[1]),
+            ]
+        );
+    }
+}
+
+/// Compiles original item bones and retains entity-only banner routes without cube sheets.
+fn banner_catalog() -> (RuntimeEntityAssets, RuntimeIconCatalog) {
+    sprite_catalog(
+        "minecraft:banner",
+        ItemVisualDefinitionRoute::BlockItem {
+            block_visual: assets::BlockVisualId(1),
+        },
+    )
+}
+
+/// Compiles original hand bones and distinct sprite variants for one item route.
+pub(super) fn sprite_catalog(
+    identifier: &str,
+    route: ItemVisualDefinitionRoute,
+) -> (RuntimeEntityAssets, RuntimeIconCatalog) {
+    let entity = br#"{"format_version":"1.10.0","minecraft:client_entity":{"description":{"identifier":"minecraft:player","geometry":{"default":"geometry.test_player"},"render_controllers":["controller.render.test_player"]}}}"#;
+    let geometry = br#"{"format_version":"1.12.0","minecraft:geometry":[{"description":{"identifier":"geometry.test_player","texture_width":64,"texture_height":64},"bones":[{"name":"body","pivot":[0,0,0],"cubes":[{"origin":[-4,0,-2],"size":[8,12,4],"uv":[0,0]}]},{"name":"rightItem","parent":"body","pivot":[-6,12,0]},{"name":"leftItem","parent":"body","pivot":[6,12,0]}]}]}"#;
+    let render = br#"{"format_version":"1.8.0","render_controllers":{"controller.render.test_player":{"geometry":"Geometry.default"}}}"#;
+    let mut compiled = pack_entity_compiler::compile_entity_pack(vec![
+        ("entity/player.json".into(), entity.to_vec()),
+        ("models/entity/player.geo.json".into(), geometry.to_vec()),
+        ("render_controllers/player.json".into(), render.to_vec()),
+    ])
+    .unwrap()
+    .unwrap()
+    .assets;
+    compiled.block_visual_count = 2;
+    compiled.item_visuals = (0..16)
+        .map(|metadata| assets::ItemVisualDefinition {
+            grip: assets::item::grip::ItemGrip::Unresolved,
+            glint: assets::item::glint::ItemGlint::Unresolved,
+            fuel: assets::item::fuel::ItemFuel::Unresolved,
+            durability: assets::item::durability::ItemDurability::Unresolved,
+            armour: assets::item::armour::ItemArmour::Unresolved,
+            key: ItemVisualKey {
+                identifier: identifier.into(),
+                metadata,
+            },
+            source: 0,
+            route,
+            first_person: assets::ItemDisplayTransform::identity(),
+            third_person: assets::ItemDisplayTransform::identity(),
+            dropped: assets::ItemDisplayTransform::identity(),
+        })
+        .collect();
+    let entities = RuntimeEntityAssets::from_compiled(compiled.with_unresolved_item_use()).unwrap();
+    let sprites = (0..16)
+        .map(|metadata| {
+            let color = assets::banner::color_rgb(metadata);
+            let rgba8 = (0..16 * 16)
+                .flat_map(|pixel| {
+                    let [x, y] = [pixel % 16, pixel / 16];
+                    [
+                        color[0],
+                        color[1],
+                        color[2],
+                        if (5..=10).contains(&x) && y < 15 {
+                            255
+                        } else {
+                            0
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            assets::IconSprite {
+                width: 16,
+                height: 16,
+                rgba8: rgba8.into(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let entries = (0..16)
+        .map(|metadata| assets::IconEntry {
+            identifier: identifier.into(),
+            metadata,
+            sprite: metadata,
+        })
+        .collect::<Vec<_>>();
+    let icons = RuntimeIconCatalog::decode(
+        &assets::encode_icon_catalog(entities.source_manifest_sha256(), &sprites, &entries)
+            .unwrap(),
+    )
+    .unwrap();
+    (entities, icons)
+}
+
+#[test]
+fn held_banner_block_route_without_cube_sheet_remains_available_in_both_preview_hands() {
+    use crate::test_support::fixture_hud;
+    use crate::ui_runtime::presentation::UiPresentationRuntime;
+    use ui_engine::test_support::fixture_font;
+    let (entities, icons) = banner_catalog();
+    assert!(icons.block_sheets().is_empty());
+    let presentation =
+        UiPresentationRuntime::with_hud_and_icons(fixture_font(), fixture_hud(), Arc::new(icons))
+            .unwrap();
+    let icons = presentation.icon_catalog.as_deref().unwrap();
+    let icon_refs = presentation.icon_refs.as_deref().unwrap();
+    let mut atlas = atlas::Atlas::new(1, super::super::MODEL_PAGES);
+    let models = prepare(
+        &mut atlas,
+        &entities,
+        icons,
+        icon_refs,
+        None,
+        &BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        models.values().map(BTreeMap::len).sum::<usize>(),
+        icons.entries().len()
+    );
+    let skin = IconRef {
+        color_mask: None,
+        page: 0,
+        uv: [0, 0, 64, 64],
+        glint: false,
+    };
+    let draw = |hands: [Option<&PreviewHeldModel>; 2]| {
+        player_preview::geometry::mesh(
+            Default::default(),
+            Default::default(),
+            0.0,
+            skin,
+            &Default::default(),
+            [None; 4],
+            hands,
+            true,
+        )
+        .unwrap()
+    };
+    let bare = draw([None; 2]).vertices().len();
+    for definition in entities.item_visuals() {
+        assert!(matches!(
+            definition.route,
+            ItemVisualDefinitionRoute::BlockItem { .. }
+        ));
+        let model = models
+            .get(definition.key.identifier.as_ref())
+            .and_then(|variants| variants.get(&definition.key.metadata))
+            .and_then(|held| held.model(icons))
+            .expect("noncube block item retains its held model");
+        assert!(
+            model
+                .placements
+                .iter()
+                .all(|placement| matches!(placement, PreviewHeldPlacement::Sprite { .. }))
+        );
+        assert_eq!(
+            model.source,
+            presentation
+                .item_icon(&definition.key.identifier, definition.key.metadata)
+                .unwrap()
+        );
+        let right = draw([Some(&model), None]).vertices().len();
+        let left = draw([None, Some(&model)]).vertices().len();
+        assert!(right > bare && left > bare);
+        assert_eq!(
+            draw([Some(&model); 2]).vertices().len(),
+            right + left - bare
+        );
+    }
+    assert!(
+        atlas.finish().unwrap().0.is_empty(),
+        "sprite meshes must not upload duplicate source pages"
+    );
+}
+
+#[test]
+fn installed_gui_carriers_reuse_sprite_pages_within_the_model_atlas_budget() {
+    use crate::test_support::fixture_hud;
+    use crate::ui_runtime::presentation::UiPresentationRuntime;
+    use assets::carriers;
+    use ui_engine::test_support::fixture_font;
+    let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(carriers::COMPILED_DIR);
+    let read = |carrier: &carriers::Carrier| {
+        let path = compiled.join(carrier.output);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping installed_gui_carriers_reuse_sprite_pages_within_the_model_atlas_budget: missing {}; run make assets",
+                    path.display()
+                );
+                Err(())
+            }
+            Err(error) => panic!("read installed GUI fixture {}: {error}", path.display()),
+        }
+    };
+    let (Ok(world), Ok(entities), Ok(icons), Ok(equipment)) = (
+        read(&carriers::WORLD),
+        read(&carriers::ENTITY),
+        read(&carriers::ICON),
+        read(&carriers::EQUIPMENT),
+    ) else {
+        return;
+    };
+    let world = assets::RuntimeAssets::decode(&world).unwrap();
+    let entities = RuntimeEntityAssets::decode(&entities).unwrap();
+    let icons = Arc::new(RuntimeIconCatalog::decode(&icons).unwrap());
+    let equipment = Arc::new(RuntimeEquipmentCatalog::decode(&equipment).unwrap());
+    let mut presentation =
+        UiPresentationRuntime::with_hud_and_icons(fixture_font(), fixture_hud(), icons).unwrap();
+    presentation.set_equipment_catalog(Some(equipment));
+    presentation.set_gui_models(&world, &entities).unwrap();
+    let mut sprites = 0;
+    let icons = presentation.icon_catalog.as_deref().unwrap();
+    for (identifier, variants) in &presentation.gui_models.sources.held {
+        for (metadata, held) in variants {
+            let Some(model) = held.model(icons) else {
+                continue;
+            };
+            if matches!(model.placements[0], PreviewHeldPlacement::Sprite { .. }) {
+                // Carried artwork can differ from the inventory thumbnail.
+                let sprite = icons.lookup_held_index(identifier, *metadata).unwrap();
+                let original = presentation.icon_refs.as_ref().unwrap()[sprite];
+                assert_eq!(
+                    (model.source.page, model.source.uv),
+                    (original.page, original.uv)
+                );
+                assert!((model.source.page as usize) < presentation.textures.dynamic_start());
+                sprites += 1;
+            }
+        }
+    }
+    assert!(
+        sprites > 0,
+        "installed items exercise the resident sprite path"
+    );
+}
+
+// Local-only: cutout cubes and chests draw as geometry; blended cubes retain composed thumbnails.
+#[test]
+fn installed_see_through_and_chest_blocks_draw_as_gui_geometry() {
+    use crate::test_support::fixture_hud;
+    use crate::ui_runtime::presentation::UiPresentationRuntime;
+    use assets::carriers;
+    use ui_engine::test_support::fixture_font;
+    let compiled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(carriers::COMPILED_DIR);
+    let read = |carrier: &carriers::Carrier| {
+        let path = compiled.join(carrier.output);
+        std::fs::read(&path).map_err(|_| {
+            eprintln!(
+                "skipping installed_see_through_and_chest_blocks_draw_as_gui_geometry: missing {}; run make assets",
+                path.display()
+            );
+        })
+    };
+    let (Ok(world), Ok(entities), Ok(icons)) = (
+        read(&carriers::WORLD),
+        read(&carriers::ENTITY),
+        read(&carriers::ICON),
+    ) else {
+        return;
+    };
+    let world = assets::RuntimeAssets::decode(&world).unwrap();
+    let entities = RuntimeEntityAssets::decode(&entities).unwrap();
+    let icons = Arc::new(RuntimeIconCatalog::decode(&icons).unwrap());
+    let mut presentation =
+        UiPresentationRuntime::with_hud_and_icons(fixture_font(), fixture_hud(), icons).unwrap();
+    presentation.set_gui_models(&world, &entities).unwrap();
+    for identifier in [
+        "minecraft:chest",
+        "minecraft:oak_leaves",
+        "minecraft:glass",
+        "minecraft:anvil",
+    ] {
+        let icon = presentation.item_icon(identifier, 0).unwrap();
+        assert!(
+            presentation
+                .gui_models
+                .sources
+                .models
+                .contains_key(&super::super::icon_key(icon)),
+            "{identifier} draws as GUI geometry"
+        );
+    }
+    let blended = presentation
+        .item_icon("minecraft:white_stained_glass", 0)
+        .unwrap();
+    assert!(
+        !presentation
+            .gui_models
+            .sources
+            .models
+            .contains_key(&super::super::icon_key(blended)),
+        "fractional blended cubes retain the thumbnail's rear-face compositing"
+    );
+}

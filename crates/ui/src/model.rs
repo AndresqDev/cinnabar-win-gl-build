@@ -1,0 +1,913 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    ops::Range,
+    sync::Arc,
+};
+
+use crate::{UiAction, UiLimits, UiPoint, UiRect, UiScale};
+
+mod budget;
+mod draw;
+mod mesh;
+mod visual;
+pub use visual::{TextShadow, UiVisual};
+mod painted_bounds;
+mod projection;
+mod repeat;
+mod retained;
+
+use budget::DrawCounts;
+
+#[cfg(test)]
+mod budget_tests;
+
+use draw::{emit_visual, is_empty};
+pub use mesh::{UiMesh, UiMeshBatch, UiMeshError, UiMeshVertex};
+pub use projection::UiWorldProjection;
+pub use retained::{DrawUpdate, RetainedDraw};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct UiNodeId(u32);
+
+impl UiNodeId {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// Fixed-function blend selection for a drawn quad.
+///
+/// `Invert` is the classic crosshair blend — src*(1-dst) + dst*(1-src) — so a
+/// white sprite reads against any background. `Backdrop` draws no UI pixels: its geometry
+/// shows the 3-D scene processed by each vertex's [`render_api::UiBackdropPaint`], applied
+/// before any UI layer composites. `Filter` closes the filter group of the batches just
+/// before it: its geometry shows what that group drew, blurred by the vertex paint's `blur`.
+/// Quads with different blends never share a draw batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UiBlendMode {
+    #[default]
+    Alpha,
+    Invert,
+    Backdrop,
+    Filter,
+}
+
+/// A paint-time 2-D affine map of one node's own visual, in that node's coordinates:
+/// points relative to its bounds' top-left, in the same units as its bounds. It moves only
+/// the drawn vertices; layout, the node's clip scissor, children and input bounds stay put.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiTransform {
+    /// Column-major `[a, b, c, d]`: `x' = a x + c y + e`, `y' = b x + d y + f`.
+    pub linear: [f32; 4],
+    /// `[e, f]`.
+    pub translation: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiNode {
+    id: UiNodeId,
+    parent: Option<UiNodeId>,
+    bounds: UiRect,
+    focusable: bool,
+    navigation_order: Option<u32>,
+    clip_children: bool,
+    viewport_clip: Option<UiRect>,
+    visual: UiVisual,
+    world_projection: Option<UiWorldProjection>,
+    transform: Option<UiTransform>,
+    filter_group: Option<u32>,
+}
+
+impl UiNode {
+    pub fn new(id: UiNodeId, parent: Option<UiNodeId>, bounds: UiRect) -> Self {
+        Self {
+            id,
+            parent,
+            bounds,
+            focusable: false,
+            navigation_order: None,
+            clip_children: false,
+            viewport_clip: None,
+            visual: UiVisual::None,
+            world_projection: None,
+            transform: None,
+            filter_group: None,
+        }
+    }
+
+    /// Draws this node's own visual into filter group `group` instead of straight into its
+    /// layer; a later [`UiBlendMode::Filter`] batch composites the group.
+    pub fn with_filter_group(mut self, group: u32) -> Self {
+        self.filter_group = Some(group);
+        self
+    }
+
+    pub const fn filter_group(&self) -> Option<u32> {
+        self.filter_group
+    }
+
+    /// Moves this node's own drawn vertices by `transform`; world-projected nodes ignore it.
+    pub fn with_transform(mut self, transform: UiTransform) -> Self {
+        self.transform = Some(transform);
+        self
+    }
+
+    pub const fn transform(&self) -> Option<&UiTransform> {
+        self.transform.as_ref()
+    }
+
+    pub fn with_focusable(mut self, focusable: bool) -> Self {
+        self.focusable = focusable;
+        self
+    }
+
+    pub fn with_navigation_order(mut self, navigation_order: u32) -> Self {
+        self.navigation_order = Some(navigation_order);
+        self
+    }
+
+    pub fn with_clip_children(mut self, clip_children: bool) -> Self {
+        self.clip_children = clip_children;
+        self
+    }
+
+    /// Uses an absolute viewport clip without changing the node's layout coordinates.
+    pub fn with_viewport_clip(mut self, clip: UiRect) -> Self {
+        self.viewport_clip = Some(clip);
+        self
+    }
+
+    /// The absolute viewport clip, when this node overrides its inherited clip.
+    pub const fn viewport_clip(&self) -> Option<UiRect> {
+        self.viewport_clip
+    }
+
+    pub fn with_visual(mut self, visual: UiVisual) -> Self {
+        self.visual = visual;
+        self
+    }
+
+    /// Repositions a node while preserving its visual, clipping and input metadata.
+    pub fn with_bounds(mut self, bounds: UiRect) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    /// Reparents a retained visual into a new tree without copying its artwork.
+    pub fn with_identity(mut self, id: UiNodeId, parent: Option<UiNodeId>) -> Self {
+        self.id = id;
+        self.parent = parent;
+        self
+    }
+
+    /// Draws local font/geometry coordinates through a world transform instead of HUD layout.
+    /// Projection is per node; safe-area offsets, GUI scale and parent clips do not apply.
+    pub fn with_world_projection(mut self, projection: UiWorldProjection) -> Self {
+        self.world_projection = Some(projection);
+        self
+    }
+
+    pub const fn id(&self) -> UiNodeId {
+        self.id
+    }
+
+    pub const fn parent(&self) -> Option<UiNodeId> {
+        self.parent
+    }
+
+    pub const fn bounds(&self) -> UiRect {
+        self.bounds
+    }
+
+    pub const fn visual(&self) -> &UiVisual {
+        &self.visual
+    }
+
+    pub const fn clips_children(&self) -> bool {
+        self.clip_children
+    }
+
+    /// The same node under another id and parent, to reorder retained nodes: siblings draw in
+    /// id order.
+    pub fn renumbered(mut self, id: UiNodeId, parent: Option<UiNodeId>) -> Self {
+        self.id = id;
+        self.parent = parent;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FocusState {
+    focused: Option<UiNodeId>,
+    pointer_capture: Option<UiNodeId>,
+    focusable: BTreeSet<UiNodeId>,
+}
+
+impl FocusState {
+    fn new(focusable: BTreeSet<UiNodeId>) -> Self {
+        Self {
+            focused: None,
+            pointer_capture: None,
+            focusable,
+        }
+    }
+
+    pub const fn focused(&self) -> Option<UiNodeId> {
+        self.focused
+    }
+
+    pub const fn pointer_capture(&self) -> Option<UiNodeId> {
+        self.pointer_capture
+    }
+
+    pub fn set_focused(&mut self, focused: Option<UiNodeId>) -> Option<UiNodeId> {
+        if focused.is_some_and(|node| !self.focusable.contains(&node)) {
+            return None;
+        }
+        if self.focused == focused {
+            return None;
+        }
+        self.focused = focused;
+        self.pointer_capture.take()
+    }
+
+    pub fn capture_pointer(&mut self, node: UiNodeId) -> Result<(), UiError> {
+        if !self.focusable.contains(&node) {
+            return Err(UiError::InvalidFocusNode { node });
+        }
+        if self.focused != Some(node) {
+            return Err(UiError::PointerCaptureRequiresFocus { node });
+        }
+        self.pointer_capture = Some(node);
+        Ok(())
+    }
+
+    pub fn release_pointer(&mut self) -> Option<UiNodeId> {
+        self.pointer_capture.take()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FocusTransition {
+    pub focused: Option<UiNodeId>,
+    pub released_capture: Option<UiNodeId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UiFrame {
+    tree_identity: Arc<UiTreeIdentity>,
+    revision: u64,
+    viewport: UiRect,
+    bounds: BTreeMap<UiNodeId, UiRect>,
+    effective_clips: BTreeMap<UiNodeId, UiRect>,
+    focus_order: Box<[UiNodeId]>,
+    draw_order: Box<[UiNodeId]>,
+    /// Frame units per node unit, which scales node transforms' translations.
+    scale: f32,
+}
+
+impl UiFrame {
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn focus_order(&self) -> &[UiNodeId] {
+        &self.focus_order
+    }
+
+    pub fn bounds(&self, node: UiNodeId) -> Option<UiRect> {
+        self.bounds.get(&node).copied()
+    }
+}
+
+/// Vertex style bit asking the renderer to draw the enchantment glint.
+pub const UI_STYLE_GLINT: u8 = 1 << 1;
+/// Vertex style bit for JSON-UI `grayscale` sprites.
+pub const UI_STYLE_GRAYSCALE: u8 = 1 << 2;
+/// Vertex style bit for JSON-UI `bilinear` sprites.
+pub const UI_STYLE_BILINEAR: u8 = render_api::UI_STYLE_BILINEAR;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiVertex {
+    /// Logical screen XY multiplied by clip W; ordinary HUD coordinates have W=1.
+    pub position: [f32; 2],
+    /// Homogeneous clip Z and W; HUD vertices use 0 and 1 respectively.
+    pub clip_z: f32,
+    pub clip_w: f32,
+    pub uv: [f32; 2],
+    pub color: [u8; 4],
+    /// Linear lighting or coverage border area.
+    pub model_light: f32,
+    /// Entity overlay RGB and mix amount, or the coverage paint's packed constant colors.
+    pub overlay_color: [f32; 4],
+    pub style_flags: u32,
+    /// Sampled-texture cutoff (negative disables it).
+    pub alpha_cutoff: f32,
+}
+
+impl UiVertex {
+    /// Whether the vertex requests the default sampled-alpha test.
+    #[must_use]
+    pub const fn alpha_test(&self) -> bool {
+        self.style_flags & render_api::UI_STYLE_ALPHA_TEST != 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiDrawBatch {
+    pub texture_page: u16,
+    pub clip: UiRect,
+    pub blend: UiBlendMode,
+    pub depth_test: bool,
+    pub depth_write: bool,
+    pub world_projection: bool,
+    /// One model control's private depth lifetime; never the world depth buffer.
+    pub isolated_depth_scope: Option<u32>,
+    /// The filter group this batch draws into, composited by a later filter batch.
+    pub filter_group: Option<u32>,
+    pub index_range: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiDrawList {
+    pub revision: u64,
+    pub vertices: Vec<UiVertex>,
+    pub indices: Vec<u32>,
+    pub batches: Vec<UiDrawBatch>,
+}
+
+/// Per-frame text-draw inputs the content-hashed layout cache cannot hold: the
+/// same-width obfuscation pools and the frame seed that animates `§k` runs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextEffects<'a> {
+    /// The active pack's formatting table; geometry remains reusable across palette changes.
+    pub palette: Option<&'a crate::FormattingPalette>,
+    pub obfuscation_seed: u64,
+    pub obfuscation: Option<&'a crate::ObfuscationGlyphs>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum UiError {
+    NodeLimitExceeded { actual: usize, limit: usize },
+    FocusableLimitExceeded { actual: usize, limit: usize },
+    DuplicateNodeId { id: UiNodeId },
+    MissingParent { node: UiNodeId, parent: UiNodeId },
+    ParentCycle { node: UiNodeId },
+    InvalidSafeViewport,
+    InvalidSpriteCoordinates,
+    LayoutRevisionOverflow,
+    MissingLayoutBounds { node: UiNodeId },
+    StaleFrame { expected: u64, actual: u64 },
+    ForeignFrame,
+    InvalidFocusNode { node: UiNodeId },
+    PointerCaptureRequiresFocus { node: UiNodeId },
+    ClipDepthExceeded { actual: usize, limit: usize },
+    VertexLimitExceeded { actual: usize, limit: usize },
+    IndexLimitExceeded { actual: usize, limit: usize },
+    DrawBatchLimitExceeded { actual: usize, limit: usize },
+    DrawByteLimitExceeded { actual: usize, limit: usize },
+    DrawIndexOverflow,
+    DrawAllocationFailed,
+    InvalidWorldProjection { node: UiNodeId },
+    MeshWorldProjectionConflict { node: UiNodeId },
+}
+
+impl fmt::Display for UiError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "retained UI error: {self:?}")
+    }
+}
+
+impl std::error::Error for UiError {}
+
+pub struct UiTree {
+    identity: Arc<UiTreeIdentity>,
+    nodes: BTreeMap<UiNodeId, UiNode>,
+    children: BTreeMap<UiNodeId, Vec<UiNodeId>>,
+    roots: Box<[UiNodeId]>,
+    focus: FocusState,
+    revision: u64,
+    frame: Option<UiFrame>,
+}
+
+#[derive(Debug)]
+struct UiTreeIdentity;
+
+impl UiTree {
+    pub fn new(nodes: Vec<UiNode>) -> Result<Self, UiError> {
+        if nodes.len() > UiLimits::MAX_NODES {
+            return Err(UiError::NodeLimitExceeded {
+                actual: nodes.len(),
+                limit: UiLimits::MAX_NODES,
+            });
+        }
+        let mut by_id = BTreeMap::new();
+        for node in nodes {
+            let id = node.id;
+            if node.world_projection.is_some()
+                && matches!(node.visual, UiVisual::Mesh(_) | UiVisual::TintedMesh { .. })
+            {
+                return Err(UiError::MeshWorldProjectionConflict { node: id });
+            }
+            if node
+                .world_projection
+                .is_some_and(|projection| !projection.is_valid())
+            {
+                return Err(UiError::InvalidWorldProjection { node: id });
+            }
+            if by_id.insert(id, node).is_some() {
+                return Err(UiError::DuplicateNodeId { id });
+            }
+        }
+        for node in by_id.values() {
+            if let Some(parent) = node.parent
+                && !by_id.contains_key(&parent)
+            {
+                return Err(UiError::MissingParent {
+                    node: node.id,
+                    parent,
+                });
+            }
+        }
+        reject_parent_cycles(&by_id)?;
+
+        let focusable = by_id
+            .values()
+            .filter(|node| node.focusable)
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        if focusable.len() > UiLimits::MAX_FOCUSABLE {
+            return Err(UiError::FocusableLimitExceeded {
+                actual: focusable.len(),
+                limit: UiLimits::MAX_FOCUSABLE,
+            });
+        }
+        let mut children = BTreeMap::<UiNodeId, Vec<UiNodeId>>::new();
+        let mut roots = Vec::new();
+        for node in by_id.values() {
+            if let Some(parent) = node.parent {
+                children.entry(parent).or_default().push(node.id);
+            } else {
+                roots.push(node.id);
+            }
+        }
+
+        Ok(Self {
+            identity: Arc::new(UiTreeIdentity),
+            nodes: by_id,
+            children,
+            roots: roots.into_boxed_slice(),
+            focus: FocusState::new(focusable),
+            revision: 0,
+            frame: None,
+        })
+    }
+
+    pub fn focus(&self) -> &FocusState {
+        &self.focus
+    }
+
+    pub fn focus_mut(&mut self) -> &mut FocusState {
+        &mut self.focus
+    }
+
+    /// Visits roots and sibling subtrees in the same ID order used by retained painting.
+    pub fn paint_order(&self) -> impl Iterator<Item = &UiNode> {
+        let mut pending = self.roots.iter().rev().copied().collect::<Vec<_>>();
+        std::iter::from_fn(move || {
+            let id = pending.pop()?;
+            if let Some(children) = self.children.get(&id) {
+                pending.extend(children.iter().rev().copied());
+            }
+            Some(&self.nodes[&id])
+        })
+    }
+
+    pub fn layout(
+        &mut self,
+        viewport: UiRect,
+        scale: UiScale,
+        safe_area: crate::SafeArea,
+    ) -> Result<UiFrame, UiError> {
+        let content_min = UiPoint::new(
+            viewport.min().x() + safe_area.left(),
+            viewport.min().y() + safe_area.top(),
+        )
+        .map_err(|_| UiError::InvalidSafeViewport)?;
+        let content_max = UiPoint::new(
+            viewport.max().x() - safe_area.right(),
+            viewport.max().y() - safe_area.bottom(),
+        )
+        .map_err(|_| UiError::InvalidSafeViewport)?;
+        let content =
+            UiRect::new(content_min, content_max).map_err(|_| UiError::InvalidSafeViewport)?;
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(UiError::LayoutRevisionOverflow)?;
+
+        let mut bounds = BTreeMap::new();
+        let mut effective_clips = BTreeMap::new();
+        let mut draw_order = Vec::with_capacity(self.nodes.len());
+        let mut pending = self
+            .roots
+            .iter()
+            .rev()
+            .map(|id| (*id, content))
+            .collect::<Vec<_>>();
+        while let Some((id, clip)) = pending.pop() {
+            let node = &self.nodes[&id];
+            let clip = node.viewport_clip.unwrap_or(clip);
+            let origin = node
+                .parent
+                .and_then(|parent| bounds.get(&parent).copied())
+                .map_or(content.min(), UiRect::min);
+            let scaled = if node.world_projection.is_some() {
+                node.bounds
+            } else {
+                scale_rect(node.bounds, origin, scale.get())?
+            };
+            bounds.insert(id, scaled);
+            effective_clips.insert(id, clip);
+            draw_order.push(id);
+            let child_clip = if node.clip_children {
+                intersect(clip, scaled)
+            } else {
+                clip
+            };
+            if let Some(children) = self.children.get(&id) {
+                pending.extend(children.iter().rev().map(|child| (*child, child_clip)));
+            }
+        }
+
+        let mut focus_order = self
+            .nodes
+            .values()
+            .filter(|node| node.focusable)
+            .map(|node| {
+                let node_bounds = bounds[&node.id];
+                (
+                    node.navigation_order.is_none(),
+                    node.navigation_order.unwrap_or(u32::MAX),
+                    FloatOrder::new(node_bounds.min().y()),
+                    FloatOrder::new(node_bounds.min().x()),
+                    node.id,
+                )
+            })
+            .collect::<Vec<_>>();
+        focus_order.sort_unstable();
+        let frame = UiFrame {
+            tree_identity: Arc::clone(&self.identity),
+            revision: next_revision,
+            viewport: content,
+            bounds,
+            effective_clips,
+            focus_order: focus_order.into_iter().map(|(_, _, _, _, id)| id).collect(),
+            draw_order: draw_order.into_boxed_slice(),
+            scale: scale.get(),
+        };
+        self.revision = next_revision;
+        self.frame = Some(frame.clone());
+        Ok(frame)
+    }
+
+    pub fn handle_action(
+        &mut self,
+        frame: &UiFrame,
+        action: UiAction,
+    ) -> Result<FocusTransition, UiError> {
+        if !Arc::ptr_eq(&frame.tree_identity, &self.identity) {
+            return Err(UiError::ForeignFrame);
+        }
+        if frame.revision != self.revision {
+            return Err(UiError::StaleFrame {
+                expected: self.revision,
+                actual: frame.revision,
+            });
+        }
+        let previous_capture = self.focus.pointer_capture();
+        match action {
+            UiAction::TabNext => self.move_focus(frame, 1),
+            UiAction::TabPrevious => self.move_focus(frame, -1),
+            UiAction::Navigate([horizontal, vertical]) if horizontal != 0 || vertical != 0 => {
+                let step = if vertical < 0 || (vertical == 0 && horizontal < 0) {
+                    -1
+                } else {
+                    1
+                };
+                self.move_focus(frame, step);
+            }
+            UiAction::PointerPrimary { position, phase } => match phase {
+                crate::PointerPhase::Pressed => {
+                    if let Some(node) = frame
+                        .draw_order
+                        .iter()
+                        .rev()
+                        .copied()
+                        .filter(|node| self.nodes[node].focusable)
+                        .find(|node| {
+                            let clip = frame.effective_clips[node];
+                            !is_empty(clip)
+                                && clip.contains(position)
+                                && frame.bounds[node].contains(position)
+                        })
+                    {
+                        self.focus.set_focused(Some(node));
+                        self.focus.capture_pointer(node)?;
+                    }
+                }
+                crate::PointerPhase::Released => {
+                    self.focus.release_pointer();
+                }
+                crate::PointerPhase::Held => {}
+            },
+            _ => {}
+        }
+        let released_capture =
+            previous_capture.filter(|capture| self.focus.pointer_capture() != Some(*capture));
+        Ok(FocusTransition {
+            focused: self.focus.focused(),
+            released_capture,
+        })
+    }
+
+    pub fn build_draw_list(&self) -> Result<UiDrawList, UiError> {
+        self.build_draw_list_with(TextEffects::default())
+    }
+
+    /// As [`Self::build_draw_list`], but applies `§k`/`§l`/`§o` style effects:
+    /// obfuscation swaps each frame from `effects`, bold and italic from the
+    /// glyphs' own style.
+    pub fn build_draw_list_with(&self, effects: TextEffects<'_>) -> Result<UiDrawList, UiError> {
+        let synthetic;
+        let frame = if let Some(frame) = &self.frame {
+            frame
+        } else {
+            synthetic = self.synthetic_frame()?;
+            &synthetic
+        };
+        let (batch_capacity, vertex_count, index_count) = self.draw_budget()?;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut batches = Vec::new();
+        vertices
+            .try_reserve_exact(vertex_count)
+            .map_err(|_| UiError::DrawAllocationFailed)?;
+        indices
+            .try_reserve_exact(index_count)
+            .map_err(|_| UiError::DrawAllocationFailed)?;
+        batches
+            .try_reserve_exact(batch_capacity)
+            .map_err(|_| UiError::DrawAllocationFailed)?;
+
+        let mut pending = self
+            .roots
+            .iter()
+            .rev()
+            .map(|id| (*id, frame.viewport, 0usize))
+            .collect::<Vec<_>>();
+        while let Some((id, clip, clip_depth)) = pending.pop() {
+            let node = &self.nodes[&id];
+            let bounds = frame
+                .bounds(id)
+                .ok_or(UiError::MissingLayoutBounds { node: id })?;
+            let clip = match node.world_projection {
+                Some(projection) => projection
+                    .viewport_clip()
+                    .map_err(|_| UiError::InvalidWorldProjection { node: id })?,
+                None => node.viewport_clip.unwrap_or(clip),
+            };
+            if !is_empty(clip) {
+                emit_visual(
+                    &node.visual,
+                    bounds,
+                    draw::DrawSpace {
+                        clip,
+                        projection: node.world_projection.as_ref(),
+                        node: id,
+                        transform: node.transform.as_ref().map(|transform| {
+                            draw::FrameAffine::for_node(transform, bounds, frame.scale)
+                        }),
+                        filter: node.filter_group,
+                    },
+                    effects,
+                    &mut vertices,
+                    &mut indices,
+                    &mut batches,
+                )?;
+            }
+
+            let (child_clip, child_depth) = if node.clip_children {
+                let actual = clip_depth
+                    .checked_add(1)
+                    .ok_or(UiError::DrawIndexOverflow)?;
+                if actual > UiLimits::MAX_CLIP_DEPTH {
+                    return Err(UiError::ClipDepthExceeded {
+                        actual,
+                        limit: UiLimits::MAX_CLIP_DEPTH,
+                    });
+                }
+                (intersect(clip, bounds), actual)
+            } else {
+                (clip, clip_depth)
+            };
+            if let Some(children) = self.children.get(&id) {
+                pending.extend(
+                    children
+                        .iter()
+                        .rev()
+                        .map(|child| (*child, child_clip, child_depth)),
+                );
+            }
+        }
+        Ok(UiDrawList {
+            revision: frame.revision,
+            vertices,
+            indices,
+            batches,
+        })
+    }
+
+    fn move_focus(&mut self, frame: &UiFrame, step: isize) {
+        if frame.focus_order.is_empty() {
+            self.focus.set_focused(None);
+            return;
+        }
+        let current = self
+            .focus
+            .focused()
+            .and_then(|focused| frame.focus_order.iter().position(|node| *node == focused));
+        let next = match (current, step.is_negative()) {
+            (Some(index), false) => (index + 1) % frame.focus_order.len(),
+            (Some(0), true) | (None, true) => frame.focus_order.len() - 1,
+            (Some(index), true) => index - 1,
+            (None, false) => 0,
+        };
+        self.focus.set_focused(Some(frame.focus_order[next]));
+    }
+
+    fn synthetic_frame(&self) -> Result<UiFrame, UiError> {
+        let viewport = UiRect::new(
+            UiPoint::new(-f32::MAX / 4.0, -f32::MAX / 4.0)
+                .map_err(|_| UiError::InvalidSafeViewport)?,
+            UiPoint::new(f32::MAX / 4.0, f32::MAX / 4.0)
+                .map_err(|_| UiError::InvalidSafeViewport)?,
+        )
+        .map_err(|_| UiError::InvalidSafeViewport)?;
+        Ok(UiFrame {
+            tree_identity: Arc::clone(&self.identity),
+            revision: self.revision,
+            viewport,
+            bounds: self
+                .nodes
+                .iter()
+                .map(|(id, node)| (*id, node.bounds))
+                .collect(),
+            effective_clips: BTreeMap::new(),
+            focus_order: Box::new([]),
+            draw_order: Box::new([]),
+            scale: 1.0,
+        })
+    }
+
+    /// The `(batch, vertex, index)` capacities this tree's draw list reserves, within limits.
+    fn draw_budget(&self) -> Result<(usize, usize, usize), UiError> {
+        Self::visual_budget(self.nodes.values().map(|node| &node.visual))
+    }
+
+    /// Checks a complete frame's visual reservations without allocating a tree or draw list.
+    pub fn check_visual_budget<'a>(
+        visuals: impl IntoIterator<Item = &'a UiVisual>,
+    ) -> Result<(), UiError> {
+        Self::visual_budget(visuals).map(|_| ())
+    }
+
+    /// Checks surrounding visuals and repeated meshes, returning the batch bound before coalescing.
+    pub fn check_visual_budget_with_mesh<'a>(
+        surrounding: impl IntoIterator<Item = &'a UiVisual>,
+        mesh_indices: usize,
+        mesh_batches: usize,
+        instances: usize,
+    ) -> Result<usize, UiError> {
+        let indices = mesh_indices
+            .checked_mul(instances)
+            .ok_or(UiError::DrawIndexOverflow)?;
+        let batches = mesh_batches
+            .checked_mul(instances)
+            .ok_or(UiError::DrawIndexOverflow)?;
+        let mut total = DrawCounts {
+            mesh_vertices: indices,
+            mesh_indices: indices,
+            mesh_batches: batches,
+            ..Default::default()
+        };
+        for visual in surrounding {
+            total = total.add(DrawCounts::of(visual)?)?;
+        }
+        total.budget()?;
+        total.batch_upper_bound()
+    }
+
+    /// Uses the same reservation contract for prospective visuals and installed tree nodes.
+    fn visual_budget<'a>(
+        visuals: impl IntoIterator<Item = &'a UiVisual>,
+    ) -> Result<(usize, usize, usize), UiError> {
+        let mut total = DrawCounts::default();
+        for visual in visuals {
+            total = total.add(DrawCounts::of(visual)?)?;
+        }
+        total.budget()
+    }
+}
+
+fn reject_parent_cycles(nodes: &BTreeMap<UiNodeId, UiNode>) -> Result<(), UiError> {
+    let mut complete = BTreeSet::new();
+    for start in nodes.keys().copied() {
+        if complete.contains(&start) {
+            continue;
+        }
+        let mut path = BTreeSet::new();
+        let mut visited = Vec::new();
+        let mut cursor = Some(start);
+        while let Some(id) = cursor {
+            if complete.contains(&id) {
+                break;
+            }
+            if !path.insert(id) {
+                return Err(UiError::ParentCycle { node: id });
+            }
+            visited.push(id);
+            cursor = nodes[&id].parent;
+        }
+        complete.extend(visited);
+    }
+    Ok(())
+}
+
+fn scale_rect(rect: UiRect, origin: UiPoint, scale: f32) -> Result<UiRect, UiError> {
+    UiRect::new(
+        UiPoint::new(
+            origin.x() + rect.min().x() * scale,
+            origin.y() + rect.min().y() * scale,
+        )
+        .map_err(|_| UiError::InvalidSafeViewport)?,
+        UiPoint::new(
+            origin.x() + rect.max().x() * scale,
+            origin.y() + rect.max().y() * scale,
+        )
+        .map_err(|_| UiError::InvalidSafeViewport)?,
+    )
+    .map_err(|_| UiError::InvalidSafeViewport)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FloatOrder(u32);
+
+impl FloatOrder {
+    fn new(value: f32) -> Self {
+        Self(value.to_bits())
+    }
+}
+
+impl From<f32> for FloatOrder {
+    fn from(value: f32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl Ord for FloatOrder {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        f32::from_bits(self.0).total_cmp(&f32::from_bits(other.0))
+    }
+}
+
+impl PartialOrd for FloatOrder {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn intersect(left: UiRect, right: UiRect) -> UiRect {
+    UiRect::new(
+        UiPoint::new(
+            left.min().x().max(right.min().x()),
+            left.min().y().max(right.min().y()),
+        )
+        .expect("finite rectangles have a finite intersection minimum"),
+        UiPoint::new(
+            left.max().x().min(right.max().x()),
+            left.max().y().min(right.max().y()),
+        )
+        .expect("finite rectangles have a finite intersection maximum"),
+    )
+    .unwrap_or_else(|_| {
+        let point = UiPoint::new(0.0, 0.0).expect("zero is finite");
+        UiRect::new(point, point).expect("equal points form a rectangle")
+    })
+}

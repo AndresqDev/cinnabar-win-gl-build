@@ -1,0 +1,437 @@
+use super::*;
+
+#[test]
+fn actor_move_partial_target_keeps_a_newer_unmarked_update_across_a_deferred_correction() {
+    for (position, expected) in [
+        ([Some(10.0), Some(80.0), Some(20.0)], [10.0, 81.0, 20.0]),
+        ([None, Some(80.0), None], [2.0, 81.0, 3.0]),
+    ] {
+        let mut stream = block_entity_visual_stream();
+        stream.submit(1, worker_block_batch(0, 1)).unwrap();
+        assert_eq!(stream.stats().queued_decode_jobs, 1);
+        stream
+            .submit(
+                2,
+                WorldEvent::PlayerMovementCorrection(PlayerMovementCorrectionEvent {
+                    position: [2.0, 70.0, 3.0],
+                    delta: [0.0; 3],
+                    pitch: 0.0,
+                    yaw: 0.0,
+                    subject: MovementCorrectionSubject::Player,
+                    on_ground: true,
+                    tick: 100,
+                    vehicle_angular_velocity: None,
+                }),
+            )
+            .unwrap();
+        let mut movement = ActorMoveEvent {
+            dimension: 0,
+            runtime_id: 1,
+            position,
+            position_origin: ActorPositionOrigin::NetworkOffset,
+            pitch: None,
+            yaw: None,
+            head_yaw: None,
+            on_ground: Some(true),
+            teleported: false,
+            force_local_move: false,
+            player_mode: None,
+            source_tick: None,
+            interpolation: Default::default(),
+        };
+        stream
+            .submit(3, WorldEvent::Actor(ActorEvent::Move(movement)))
+            .unwrap();
+        assert!(stream.order.is_finished(3));
+        assert!(stream.take_committed_controls().is_empty());
+        complete_pending_decode_jobs(&mut stream);
+        assert!(matches!(
+            stream.take_committed_controls().as_slice(),
+            [CommittedControlEvent::PlayerMovementCorrection { sequence: 2, .. }]
+        ));
+        movement.position = [None, Some(81.0), None];
+        movement.force_local_move = true;
+        stream
+            .submit(4, WorldEvent::Actor(ActorEvent::Move(movement)))
+            .unwrap();
+        assert!(matches!(
+            stream.take_committed_controls().as_slice(),
+            [CommittedControlEvent::LocalActorMove { resolved, .. }]
+                if resolved.position == expected
+        ));
+    }
+}
+
+#[test]
+fn newer_update_waits_for_older_decode_and_wins() {
+    let key = SubChunkKey::new(0, 0, -4, 0);
+    let decoded = DecodedLevelChunk::decode(
+        -4,
+        1,
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../world/fixtures/uniform_non_air.bin"
+        )),
+        &RAW_IDS,
+    );
+    let mut ordered = client_world::ingestion::OrderedCommitState::new(1);
+    let column = || client_world::ingestion::Footprint::terrain([key.chunk()], true);
+    ordered.admit(2, column(), 0).unwrap();
+    ordered
+        .insert_ready(
+            2,
+            PreparedWorldEvent::Immediate(WorldEvent::BlockUpdates(vec![BlockUpdateEvent {
+                dimension: key.dimension,
+                position: [0, key.y * 16, 0],
+                layer: 0,
+                network_id: 99,
+            }])),
+        )
+        .unwrap();
+    assert!(ordered.next_commit().is_none(), "sequence two must wait");
+    ordered.admit(1, column(), 0).unwrap();
+    ordered
+        .insert_ready(
+            1,
+            PreparedWorldEvent::InlineLevelChunk {
+                event: LevelChunkEvent {
+                    dimension: key.dimension,
+                    x: key.x,
+                    z: key.z,
+                    mode: LevelChunkMode::Inline { count: 1 },
+                    payload: Vec::new(),
+                },
+                decoded,
+                light_neutral: Vec::new(),
+                duration: Duration::ZERO,
+            },
+        )
+        .unwrap();
+
+    let mut store = ChunkStore::new();
+    while let Some(step) = ordered.next_commit() {
+        let sequence = match step {
+            CommitStep::Apply {
+                sequence,
+                event: PreparedWorldEvent::InlineLevelChunk { event, decoded, .. },
+            } => {
+                store
+                    .commit_level_chunk(ChunkKey::new(event.dimension, event.x, event.z), decoded)
+                    .unwrap();
+                sequence
+            }
+            CommitStep::BlockUpdates { sequence, events } => {
+                assert_eq!(events.len(), 1);
+                let (key, update) = split_block_update(events.into_iter().next().unwrap()).unwrap();
+                store.update_block(key, update, RAW_IDS.air).unwrap();
+                sequence
+            }
+            other => panic!("unexpected commit step {other:?}"),
+        };
+        assert!(ordered.finish_commit(sequence));
+    }
+
+    assert_eq!(
+        store.sub_chunk(key).unwrap().runtime_id(0, 0, 0, 0),
+        Some(99)
+    );
+}
+
+/// Parallel decode workers may finish out of order; commits must still follow wire order.
+#[test]
+fn out_of_order_decode_completions_commit_in_sequence() {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        dimension: 0,
+        local_player_runtime_id: 1,
+        local_player_unique_id: 1,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    let key = SubChunkKey::new(0, 0, -4, 0);
+    stream
+        .submit(1, inline_block_entity_event(0, 5, Vec::new()))
+        .unwrap();
+    stream
+        .submit(2, inline_block_entity_event(0, 7, Vec::new()))
+        .unwrap();
+    let completions: Vec<_> = std::iter::from_fn(|| stream.pending_decode.pop_front())
+        .map(|queued| queued.job.run(queued.queued_at))
+        .collect();
+    assert_eq!(completions.len(), 2);
+
+    let mut completions = completions.into_iter().rev();
+    stream.accept_decode_completion(completions.next().unwrap());
+    stream.apply_ready();
+    assert_eq!(stream.order.next_sequence(), 1, "sequence two must wait");
+    assert!(stream.authority.terrain().sub_chunk(key).is_none());
+
+    stream.accept_decode_completion(completions.next().unwrap());
+    // Each pass commits at least one ready event; the frame budget may stop it after one.
+    stream.apply_ready();
+    stream.apply_ready();
+    assert_eq!(stream.order.next_sequence(), 3);
+    assert_eq!(
+        stream
+            .authority
+            .terrain()
+            .sub_chunk(key)
+            .unwrap()
+            .runtime_id(0, 0, 0, 0),
+        Some(7),
+        "the later wire column must win"
+    );
+}
+
+#[test]
+fn control_effects_are_exposed_only_after_older_heavy_sequence_commits_in_fifo_order() {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        local_player_unique_id: 1,
+        dimension: 0,
+        local_player_runtime_id: 1,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    let movement = MovePlayerEvent {
+        runtime_id: 1,
+        position: [4.0, 70.0, 5.0],
+        pitch: 7.0,
+        yaw: 9.0,
+        ..Default::default()
+    };
+    let change = ChangeDimensionEvent {
+        dimension: 1,
+        position: [8.0, 80.0, 9.0],
+        ..Default::default()
+    };
+    stream.submit(1, inline_air_event(0)).unwrap();
+    stream.submit(2, WorldEvent::MovePlayer(movement)).unwrap();
+    stream
+        .submit(3, WorldEvent::ChangeDimension(change))
+        .unwrap();
+
+    assert_eq!(stream.current_dimension(), 0);
+    assert!(stream.take_committed_controls().is_empty());
+
+    let super::DecodeJob::InlineLevelChunk {
+        event,
+        payload,
+        slots,
+        count,
+        ids,
+        ..
+    } = stream.pending_decode.pop_front().unwrap().job
+    else {
+        panic!("expected inline decode job")
+    };
+    let chunk = ChunkKey::new(event.dimension, event.x, event.z);
+    let decoded = DecodedLevelChunk::decode_inline(chunk, slots, count, &payload, &ids, &ids);
+    stream
+        .order
+        .insert_ready(
+            1,
+            super::PreparedWorldEvent::InlineLevelChunk {
+                event,
+                decoded,
+                light_neutral: Vec::new(),
+                duration: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+    // One heavy step per spent slice: the move follows the chunk at once as a light
+    // commit, while the dimension change is heavy and waits for the next slice.
+    apply_spent_slice(&mut stream);
+    assert_eq!(stream.order.next_sequence(), 3);
+    assert_eq!(stream.current_dimension(), 0);
+    apply_spent_slice(&mut stream);
+    assert_eq!(stream.order.next_sequence(), 4);
+    assert_eq!(stream.current_dimension(), 1);
+    let controls = stream.take_committed_controls();
+    assert!(matches!(
+        controls.as_slice(),
+        [
+            super::CommittedControlEvent::MovePlayer { sequence: 2, .. },
+            super::CommittedControlEvent::LocalMovementFlags {
+                sequence: 3,
+                replacement: true,
+                ..
+            },
+            super::CommittedControlEvent::LocalMovementSpeed {
+                sequence: 3,
+                dimension: 1,
+                ..
+            },
+            super::CommittedControlEvent::ChangeDimension { sequence: 3, .. },
+        ]
+    ));
+    assert_eq!(
+        controls
+            .into_iter()
+            .filter(|control| matches!(
+                control,
+                super::CommittedControlEvent::MovePlayer { .. }
+                    | super::CommittedControlEvent::ChangeDimension { .. }
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            super::CommittedControlEvent::MovePlayer {
+                sequence: 2,
+                movement,
+                resolved: super::server_position::ResolvedServerPosition {
+                    position: movement.position,
+                    surface_anchor: None,
+                },
+                source_cohort: None,
+            },
+            super::CommittedControlEvent::ChangeDimension {
+                sequence: 3,
+                change,
+                resolved: super::server_position::ResolvedServerPosition {
+                    position: change.position,
+                    surface_anchor: None,
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn movement_correction_commits_in_fifo_without_move_player_capture_metadata() {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        local_player_unique_id: 1,
+        dimension: 0,
+        local_player_runtime_id: 1,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    let correction = PlayerMovementCorrectionEvent {
+        position: [27.5, 111.0, 91.5],
+        delta: [0.25, -0.5, 0.75],
+        pitch: -12.0,
+        yaw: 143.0,
+        subject: MovementCorrectionSubject::Player,
+        on_ground: true,
+        tick: 4_096,
+        vehicle_angular_velocity: None,
+    };
+    stream.submit(1, inline_air_event(0)).unwrap();
+    stream
+        .submit(2, WorldEvent::PlayerMovementCorrection(correction))
+        .unwrap();
+
+    assert!(stream.take_committed_controls().is_empty());
+
+    let super::DecodeJob::InlineLevelChunk {
+        event,
+        payload,
+        slots,
+        count,
+        ids,
+        ..
+    } = stream.pending_decode.pop_front().unwrap().job
+    else {
+        panic!("expected inline decode job")
+    };
+    let chunk = ChunkKey::new(event.dimension, event.x, event.z);
+    let decoded = DecodedLevelChunk::decode_inline(chunk, slots, count, &payload, &ids, &ids);
+    stream
+        .order
+        .insert_ready(
+            1,
+            super::PreparedWorldEvent::InlineLevelChunk {
+                event,
+                decoded,
+                light_neutral: Vec::new(),
+                duration: std::time::Duration::ZERO,
+            },
+        )
+        .unwrap();
+    // Without local physics the correction scopes retention, so it follows the chunk; as a
+    // light commit it does so in the same spent slice.
+    apply_spent_slice(&mut stream);
+
+    assert_eq!(
+        stream.take_committed_controls(),
+        vec![super::CommittedControlEvent::PlayerMovementCorrection {
+            sequence: 2,
+            correction,
+            resolved: super::server_position::ResolvedServerPosition {
+                position: correction.position,
+                surface_anchor: None,
+            },
+        }]
+    );
+}
+
+/// Attribute updates behind a pending chunk decode commit at once, one control each,
+/// until retained consumers fill light admission.
+#[test]
+fn speed_attribute_burst_behind_a_pending_decode_commits_one_control_per_update() {
+    let mut stream = WorldStream::new(WorldBootstrap {
+        local_player_unique_id: 1,
+        dimension: 0,
+        local_player_runtime_id: 1,
+        player_position: [0.0; 3],
+        world_spawn_position: [0; 3],
+        air_network_id: protocol_ids::SEQUENTIAL_AIR_NETWORK_ID,
+        block_network_ids_are_hashes: false,
+    });
+    let attribute = |name: &str, current: f32| ActorAttribute {
+        name: Arc::from(name),
+        min: 0.0,
+        max: 1024.0,
+        current,
+        default: Some(0.1),
+        modifiers: Arc::from([]),
+    };
+    stream.submit(1, inline_air_event(0)).unwrap();
+    let mut sequence = 1;
+    while stream.light_admission_capacity() > 0 {
+        sequence += 1;
+        let current = sequence as f32 / 1000.0;
+        stream
+            .submit(
+                sequence,
+                WorldEvent::Actor(ActorEvent::Attributes(ActorAttributesUpdateEvent {
+                    dimension: 0,
+                    runtime_id: 1,
+                    attributes: Arc::from([
+                        attribute("minecraft:movement", current),
+                        attribute("minecraft:underwater_movement", current / 2.0),
+                        attribute("minecraft:lava_movement", current / 4.0),
+                        attribute("minecraft:air_drag_modifier", current * 2.0),
+                    ]),
+                    tick: sequence,
+                })),
+            )
+            .unwrap();
+    }
+    let updates = sequence - 1;
+    assert!(stream.order.is_finished(sequence));
+    assert_eq!(
+        stream.committed_sequence(),
+        0,
+        "the chunk still owns the frontier"
+    );
+    let controls = stream.take_committed_controls();
+    assert_eq!(controls.len() as u64, updates);
+    let last = sequence as f32 / 1000.0;
+    assert!(matches!(
+        controls.last(),
+        Some(super::CommittedControlEvent::LocalMovementSpeed {
+            movement: Some(movement),
+            underwater: Some(underwater),
+            lava: Some(lava),
+            air_drag_modifier: Some(air_drag),
+            ..
+        }) if movement.current == f64::from(last)
+            && *underwater == f64::from(last / 2.0)
+            && *lava == f64::from(last / 4.0)
+            && *air_drag == last * 2.0
+    ));
+}

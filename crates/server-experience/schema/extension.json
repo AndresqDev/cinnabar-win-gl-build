@@ -1,0 +1,1613 @@
+{
+  "version": 1,
+  "json": {
+    "unknown_fields": "deny",
+    "duplicate_struct_fields": "deny",
+    "missing_option": "null",
+    "set_order": "sorted_unique",
+    "map_order": "sorted_keys",
+    "unicode": "utf8",
+    "recursion_limit": 128
+  },
+  "signing": {
+    "algorithm": "ed25519",
+    "input": "domain_then_canonical_payload",
+    "hex": "lowercase"
+  },
+  "constants": [
+    {
+      "module": "policy",
+      "name": "MARKER_PATH",
+      "type": "&str",
+      "value": "\"cinnabar/extension-offer.json\"",
+      "go": "MarkerPath"
+    },
+    {
+      "module": "policy",
+      "name": "WIRE_VERSION",
+      "type": "u16",
+      "value": "1",
+      "go": "WireVersion"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_WIRE_VERSION",
+      "type": "u16",
+      "value": "2",
+      "go": "MaxWireVersion"
+    },
+    {
+      "module": "policy",
+      "name": "API_VERSION",
+      "type": "u16",
+      "value": "1",
+      "go": "APIVersion"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_IDENTIFIER_BYTES",
+      "type": "usize",
+      "value": "96",
+      "go": "MaxIdentifierBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_URL_BYTES",
+      "type": "usize",
+      "value": "2048",
+      "go": "MaxURLBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_ORIGINS",
+      "type": "usize",
+      "value": "8",
+      "go": "MaxOrigins"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_FALLBACK_BYTES",
+      "type": "usize",
+      "value": "512",
+      "go": "MaxFallbackBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_MARKER_BYTES",
+      "type": "usize",
+      "value": "64 * 1024",
+      "go": "MaxMarkerBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_MANIFEST_BYTES",
+      "type": "usize",
+      "value": "4 * 1024 * 1024",
+      "go": "MaxManifestBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_PAYLOAD_BYTES",
+      "type": "usize",
+      "value": "16 * 1024",
+      "go": "MaxPayloadBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_MESSAGE_BYTES",
+      "type": "usize",
+      "value": "48 * 1024",
+      "go": "MaxMessageBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_MESSAGES_PER_SECOND",
+      "type": "u64",
+      "value": "64",
+      "go": "MaxMessagesPerSecond"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_BYTES_PER_SECOND",
+      "type": "u64",
+      "value": "64 * 1024",
+      "go": "MaxBytesPerSecond"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_BURST_BYTES",
+      "type": "u64",
+      "value": "3 * MAX_MESSAGE_BYTES as u64",
+      "go": "MaxBurstBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_QUEUE_MESSAGES",
+      "type": "usize",
+      "value": "256"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_QUEUE_BYTES",
+      "type": "usize",
+      "value": "256 * 1024",
+      "go": "MaxQueueBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_ACTIONS",
+      "type": "usize",
+      "value": "1024",
+      "go": "MaxActions"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_CHANNELS",
+      "type": "usize",
+      "value": "64",
+      "go": "MaxChannels"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_CHANNEL_FIELDS",
+      "type": "usize",
+      "value": "64",
+      "go": "MaxChannelFields"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_FIELD_DEPTH",
+      "type": "usize",
+      "value": "4",
+      "go": "MaxFieldDepth"
+    },
+    {
+      "module": "policy",
+      "name": "INITIAL_BUNDLE_GENERATION",
+      "type": "u64",
+      "value": "1",
+      "go": "InitialBundleGeneration"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_BUNDLES",
+      "type": "usize",
+      "value": "4",
+      "go": "MaxBundles"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_COMPONENT_BYTES",
+      "type": "usize",
+      "value": "16 * 1024 * 1024"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_BUNDLE_BYTES",
+      "type": "usize",
+      "value": "64 * 1024 * 1024",
+      "go": "MaxBundleBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_EXPANDED_BYTES",
+      "type": "u64",
+      "value": "256 * 1024 * 1024",
+      "go": "MaxExpandedBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_FILES",
+      "type": "usize",
+      "value": "4096"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_GUEST_MEMORY",
+      "type": "u64",
+      "value": "32 * 1024 * 1024",
+      "go": "MaxGuestMemory"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_SESSION_MEMORY",
+      "type": "u64",
+      "value": "64 * 1024 * 1024",
+      "go": "MaxSessionMemory"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_GPU_BYTES",
+      "type": "u64",
+      "value": "128 * 1024 * 1024",
+      "go": "MaxGPUBytes"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_HOST_OUTPUT",
+      "type": "usize",
+      "value": "MAX_MESSAGE_BYTES + 64 * 1024"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_WIDGET_TEXT_BYTES",
+      "type": "usize",
+      "value": "512"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_DRAWS",
+      "type": "u32",
+      "value": "128"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_TRIANGLES",
+      "type": "u32",
+      "value": "100_000"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_PARTICLES",
+      "type": "u32",
+      "value": "4096"
+    },
+    {
+      "module": "policy",
+      "name": "CACHE_QUOTA",
+      "type": "u64",
+      "value": "512 * 1024 * 1024"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_OFFER_LIFETIME_SECS",
+      "type": "u64",
+      "value": "24 * 60 * 60",
+      "go": "MaxOfferLifetimeSecs"
+    },
+    {
+      "module": "policy",
+      "name": "NEGOTIATION_TIMEOUT_MS",
+      "type": "u64",
+      "value": "15_000",
+      "go": "NegotiationTimeoutMs"
+    },
+    {
+      "module": "policy",
+      "name": "DEVELOPER_ENV",
+      "type": "&str",
+      "value": "\"CINNABAR_DEV_SERVER_EXPERIENCES\""
+    },
+    {
+      "module": "policy",
+      "name": "MAX_GUEST_STRIKES",
+      "type": "usize",
+      "value": "3"
+    },
+    {
+      "module": "policy",
+      "name": "GUEST_STRIKE_WINDOW_MS",
+      "type": "u64",
+      "value": "60_000"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_TEMPLATES",
+      "type": "usize",
+      "value": "32"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_TEMPLATE_BYTES",
+      "type": "usize",
+      "value": "256 * 1024"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_TEXTURES",
+      "type": "usize",
+      "value": "256"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_TEXTURE_BYTES",
+      "type": "usize",
+      "value": "4 * 1024 * 1024"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_COLLECTIONS",
+      "type": "usize",
+      "value": "32"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_COLLECTION_ROWS",
+      "type": "usize",
+      "value": "4096"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_ROW_FIELDS",
+      "type": "usize",
+      "value": "32"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_UI_VALUES",
+      "type": "usize",
+      "value": "256"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_UI_NUMBERS",
+      "type": "usize",
+      "value": "4"
+    },
+    {
+      "module": "policy",
+      "name": "MAX_EDIT_TEXT_BYTES",
+      "type": "usize",
+      "value": "512"
+    },
+    {
+      "module": "crypto",
+      "name": "OFFER_DOMAIN",
+      "type": "&[u8]",
+      "value": "b\"Cinnabar/experience/offer/v1\\0\"",
+      "go": "OfferDomain"
+    },
+    {
+      "module": "crypto",
+      "name": "ACCEPT_DOMAIN",
+      "type": "&[u8]",
+      "value": "b\"Cinnabar/experience/accept/v1\\0\"",
+      "go": "AcceptDomain"
+    },
+    {
+      "module": "crypto",
+      "name": "MANIFEST_DOMAIN",
+      "type": "&[u8]",
+      "value": "b\"Cinnabar/experience/manifest/v1\\0\"",
+      "go": "ManifestDomain"
+    },
+    {
+      "module": "bundle",
+      "name": "MANIFEST_PATH",
+      "type": "&str",
+      "value": "\"manifest.signed.json\"",
+      "go": "ManifestPath"
+    },
+    {
+      "module": null,
+      "go": "Carrier",
+      "external": {
+        "path": "crates/protocol/src/experience.rs",
+        "name": "EXPERIENCE_CHANNEL"
+      }
+    },
+    {
+      "module": null,
+      "go": "MaxEnvelopeBytes",
+      "external": {
+        "path": "crates/protocol/src/experience.rs",
+        "name": "MAX_EXPERIENCE_ENVELOPE_BYTES"
+      }
+    }
+  ],
+  "records": [
+    {
+      "module": "manifest",
+      "name": "Scope",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "permissions",
+          "go": "Permissions",
+          "type": "BTreeSet<Permission>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "origins",
+          "go": "Origins",
+          "type": "BTreeSet<String>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "memory_bytes",
+          "go": "MemoryBytes",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "gpu_bytes",
+          "go": "GPUBytes",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "personal_mods",
+          "go": "PersonalMods",
+          "type": "BTreeSet<String>",
+          "optional": true,
+          "skip": true
+        }
+      ]
+    },
+    {
+      "module": "manifest",
+      "name": "PackageOffer",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "id",
+          "go": "ID",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "publisher_key",
+          "go": "PublisherKey",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "digest",
+          "go": "Digest",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "bytes",
+          "go": "Bytes",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "url",
+          "go": "URL",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "manifest",
+      "name": "Offer",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "audience",
+          "go": "Audience",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "server_key",
+          "go": "ServerKey",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "revision",
+          "go": "Revision",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "expires_unix",
+          "go": "ExpiresUnix",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "scope",
+          "go": "Scope",
+          "type": "Scope",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "packages",
+          "go": "Packages",
+          "type": "Vec<PackageOffer>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "fallback",
+          "go": "Fallback",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "carrier",
+          "go": "Carrier",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "manifest",
+      "name": "ContentFile",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "path",
+          "go": "Path",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "bytes",
+          "go": "Bytes",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "sha256",
+          "go": "SHA256",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "manifest",
+      "name": "Manifest",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "api",
+          "go": "API",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "id",
+          "go": "ID",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "publisher_key",
+          "go": "PublisherKey",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "package_version",
+          "go": "PackageVersion",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "permissions",
+          "go": "Permissions",
+          "type": "BTreeSet<Permission>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "component",
+          "go": "Component",
+          "type": "Option<String>",
+          "optional": true,
+          "skip": false
+        },
+        {
+          "name": "channels",
+          "go": "Channels",
+          "type": "Vec<crate::wire::Channel>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "actions",
+          "go": "Actions",
+          "type": "BTreeSet<String>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "templates",
+          "go": "Templates",
+          "type": "BTreeSet<String>",
+          "optional": true,
+          "skip": true
+        },
+        {
+          "name": "files",
+          "go": "Files",
+          "type": "Vec<ContentFile>",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "crypto",
+      "name": "SignedDocument",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "payload",
+          "go": "Payload",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "signature",
+          "go": "Signature",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "Marker",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "server_key",
+          "go": "ServerKey",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "offer",
+          "go": "Offer",
+          "type": "SignedDocument",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "Limits",
+      "derive": "Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "max_fragment_bytes",
+          "go": "MaxFragmentBytes",
+          "type": "u32",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "max_message_bytes",
+          "go": "MaxMessageBytes",
+          "type": "u32",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "max_reassembly_bytes",
+          "go": "MaxReassemblyBytes",
+          "type": "u32",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "WireOffer",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "versions",
+          "go": "Versions",
+          "type": "BTreeSet<u16>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "limits",
+          "go": "Limits",
+          "type": "Limits",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "Wire",
+      "derive": "Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "limits",
+          "go": "Limits",
+          "type": "Limits",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "Hello",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "api",
+          "go": "API",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "capabilities",
+          "go": "Capabilities",
+          "type": "BTreeSet<crate::manifest::Permission>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "offer_digest",
+          "go": "OfferDigest",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "client_challenge",
+          "go": "ClientChallenge",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "connection",
+          "go": "Connection",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "subclient",
+          "go": "Subclient",
+          "type": "u8",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "wire",
+          "go": "Wire",
+          "type": "Option<WireOffer>",
+          "optional": true,
+          "skip": true
+        }
+      ]
+    },
+    {
+      "module": "negotiation",
+      "name": "Accept",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "hello",
+          "go": "Hello",
+          "type": "Hello",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "server_challenge",
+          "go": "ServerChallenge",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "session",
+          "go": "Session",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "audience",
+          "go": "Audience",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "offer_digest",
+          "go": "OfferDigest",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "revision",
+          "go": "Revision",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "expires_unix",
+          "go": "ExpiresUnix",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "wire",
+          "go": "Wire",
+          "type": "Option<Wire>",
+          "optional": true,
+          "skip": true
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Channel",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "fields": [
+        {
+          "name": "id",
+          "go": "ID",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "schema",
+          "go": "Schema",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "direction",
+          "go": "Direction",
+          "type": "Direction",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "fields",
+          "go": "Fields",
+          "type": "Vec<Field>",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Envelope",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "session",
+          "go": "Session",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "connection",
+          "go": "Connection",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "subclient",
+          "go": "Subclient",
+          "type": "u8",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "bundle",
+          "go": "Bundle",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "generation",
+          "go": "Generation",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "channel",
+          "go": "Channel",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "schema",
+          "go": "Schema",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "sequence",
+          "go": "Sequence",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "world_epoch",
+          "go": "WorldEpoch",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "payload",
+          "go": "Payload",
+          "type": "Vec<Scalar>",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Part",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "fields": [
+        {
+          "name": "index",
+          "go": "Index",
+          "type": "u32",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "count",
+          "go": "Count",
+          "type": "u32",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "data",
+          "go": "Data",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Fragment",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq",
+      "fields": [
+        {
+          "name": "version",
+          "go": "Version",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "session",
+          "go": "Session",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "connection",
+          "go": "Connection",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "subclient",
+          "go": "Subclient",
+          "type": "u8",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "bundle",
+          "go": "Bundle",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "generation",
+          "go": "Generation",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "channel",
+          "go": "Channel",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "schema",
+          "go": "Schema",
+          "type": "u16",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "sequence",
+          "go": "Sequence",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "world_epoch",
+          "go": "WorldEpoch",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "fragment",
+          "go": "Fragment",
+          "type": "Part",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": null,
+      "name": "Ready",
+      "fields": [
+        {
+          "name": "session",
+          "go": "Session",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "packages",
+          "go": "Packages",
+          "type": "Vec<String>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "generation",
+          "go": "Generation",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "permissions",
+          "go": "Permissions",
+          "type": "std::collections::BTreeMap<String, std::collections::BTreeSet<crate::manifest::Permission>>",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "world_epoch",
+          "go": "WorldEpoch",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    },
+    {
+      "module": null,
+      "name": "Epoch",
+      "fields": [
+        {
+          "name": "session",
+          "go": "Session",
+          "type": "String",
+          "optional": false,
+          "skip": false
+        },
+        {
+          "name": "world_epoch",
+          "go": "WorldEpoch",
+          "type": "u64",
+          "optional": false,
+          "skip": false
+        }
+      ]
+    }
+  ],
+  "enums": [
+    {
+      "module": "manifest",
+      "name": "Permission",
+      "derive": "Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord",
+      "variants": [
+        {
+          "rust": "Ui",
+          "go": "PermissionUI",
+          "json": "ui",
+          "implemented": true
+        },
+        {
+          "rust": "ModalUi",
+          "go": "PermissionModalUI",
+          "json": "modal_ui",
+          "implemented": true
+        },
+        {
+          "rust": "Input",
+          "go": "PermissionInput",
+          "json": "input",
+          "implemented": true
+        },
+        {
+          "rust": "Messaging",
+          "go": "PermissionMessaging",
+          "json": "messaging",
+          "implemented": true
+        },
+        {
+          "rust": "Scene",
+          "go": "PermissionScene",
+          "json": "scene",
+          "implemented": false
+        },
+        {
+          "rust": "Media",
+          "go": "PermissionMedia",
+          "json": "media",
+          "implemented": false
+        },
+        {
+          "rust": "Items",
+          "go": "PermissionItems",
+          "json": "items",
+          "implemented": false
+        },
+        {
+          "rust": "WorldDraw",
+          "go": "PermissionWorldDraw",
+          "json": "world_draw",
+          "implemented": true
+        },
+        {
+          "rust": "EntityObserve",
+          "go": "PermissionEntityObserve",
+          "json": "entity_observe",
+          "implemented": true
+        },
+        {
+          "rust": "EntityHighlight",
+          "go": "PermissionEntityHighlight",
+          "json": "entity_highlight",
+          "implemented": true
+        },
+        {
+          "rust": "RenderThroughWalls",
+          "go": "PermissionRenderThroughWalls",
+          "json": "render_through_walls",
+          "implemented": true
+        },
+        {
+          "rust": "RenderMaterial",
+          "go": "PermissionRenderMaterial",
+          "json": "render_material",
+          "implemented": true
+        },
+        {
+          "rust": "RenderPost",
+          "go": "PermissionRenderPost",
+          "json": "render_post",
+          "implemented": true
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Direction",
+      "derive": "Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq",
+      "variants": [
+        {
+          "rust": "ToClient",
+          "go": "ToClient",
+          "json": "to_client"
+        },
+        {
+          "rust": "ToServer",
+          "go": "ToServer",
+          "json": "to_server"
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Scalar",
+      "derive": "Clone, Debug, Deserialize, Serialize, PartialEq",
+      "tag": "type",
+      "content": "value",
+      "variants": [
+        {
+          "rust": "Bool",
+          "go": "Bool",
+          "json": "bool",
+          "type": "bool"
+        },
+        {
+          "rust": "Integer",
+          "go": "Integer",
+          "json": "integer",
+          "type": "i64"
+        },
+        {
+          "rust": "Text",
+          "go": "Text",
+          "json": "text",
+          "type": "String"
+        },
+        {
+          "rust": "Choice",
+          "go": "Choice",
+          "json": "choice",
+          "type": "u16"
+        },
+        {
+          "rust": "List",
+          "go": "List",
+          "json": "list",
+          "type": "Vec<Scalar>"
+        },
+        {
+          "rust": "Record",
+          "go": "Record",
+          "json": "record",
+          "type": "Vec<Scalar>"
+        }
+      ]
+    },
+    {
+      "module": "wire",
+      "name": "Field",
+      "derive": "Clone, Debug, Deserialize, Serialize",
+      "tag": "type",
+      "content": null,
+      "variants": [
+        {
+          "rust": "Bool",
+          "go": "BoolField",
+          "json": "bool",
+          "fields": [],
+          "admission": "bool"
+        },
+        {
+          "rust": "Integer",
+          "go": "IntegerField",
+          "json": "integer",
+          "fields": [
+            {
+              "name": "min",
+              "go": "Min",
+              "type": "i64",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "max",
+              "go": "Max",
+              "type": "i64",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "admission": "range"
+        },
+        {
+          "rust": "Text",
+          "go": "TextField",
+          "json": "text",
+          "fields": [
+            {
+              "name": "max_bytes",
+              "go": "MaxBytes",
+              "type": "u16",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "admission": "utf8_bytes"
+        },
+        {
+          "rust": "Choice",
+          "go": "ChoiceField",
+          "json": "choice",
+          "fields": [
+            {
+              "name": "variants",
+              "go": "Variants",
+              "type": "u16",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "admission": "choice"
+        },
+        {
+          "rust": "List",
+          "go": "ListField",
+          "json": "list",
+          "fields": [
+            {
+              "name": "item",
+              "go": "Item",
+              "type": "Box<Field>",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "max_items",
+              "go": "MaxItems",
+              "type": "u16",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "admission": "list"
+        },
+        {
+          "rust": "Record",
+          "go": "RecordField",
+          "json": "record",
+          "fields": [
+            {
+              "name": "fields",
+              "go": "Fields",
+              "type": "Vec<Field>",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "admission": "record"
+        }
+      ]
+    },
+    {
+      "module": "session",
+      "name": "Control",
+      "derive": "Debug, Deserialize, Serialize",
+      "tag": "kind",
+      "content": "body",
+      "variants": [
+        {
+          "rust": "Hello",
+          "go": "Hello",
+          "json": "hello",
+          "type": "Hello",
+          "rate": {
+            "to_client": "Handshake",
+            "to_server": "Handshake"
+          }
+        },
+        {
+          "rust": "Accept",
+          "go": "Accept",
+          "json": "accept",
+          "type": "SignedDocument",
+          "rate": {
+            "to_client": "Handshake",
+            "to_server": "Handshake"
+          }
+        },
+        {
+          "rust": "Ready",
+          "go": "Ready",
+          "json": "ready",
+          "fields": [
+            {
+              "name": "session",
+              "go": "Session",
+              "type": "String",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "packages",
+              "go": "Packages",
+              "type": "Vec<String>",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "generation",
+              "go": "Generation",
+              "type": "u64",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "permissions",
+              "go": "Permissions",
+              "type": "std::collections::BTreeMap<String, std::collections::BTreeSet<crate::manifest::Permission>>",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "world_epoch",
+              "go": "WorldEpoch",
+              "type": "u64",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "rate": {
+            "to_client": "Handshake",
+            "to_server": "Handshake"
+          }
+        },
+        {
+          "rust": "Epoch",
+          "go": "Epoch",
+          "json": "epoch",
+          "fields": [
+            {
+              "name": "session",
+              "go": "Session",
+              "type": "String",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "world_epoch",
+              "go": "WorldEpoch",
+              "type": "u64",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "rate": {
+            "to_client": "WorldNotice",
+            "to_server": "NativeEpoch"
+          }
+        },
+        {
+          "rust": "WorldAck",
+          "go": "WorldAck",
+          "json": "world_ack",
+          "fields": [
+            {
+              "name": "session",
+              "go": "Session",
+              "type": "String",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "world_epoch",
+              "go": "WorldEpoch",
+              "type": "u64",
+              "optional": false,
+              "skip": false
+            },
+            {
+              "name": "requested_epoch",
+              "go": "RequestedEpoch",
+              "type": "u64",
+              "optional": false,
+              "skip": false
+            }
+          ],
+          "rate": {
+            "to_client": "Data",
+            "to_server": "Data",
+            "matching_notice": "WorldAck"
+          }
+        },
+        {
+          "rust": "Disabled",
+          "go": "Disabled",
+          "json": "disabled",
+          "rate": {
+            "to_client": "Handshake",
+            "to_server": "Handshake"
+          }
+        }
+      ]
+    }
+  ],
+  "constraints": {
+    "identifier": {
+      "extra_ascii": ":_-.",
+      "max_bytes": "MAX_IDENTIFIER_BYTES"
+    },
+    "channels": {
+      "fields": "MAX_CHANNEL_FIELDS",
+      "depth": "MAX_FIELD_DEPTH"
+    },
+    "wire_limits": "ascending_nonzero"
+  },
+  "rate_budget": {
+    "size": "encoded_carrier_bytes",
+    "classes": {
+      "Data": true,
+      "NativeEpoch": true,
+      "WorldNotice": false,
+      "WorldAck": false,
+      "Handshake": false
+    }
+  }
+}

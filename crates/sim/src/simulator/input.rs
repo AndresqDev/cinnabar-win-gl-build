@@ -1,0 +1,197 @@
+use serde::{Deserialize, Serialize};
+
+use super::{MovementEffects, MovementMode, SimulationError, SneakProfile, VerticalPhysics};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MovementInput {
+    /// One released trident, retaining its facing independently of this tick's look.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub riptide: Option<super::RiptideLaunch>,
+    /// Spectator travel ignores terrain collision and block contact effects.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spectator: bool,
+    /// Bypasses terrain clipping while preserving the selected travel physics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_clip: bool,
+    /// Independent pose flags request a compact body even when flight owns travel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub horizontal_pose: bool,
+    /// The swim-or-crawl flag after this tick's pose producers have run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swim_pose_active: Option<bool>,
+    pub strafe: f64,
+    pub forward: f64,
+    pub yaw_degrees: f64,
+    pub jumping: bool,
+    pub jump_pressed: bool,
+    pub sprinting: bool,
+    pub sneaking: bool,
+    /// Level sneaking dimensions, retained with each tick for deterministic replay.
+    #[serde(default, skip_serializing_if = "SneakProfile::is_current")]
+    pub sneak_profile: SneakProfile,
+    /// Tick-captured authority that disables travel without discarding device input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub immobile: bool,
+    /// Suppresses this tick's travel while jump state and block contacts still update.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_travel: bool,
+    /// Axes precede item and pose slowdown. False preserves historical
+    /// already-processed input clamping; true retains partial-axis magnitude.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub move_vector_is_raw: bool,
+    /// Whether the selected item is actively in its consumable-use phase.
+    #[serde(default)]
+    pub using_consumable: bool,
+    /// Effective item-use factor applied once after pose slowdown. None
+    /// preserves consumable flags; explicit zero and one are meaningful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_use_movement_modifier: Option<f64>,
+    /// Effective non-sprinting `minecraft:movement` value captured for this
+    /// fixed tick, retaining custom/effect speed. Sprint is applied separately
+    /// once. Absence selects the vanilla default; zero is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub movement_speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "MovementEffects::is_empty")]
+    pub effects: MovementEffects,
+    /// Client-selected locomotion mode; `Walking` runs the oracle-validated path.
+    #[serde(default, skip_serializing_if = "is_walking")]
+    pub mode: MovementMode,
+    /// Look pitch, degrees positive downward. Read only by swimming and gliding.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pitch_degrees: f64,
+    /// Tick-captured height of the pose-adjusted eye anchor above the feet. The
+    /// caller retains its pose-offset transition in prediction input; absence
+    /// leaves the swimming surface guard unspecified for legacy traces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquid_attach_height: Option<f64>,
+    /// Height of the preceding collision pose at this tick's current feet.
+    /// Native liquid sensing runs before pose selection; replay retains this
+    /// height while resampling water/lava at the corrected position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquid_contact_height: Option<f64>,
+    /// Flow policy is sensed before this tick's flight trigger. Retaining its
+    /// preceding flying state keeps toggle ticks and correction replay aligned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liquid_flow_enabled: Option<bool>,
+    /// Effective `minecraft:underwater_movement` current; `None` selects its vanilla default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub underwater_movement_speed: Option<f64>,
+    /// Effective `minecraft:lava_movement` current; `None` selects its vanilla default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lava_movement_speed: Option<f64>,
+    /// Depth Strider level on the boots; scales water travel toward ground travel.
+    #[serde(default, skip_serializing_if = "is_zero_level")]
+    pub depth_strider: u8,
+    /// Soul Speed level on the boots; replaces the soul sand slowdown.
+    #[serde(default, skip_serializing_if = "is_zero_level")]
+    pub soul_speed: u8,
+    /// Swift Sneak level on the leggings, captured for this tick and replay.
+    #[serde(default, skip_serializing_if = "is_zero_level")]
+    pub swift_sneak: u8,
+    /// The input mode's request to descend through a climbable block, as
+    /// vanilla's descent action reads it; `None` uses `sneaking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descent_request: Option<bool>,
+    /// Snow-standing capability (leather boots): powder snow climbs like a
+    /// ladder and counts as a block-climber ascending and descending block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_stand_on_snow: bool,
+    /// Ability vertical flight speed (per-tick acceleration scale); `None` selects 1.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_fly_speed: Option<f64>,
+    /// Creative flight hovers with stronger damping than other flying modes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub creative_flight: bool,
+    /// Ability flight speed; `None` selects the vanilla default. Read only when flying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fly_speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "VerticalPhysics::is_default")]
+    pub vertical_physics: VerticalPhysics,
+    /// An Instabuild glider is holding jump after the glide's first ten ticks,
+    /// so the glide input pushes it upward before this tick's travel.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub glide_ascent: bool,
+}
+
+impl MovementInput {
+    /// Returns the item- and pose-adjusted controls used by the simulator for this input.
+    #[must_use]
+    pub fn processed_controls(self) -> super::ProcessedControls {
+        super::controls::process(self)
+    }
+}
+
+fn is_walking(mode: &MovementMode) -> bool {
+    mode.is_walking()
+}
+
+fn is_zero_level(value: &u8) -> bool {
+    *value == 0
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+pub(super) fn validate(input: MovementInput) -> Result<(), SimulationError> {
+    for (field, value) in [
+        ("strafe", input.strafe),
+        ("forward", input.forward),
+        ("yaw_degrees", input.yaw_degrees),
+        ("pitch_degrees", input.pitch_degrees),
+    ] {
+        if !value.is_finite() {
+            return Err(SimulationError::NonFiniteInput { field });
+        }
+    }
+    if input
+        .liquid_attach_height
+        .is_some_and(|height| !height.is_finite())
+    {
+        return Err(SimulationError::NonFiniteInput {
+            field: "liquid_attach_height",
+        });
+    }
+    if input
+        .liquid_contact_height
+        .is_some_and(|height| !height.is_finite() || height <= 0.0)
+    {
+        return Err(SimulationError::InvalidLiquidContactHeight);
+    }
+    if input
+        .vertical_physics
+        .air_drag_modifier
+        .is_some_and(|modifier| !modifier.is_finite())
+    {
+        return Err(SimulationError::NonFiniteInput {
+            field: "air_drag_modifier",
+        });
+    }
+    if input
+        .item_use_movement_modifier
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(SimulationError::InvalidItemUseMovementModifier);
+    }
+    if [
+        input.movement_speed,
+        input.underwater_movement_speed,
+        input.lava_movement_speed,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(SimulationError::InvalidMovementSpeed);
+    }
+    if [input.fly_speed, input.vertical_fly_speed]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.is_finite())
+        || input.fly_speed.is_some_and(|value| value < 0.0)
+    {
+        return Err(SimulationError::InvalidMovementSpeed);
+    }
+    Ok(())
+}

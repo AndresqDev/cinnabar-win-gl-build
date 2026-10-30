@@ -1,0 +1,87 @@
+//! Retained server debug geometry: shared meshes, stable instance slots and GPU visibility.
+
+use bevy::prelude::IntoScheduleConfigs;
+use bevy::render::render_phase::AddRenderCommand;
+use render_scene::PrimitiveShapesScene;
+
+mod gpu;
+mod mesh;
+mod pipeline;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+use bevy::prelude::{IntoSystem, System, default};
+use bevy::{
+    asset::{load_internal_asset, uuid_handle},
+    prelude::{App, Handle, Plugin, Shader, World},
+    render::{
+        Render, RenderApp, RenderStartup, RenderSystems, extract_resource::ExtractResourcePlugin,
+    },
+};
+
+/// Installs the network primitive renderer independently of actor rendering.
+pub struct PrimitiveShapesRenderPlugin;
+
+const SHADER: Handle<Shader> = uuid_handle!("361a6dc1-b0e8-41ee-a5ac-94b3e8d6cc48");
+// Debug text retains its existing cubic facing independently of actor nametags.
+const TEXT_ACOS_LINEAR: f32 = 0.87266463;
+const TEXT_ACOS_CUBIC: f32 = -0.698_131_7;
+const TEXT_HORIZONTAL_ZERO: f32 = 0.0001;
+
+impl Plugin for PrimitiveShapesRenderPlugin {
+    /// Keeps the domain store in the main world and uploads changes in the render world.
+    fn build(&self, app: &mut App) {
+        app.init_resource::<PrimitiveShapesScene>()
+            .add_plugins(ExtractResourcePlugin::<PrimitiveShapesScene>::default());
+        load_internal_asset!(app, SHADER, "primitive_shapes/shapes.wesl", shader);
+        crate::pipeline_warmup::register::<pipeline::ShapePipeline>(app);
+        let Some(render) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        crate::transparent_phase::install(render);
+        crate::world_passes::install(render);
+        render.init_resource::<pipeline::ShapePipeline>()
+            .add_render_command::<bevy::core_pipeline::core_3d::Transparent3d, pipeline::DrawShapes>()
+            .add_systems(RenderStartup, gpu::init)
+            .add_systems(Render, (
+                gpu::prepare.in_set(RenderSystems::PrepareResources),
+                pipeline::prepare_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                pipeline::queue.in_set(crate::world_passes::WorldPassSystems).in_set(RenderSystems::Queue),
+            ));
+    }
+}
+
+/// Injects the shared font-pixel scale and debug-text constants into its shader.
+fn shader(raw: &str, path: impl Into<String>) -> Shader {
+    let source = raw
+        .replace(
+            "ARROW_KIND_VALUE",
+            &(render_api::primitive_shapes::PrimitiveShapeKind::Arrow as u32).to_string(),
+        )
+        .replace(
+            "BOX_KIND_VALUE",
+            &(render_api::primitive_shapes::PrimitiveShapeKind::Box as u32).to_string(),
+        )
+        .replace(
+            "ALL_DIMENSIONS_VALUE",
+            &render_api::primitive_shapes::PRIMITIVE_ALL_DIMENSIONS.to_string(),
+        )
+        .replace(
+            "ARROW_MIN_LENGTH_SQUARED_VALUE",
+            &render_api::primitive_shapes::PRIMITIVE_ARROW_MIN_LENGTH_SQUARED.to_string(),
+        )
+        .replace(
+            "TEXT_SCALE_VALUE",
+            &render_model::NAMETAG_BLOCKS_PER_FONT_PIXEL.to_string(),
+        )
+        .replace("ACOS_LINEAR_VALUE", &TEXT_ACOS_LINEAR.to_string())
+        .replace("ACOS_CUBIC_VALUE", &TEXT_ACOS_CUBIC.to_string())
+        .replace("HORIZONTAL_ZERO_VALUE", &TEXT_HORIZONTAL_ZERO.to_string());
+    crate::shader_safety::from_wesl(source, path)
+}
+
+/// Identifies the debug draw family for encoded-color transparency routing.
+pub(crate) fn draw_function(world: &World) -> Option<bevy::render::render_phase::DrawFunctionId> {
+    world.get_resource::<bevy::render::render_phase::DrawFunctions<bevy::core_pipeline::core_3d::Transparent3d>>()?.read().get_id::<pipeline::DrawShapes>()
+}

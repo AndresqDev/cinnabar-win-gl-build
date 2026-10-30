@@ -1,0 +1,278 @@
+use std::sync::Arc;
+
+use bedrock_protocol_1_26_60::enums::ActorEventType;
+use bedrock_protocol_1_26_60::packets::{
+    ActorEvent as ActorEventPacket, AddItemActor as AddItemActorPacket,
+    TakeItemActor as TakeItemActorPacket,
+};
+
+use super::{ITEM_ACTOR_NETWORK_OFFSET, normalize_metadata, validate_finite};
+use crate::{ActorEvent, ActorKind, ActorPacketError, ActorSpawnEvent, item::normalize_item};
+
+/// Server-announced actor events the client visualises; ids with no client-side visual are dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorStatusKind {
+    Hurt,
+    /// Event 81: hurt animation and sound without the red damage flash.
+    HurtWithoutDamage,
+    Death,
+    /// Failed taming: smoke particles.
+    TamingFailed,
+    /// Successful taming: heart particles.
+    TamingSucceeded,
+    /// Native event 39 assigns the signed payload to the actor's shake countdown.
+    Shake,
+    ShakeWetness,
+    EatGrass,
+    LoveHearts,
+    VillagerAngry,
+    VillagerHappy,
+    WitchHatMagic,
+    FireworksExplode,
+    DrinkPotion,
+    ThrowPotion,
+    PrimeTntMinecart,
+    PrimeCreeper,
+    TotemActivate,
+    SpawnAlive,
+    LeashDestroyed,
+    ZombieConverting,
+    Puke,
+    DrinkMilk,
+    Feed,
+    ActorGrowUp,
+    /// Event 80 starts the held kinetic weapon's impact feedback.
+    KineticDamageDealt,
+}
+
+/// One actor status event, addressed by runtime id (the wire carries no dimension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorStatusEvent {
+    pub runtime_id: u64,
+    pub kind: ActorStatusKind,
+    /// Event-specific payload; its meaning depends on `kind` and is unused for most kinds.
+    pub data: i32,
+}
+
+/// A dropped item was picked up: the item flies to `collector_runtime_id` and is then removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorTakeItemEvent {
+    pub item_runtime_id: u64,
+    pub collector_runtime_id: u64,
+}
+
+pub(crate) fn normalize_take_item_actor(packet: TakeItemActorPacket) -> ActorEvent {
+    ActorEvent::TakeItem(ActorTakeItemEvent {
+        item_runtime_id: packet.item_runtime_id.0,
+        collector_runtime_id: packet.actor_runtime_id.0,
+    })
+}
+
+/// Dropped-item spawn; the stack rides in `held_item` and the identifier is fixed.
+pub(crate) fn normalize_add_item_actor(
+    packet: AddItemActorPacket,
+    dimension: i32,
+) -> Result<ActorEvent, ActorPacketError> {
+    for (field, value) in [
+        ("position.x", packet.position.x),
+        ("position.y", packet.position.y),
+        ("position.z", packet.position.z),
+        ("velocity.x", packet.velocity.x),
+        ("velocity.y", packet.velocity.y),
+        ("velocity.z", packet.velocity.z),
+    ] {
+        validate_finite(field, value)?;
+    }
+    let held_item = normalize_item(packet.item)?;
+    let metadata = normalize_metadata(packet.entity_data)?;
+    Ok(ActorEvent::Spawn(ActorSpawnEvent {
+        dimension,
+        unique_id: packet.target_actor_id.0,
+        runtime_id: packet.target_runtime_id.0,
+        kind: ActorKind::Entity {
+            identifier: Arc::from("minecraft:item"),
+        },
+        // Vanilla passes the network position
+        // unchanged. Our store retains feet; dropped rendering restores it explicitly.
+        position: [
+            packet.position.x,
+            packet.position.y - ITEM_ACTOR_NETWORK_OFFSET,
+            packet.position.z,
+        ],
+        velocity: [packet.velocity.x, packet.velocity.y, packet.velocity.z],
+        pitch: 0.0,
+        yaw: 0.0,
+        head_yaw: 0.0,
+        body_yaw: 0.0,
+        held_item,
+        metadata,
+        attributes: Arc::from([]),
+        properties: Arc::from([]),
+        links: Arc::from([]),
+    }))
+}
+
+/// Maps an ActorEvent packet to a status event, or `None` for ids the client draws nothing for.
+pub(crate) fn normalize_actor_event(packet: ActorEventPacket) -> Option<ActorEvent> {
+    let kind = match packet.event_id {
+        ActorEventType::Hurt => ActorStatusKind::Hurt,
+        ActorEventType::HurtWithoutReceivingDamage => ActorStatusKind::HurtWithoutDamage,
+        ActorEventType::Death | ActorEventType::InstantDeath => ActorStatusKind::Death,
+        ActorEventType::TamingFailed => ActorStatusKind::TamingFailed,
+        ActorEventType::TamingSucceeded => ActorStatusKind::TamingSucceeded,
+        ActorEventType::Shake => ActorStatusKind::Shake,
+        ActorEventType::ShakeWetness => ActorStatusKind::ShakeWetness,
+        ActorEventType::EatGrass => ActorStatusKind::EatGrass,
+        ActorEventType::LoveHearts | ActorEventType::InLoveHearts => ActorStatusKind::LoveHearts,
+        ActorEventType::VillagerAngry => ActorStatusKind::VillagerAngry,
+        ActorEventType::VillagerHappy => ActorStatusKind::VillagerHappy,
+        ActorEventType::WitchHatMagic => ActorStatusKind::WitchHatMagic,
+        ActorEventType::FireworksExplode => ActorStatusKind::FireworksExplode,
+        ActorEventType::DrinkPotion => ActorStatusKind::DrinkPotion,
+        ActorEventType::ThrowPotion => ActorStatusKind::ThrowPotion,
+        ActorEventType::PrimeTntCart => ActorStatusKind::PrimeTntMinecart,
+        ActorEventType::PrimeCreeper => ActorStatusKind::PrimeCreeper,
+        ActorEventType::TalismanActivate => ActorStatusKind::TotemActivate,
+        ActorEventType::SpawnAlive => ActorStatusKind::SpawnAlive,
+        ActorEventType::LeashDestroyed => ActorStatusKind::LeashDestroyed,
+        ActorEventType::ZombieConverting => ActorStatusKind::ZombieConverting,
+        ActorEventType::Puke => ActorStatusKind::Puke,
+        ActorEventType::DrinkMilk => ActorStatusKind::DrinkMilk,
+        ActorEventType::Feed => ActorStatusKind::Feed,
+        ActorEventType::ActorGrowUp => ActorStatusKind::ActorGrowUp,
+        ActorEventType::KineticDamageDealt => ActorStatusKind::KineticDamageDealt,
+        _ => return None,
+    };
+    Some(ActorEvent::Status(ActorStatusEvent {
+        runtime_id: packet.target_runtime_id.0,
+        kind,
+        data: packet.data.0,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_protocol_1_26_60::wire::{self, Decode, Encode};
+
+    fn packet(event_id: ActorEventType) -> ActorEventPacket {
+        let mut packet = ActorEventPacket::default();
+        packet.target_runtime_id.0 = 9;
+        packet.event_id = event_id;
+        packet.data = wire::ZigZag32(4);
+        packet
+    }
+
+    #[test]
+    fn hurt_and_death_ids_normalize_by_runtime_id() {
+        assert_eq!(
+            normalize_actor_event(packet(ActorEventType::Hurt)),
+            Some(ActorEvent::Status(ActorStatusEvent {
+                runtime_id: 9,
+                kind: ActorStatusKind::Hurt,
+                data: 4,
+            }))
+        );
+        assert!(matches!(
+            normalize_actor_event(packet(ActorEventType::HurtWithoutReceivingDamage)),
+            Some(ActorEvent::Status(ActorStatusEvent {
+                kind: ActorStatusKind::HurtWithoutDamage,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            normalize_actor_event(packet(ActorEventType::InstantDeath)),
+            Some(ActorEvent::Status(ActorStatusEvent {
+                kind: ActorStatusKind::Death,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn unknown_and_invisible_ids_are_skipped() {
+        assert_eq!(
+            normalize_actor_event(packet(ActorEventType::Unknown(200))),
+            None
+        );
+        assert_eq!(normalize_actor_event(packet(ActorEventType::Jump)), None);
+    }
+
+    #[test]
+    fn shake_preserves_the_server_signed_countdown_without_a_default_duration() {
+        for data in [i32::MIN, -1, 0, 1, 12, i32::MAX] {
+            let mut packet = packet(ActorEventType::Shake);
+            packet.data = wire::ZigZag32(data);
+            assert_eq!(
+                normalize_actor_event(packet),
+                Some(ActorEvent::Status(ActorStatusEvent {
+                    runtime_id: 9,
+                    kind: ActorStatusKind::Shake,
+                    data,
+                }))
+            );
+        }
+    }
+
+    #[test]
+    fn shake_wire_roundtrips_signed_data_and_rejects_every_truncated_body() {
+        for data in [i32::MIN, -1, 0, 12, i32::MAX] {
+            let mut packet = packet(ActorEventType::Shake);
+            packet.data = wire::ZigZag32(data);
+            let encoded = packet.encode_to_vec().unwrap();
+            let decoded = ActorEventPacket::decode_exact(&encoded).unwrap();
+            assert_eq!(
+                normalize_actor_event(decoded),
+                normalize_actor_event(packet)
+            );
+            for end in 0..encoded.len() {
+                assert!(ActorEventPacket::decode_exact(&encoded[..end]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn add_item_actor_spawns_a_fixed_identifier_item_entity() {
+        let mut packet = AddItemActorPacket::default();
+        packet.target_actor_id.0 = -5;
+        packet.target_runtime_id.0 = 12;
+        packet.position.y = 64.0 + ITEM_ACTOR_NETWORK_OFFSET;
+        let Ok(ActorEvent::Spawn(spawn)) = normalize_add_item_actor(packet, 0) else {
+            panic!("item actor spawn");
+        };
+        assert_eq!((spawn.unique_id, spawn.runtime_id), (-5, 12));
+        assert!(matches!(
+            &spawn.kind,
+            crate::ActorKind::Entity { identifier } if identifier.as_ref() == "minecraft:item"
+        ));
+        assert_eq!(spawn.position[1], 64.0);
+    }
+
+    #[test]
+    fn add_item_wire_origin_is_normalized_to_collision_feet_once() {
+        let mut packet = AddItemActorPacket::default();
+        packet.position.x = 1.0;
+        packet.position.y = 64.0 + ITEM_ACTOR_NETWORK_OFFSET;
+        packet.position.z = 3.0;
+        let bytes = packet.encode_to_vec().unwrap();
+        let packet = AddItemActorPacket::decode_exact(&bytes).unwrap();
+        let ActorEvent::Spawn(spawn) = normalize_add_item_actor(packet, 0).unwrap() else {
+            panic!("expected item spawn");
+        };
+        assert_eq!(spawn.position, [1.0, 64.0, 3.0]);
+    }
+
+    #[test]
+    fn take_item_names_item_and_collector() {
+        let mut packet = TakeItemActorPacket::default();
+        packet.item_runtime_id.0 = 3;
+        packet.actor_runtime_id.0 = 4;
+        assert_eq!(
+            normalize_take_item_actor(packet),
+            ActorEvent::TakeItem(ActorTakeItemEvent {
+                item_runtime_id: 3,
+                collector_runtime_id: 4,
+            })
+        );
+    }
+}

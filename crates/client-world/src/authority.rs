@@ -1,0 +1,288 @@
+//! Authoritative session data and synchronous committed-event application.
+#[cfg(test)]
+use protocol_ids::{HASHED_AIR_NETWORK_ID, SEQUENTIAL_AIR_NETWORK_ID};
+
+use crate::ingestion::MAX_ADMITTED_WORLD_EVENTS;
+use crate::{
+    ActorArmorSnapshot, ActorEquipmentSnapshot, ActorSnapshot, LocalPlayerFeed, PlayerProfile,
+    RemoteActionSnapshot, RemoteActionStats, ResolvedServerPosition, actor_store::ActorStore,
+    server_position::resolve_server_position,
+};
+use actor_animation::{ActorAnimationStats, ActorRigSnapshot};
+use assets::{NetworkIdMode, ResolvedBiomeTints, RuntimeAssets, RuntimeEntityAssets};
+use protocol::{
+    ActorAttribute, ActorEvent, ActorHandedness, AudioEvent, BiomeDefinitionEvent, BlockCrackEvent,
+    ChangeDimensionEvent, CustomBlocks, DaylightCycleUpdateEvent, DimensionHeightDiagnostic,
+    DimensionRange, MAX_DIMENSION_DEFINITIONS, MovePlayerEvent, PlayerMovementCorrectionEvent,
+    PrimitiveShapesEvent, RespawnEvent, SetTimeEvent, UiEvent, WeatherUpdateEvent, WorldBootstrap,
+    WorldEvent, vanilla_dimension_range,
+};
+#[cfg(test)]
+use protocol::{
+    ActorAttributesUpdateEvent, ActorKind, ActorMetadata, ActorMetadataUpdateEvent,
+    ActorMetadataValue, ActorSpawnEvent, CustomBlock, CustomBlockVisuals, CustomSelection,
+    CustomStateAxis, CustomStateValue, PrimitiveShapeChange,
+};
+use std::{
+    collections::BTreeSet,
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use world::{ChunkKey, ChunkStore};
+mod access;
+mod actor_lives;
+mod actor_movement;
+mod actors;
+mod biomes;
+mod block_events;
+mod block_identities;
+mod local_actor_move;
+#[cfg(test)]
+mod local_death_tests;
+pub use block_identities::PreparedBlockIdentities;
+mod combat;
+mod commits;
+mod contracts;
+mod dimension_ranges;
+mod dimension_transfer;
+mod local_actor_lifetime;
+#[cfg(test)]
+mod local_movement_flags_tests;
+#[cfg(test)]
+mod local_skin_selection_tests;
+mod map_data;
+mod movement_attribute;
+mod particles;
+#[cfg(test)]
+mod pickup_tests;
+#[cfg(test)]
+mod primitive_shape_tests;
+mod queues;
+mod sign_edit;
+#[cfg(test)]
+mod synchronized_audio_tests;
+mod terrain;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod world_spawn_tests;
+pub use actor_lives::{ActorLife, MAX_ACTOR_LIVES};
+pub use biomes::BiomeCommitReport;
+pub use block_events::BlockEventCue;
+pub use combat::{ActorCombatEvidence, ActorCombatKind};
+pub use contracts::{
+    CommittedAudioEvent, CommittedCameraEvent, CommittedControlEvent, CommittedParticleEvent,
+    CommittedUiEvent, PublisherViewGeometry, ViewCohort,
+};
+pub use map_data::MapImage;
+pub use movement_attribute::MovementSpeedAttribute;
+pub use sign_edit::SignEditRequest;
+
+static NEXT_BIOME_TINT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_ACTOR_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a distinct lifetime namespace for network and client-owned actor stores.
+pub(crate) fn allocate_actor_session_id() -> u64 {
+    NEXT_ACTOR_SESSION_ID
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("actor session identity space exhausted")
+}
+/// A local spawn can publish item use, movement attributes and a local death.
+pub const COMMITTED_CONTROL_CAPACITY: usize = 3 * MAX_ADMITTED_WORLD_EVENTS;
+pub const COMMITTED_UI_CAPACITY: usize = MAX_ADMITTED_WORLD_EVENTS;
+pub const COMMITTED_AUDIO_CAPACITY: usize = MAX_ADMITTED_WORLD_EVENTS;
+pub const COMMITTED_CAMERA_CAPACITY: usize = MAX_ADMITTED_WORLD_EVENTS;
+pub const COMMITTED_PARTICLE_CAPACITY: usize = 512;
+
+/// The one session owner of packed terrain, actors, identities and committed consumer queues.
+/// Terrain scheduling borrows this owner synchronously; it keeps no shadow world or frontier.
+pub struct WorldAuthority {
+    /// The local player's game mode follows the world default.
+    local_mode_follows_default: bool,
+    terrain: ChunkStore,
+    actors: ActorStore,
+    combat_evidence: VecDeque<ActorCombatEvidence>,
+    combat_revision: u64,
+    block_events: block_events::BlockEvents,
+    map_images: map_data::MapImages,
+    pending_sign_edit: Option<SignEditRequest>,
+    audio_nondefault_camera_observed: bool,
+    network_id_mode: NetworkIdMode,
+    air_block_id: u32,
+    runtime_assets: Arc<RuntimeAssets>,
+    custom_block_ids: std::ops::Range<u32>,
+    custom_block_identities: Arc<std::collections::HashMap<u32, u32>>,
+    block_names: block_identities::BlockNames,
+    id_remap: Arc<assets::SequentialIdRemap>,
+    decode_diagnostics: Arc<crate::ingestion::DecodeDiagnostics>,
+    biome_definitions: Arc<[BiomeDefinitionEvent]>,
+    resolved_biome_tints: Arc<ResolvedBiomeTints>,
+    biome_tint_stream_id: u64,
+    biome_tint_revision: u64,
+    current_dimension: i32,
+    /// The level's default spawn, which compasses point at.
+    world_spawn: [i32; 3],
+    dimension_ranges: std::collections::BTreeMap<i32, (Arc<str>, DimensionRange)>,
+    frozen_dimension_ranges: BTreeSet<i32>,
+    dimension_range_skips: u64,
+    form_dimension_epoch: u64,
+    local_player_runtime_id: u64,
+    local_player_unique_id: i64,
+    local_actor_position: Option<local_actor_move::LocalActorPosition>,
+    local_movement_speed: Option<f64>,
+    /// The bootstrap lifetime is zero; session setup already clears its consumers.
+    published_local_actor_revision: u64,
+    resolved_server_position: ResolvedServerPosition,
+    latest_movement_correction_tick: Option<u64>,
+    actor_session_id: u64,
+    /// Logical life state starts unknown and survives synthetic actor replacement.
+    local_player_dead: Option<bool>,
+    committed_controls: VecDeque<CommittedControlEvent>,
+    committed_ui: VecDeque<CommittedUiEvent>,
+    committed_audio: VecDeque<CommittedAudioEvent>,
+    committed_camera: VecDeque<CommittedCameraEvent>,
+    committed_primitive_shapes: VecDeque<PrimitiveShapesEvent>,
+    committed_particles: VecDeque<CommittedParticleEvent>,
+}
+
+impl WorldAuthority {
+    /// Creates fresh session identities and authoritative state from a validated bootstrap.
+    pub fn new(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        entity_assets: Option<Arc<RuntimeEntityAssets>>,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        Self::new_with_actor_catalog(
+            bootstrap,
+            runtime_assets,
+            entity_assets.map(actor_animation::ActorAnimationCatalog::new),
+            current_position,
+            existing_anchor,
+        )
+    }
+
+    /// Starts session authority using entity analysis completed before bootstrap publication.
+    pub fn new_with_actor_catalog(
+        bootstrap: WorldBootstrap,
+        runtime_assets: Arc<RuntimeAssets>,
+        entity_assets: Option<actor_animation::ActorAnimationCatalog>,
+        current_position: [f32; 3],
+        existing_anchor: Option<[i32; 2]>,
+    ) -> Self {
+        let resolved_server_position =
+            resolve_server_position(bootstrap.player_position, current_position, existing_anchor);
+        let resolved_biome_tints = Arc::new(
+            runtime_assets
+                .biome_assets()
+                .resolve_live(&[])
+                .expect("validated runtime biome assets resolve without live definitions"),
+        );
+        let biome_tint_stream_id = NEXT_BIOME_TINT_STREAM_ID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("biome tint stream identity space exhausted");
+        let actor_session_id = allocate_actor_session_id();
+        let network_id_mode = if bootstrap.block_network_ids_are_hashes {
+            NetworkIdMode::Hashed
+        } else {
+            NetworkIdMode::Sequential
+        };
+        let air_block_id = runtime_assets
+            .air_network_id(network_id_mode)
+            .unwrap_or(bootstrap.air_network_id);
+        let mut actors = entity_assets.map_or_else(
+            || ActorStore::new(actor_session_id, bootstrap.dimension),
+            |assets| {
+                ActorStore::new_with_entity_assets(actor_session_id, bootstrap.dimension, assets)
+            },
+        );
+        actors.exclude_remote_state_for(bootstrap.local_player_runtime_id);
+        actors.set_local_unique_id(bootstrap.local_player_unique_id);
+        // No custom palette is admitted yet, so the internal air id is also its wire id.
+        actors.set_air_block_network_id(Some(air_block_id));
+        Self {
+            terrain: ChunkStore::new(),
+            actors,
+            combat_evidence: VecDeque::new(),
+            local_mode_follows_default: false,
+            combat_revision: 0,
+            block_events: block_events::BlockEvents::default(),
+            map_images: map_data::MapImages::default(),
+            pending_sign_edit: None,
+            audio_nondefault_camera_observed: false,
+            network_id_mode,
+            air_block_id,
+            runtime_assets,
+            custom_block_ids: 0..0,
+            custom_block_identities: Arc::default(),
+            block_names: block_identities::BlockNames::new(network_id_mode),
+            id_remap: Arc::default(),
+            decode_diagnostics: Arc::default(),
+            biome_definitions: Arc::from([]),
+            resolved_biome_tints,
+            biome_tint_stream_id,
+            biome_tint_revision: 0,
+            current_dimension: bootstrap.dimension,
+            world_spawn: bootstrap.world_spawn_position,
+            dimension_ranges: std::collections::BTreeMap::new(),
+            frozen_dimension_ranges: BTreeSet::new(),
+            dimension_range_skips: 0,
+            form_dimension_epoch: 0,
+            local_player_runtime_id: bootstrap.local_player_runtime_id,
+            local_player_unique_id: bootstrap.local_player_unique_id,
+            local_actor_position: None,
+            local_movement_speed: None,
+            published_local_actor_revision: 0,
+            resolved_server_position,
+            latest_movement_correction_tick: None,
+            actor_session_id,
+            local_player_dead: None,
+            committed_controls: VecDeque::new(),
+            committed_ui: VecDeque::new(),
+            committed_audio: VecDeque::new(),
+            committed_camera: VecDeque::new(),
+            committed_primitive_shapes: VecDeque::new(),
+            committed_particles: VecDeque::new(),
+        }
+    }
+    /// Borrows the committed packed terrain for collision and mesh snapshots.
+    pub const fn terrain(&self) -> &ChunkStore {
+        &self.terrain
+    }
+    /// Applies an actor move before any local-player retention work.
+    pub fn apply_player_move(&mut self, sequence: u64, movement: MovePlayerEvent) {
+        if movement.runtime_id == self.local_player_runtime_id {
+            self.retain_local_actor_position(sequence, movement.position.map(Some));
+        }
+        let _ = self.actors.apply_player_move(
+            self.actor_session_id,
+            sequence,
+            self.current_dimension,
+            movement,
+        );
+    }
+    /// Resets authoritative actor state at the committed dimension transition.
+    pub fn reset_dimension(&mut self, sequence: u64, dimension: i32) {
+        let previous_mount = self.actors.ridden_unique_id(self.local_player_unique_id);
+        let _ = self
+            .actors
+            .reset_dimension(self.actor_session_id, sequence, dimension);
+        self.current_dimension = dimension;
+        self.local_actor_position = None;
+        self.form_dimension_epoch = sequence;
+        self.publish_local_actor_replacement(sequence);
+        self.publish_local_mount_change(sequence, previous_mount);
+    }
+    /// Returns the mount retained for an actor's current lifetime.
+    pub fn ridden_unique_id(&self, unique_id: i64) -> Option<i64> {
+        self.actors.ridden_unique_id(unique_id)
+    }
+}

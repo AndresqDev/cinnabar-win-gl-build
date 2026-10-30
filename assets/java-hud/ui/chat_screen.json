@@ -1,0 +1,196 @@
+// Java-look presentation; the vanilla chat controller still owns editing and sending.
+{
+  "namespace": "chat",
+  "chat_screen@common.base_screen": {
+    "absorbs_input": true,
+    "render_game_behind": true,
+    "$screen_content": "chat.java_chat_content",
+    "$screen_bg_content": "common.base_screen_empty_panel",
+    "$screen_animations": [],
+    "$background_animations": []
+  },
+  "java_chat_content": {
+    "type": "panel",
+    "controls": [
+      {
+        "messages_panel@chat.messages_scrolling_panel": {
+          "$history_anchor": "bottom_left",
+          "$cinnabar_hotbar_lift": 0,
+          "$history_offset": [ 0, "($cinnabar_chat_history_bottom + $cinnabar_hotbar_lift)" ],
+          "variables": [{
+            "requires": "$cinnabar_bedrock_hotbar",
+            "$cinnabar_hotbar_lift": "$cinnabar_bedrock_hotbar_lift"
+          }, {
+            "requires": "$cinnabar_chat_top",
+            "$history_anchor": "top_left",
+            "$history_offset": [ 0, 0 ]
+          }],
+          "size": [ "$cinnabar_chat_width", 180 ],
+          "max_size": [ "100%", "50%" ],
+          "anchor_from": "$history_anchor",
+          "anchor_to": "$history_anchor",
+          "offset": "$history_offset",
+          "$scroll_size": [ 0, "100%" ],
+          "$scroll_bar_left_padding_size": [ 0, 0 ],
+          "$scroll_bar_right_padding_size": [ 0, 0 ]
+        }
+      },
+      {
+        "input_line": {
+          "type": "panel",
+          "anchor_from": "bottom_left",
+          "anchor_to": "bottom_left",
+          "offset": [ 2, -2 ],
+          "size": [ "100% - 4px", 12 ],
+          "max_size": [ "100%", "100%" ],
+          "layer": 2,
+          "clips_children": true,
+          "controls": [
+            {
+              "background": {
+                "type": "image",
+                "texture": "textures/ui/Black",
+                // Fixed input background: alpha 128/255.
+                "alpha": 0.5019607843137255,
+                "size": [ "100%", "100%" ]
+              }
+            },
+            {
+              "text_edit_box": {
+                "type": "edit_box",
+                "text_control": "text",
+                "size": [ "100% - 4px", 10 ],
+                "anchor_from": "top_left",
+                "anchor_to": "top_left",
+                "offset": [ 2, 2 ],
+                "always_listening": true,
+                "default_focus_precedence": 1,
+                "layer": 1,
+                "controls": [
+                  {
+                    "text": {
+                      "type": "label",
+                      "size": [ "100%", 10 ],
+                      "text": "#message_text_box_content",
+                      "localize": false,
+                      "shadow": true,
+                      "color": [ 1, 1, 1 ],
+                      "bindings": [ { "binding_name": "#message_text_box_content" } ]
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      {
+        "suggestions": {
+          "type": "stack_panel",
+          "orientation": "horizontal",
+          "use_child_anchors": true,
+          "anchor_from": "bottom_left",
+          "anchor_to": "bottom_left",
+          "size": [ "100% - 3px", "100%cm" ],
+          "offset": [ 3, -15 ],
+          "layer": 10,
+          "controls": [
+            {
+              "completion_prefix": {
+                "type": "panel",
+                "alpha": 0,
+                "size": [ "fill", 0 ],
+                "max_size": [ "100%c", 0 ],
+                "controls": [{
+                  "text": {
+                    "type": "label",
+                    "text": "#cinnabar_chat_completion_prefix",
+                    "localize": false,
+                    "size": [ "default", 0 ],
+                    "bindings": [ { "binding_name": "#cinnabar_chat_completion_prefix" } ]
+                  }
+                }]
+              }
+            },
+            {
+              "rows": {
+                "type": "stack_panel",
+                "orientation": "vertical",
+                "size": [ "100%cm", "100%c" ],
+                "max_size": [ "100%", "100%" ],
+                "collection_name": "auto_complete",
+                "factory": { "control_name": "chat.auto_complete_panel_contents_with_item" }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "messages_stack_panel": {
+    "variables": [{
+      "requires": "$cinnabar_chat_top",
+      "$scrolling_content_anchor_from": "top_left",
+      "$scrolling_content_anchor_to": "top_left"
+    }]
+  },
+  "auto_complete_panel_contents_with_item": {
+    "size": [ "100%cm + 1px", 12 ],
+    "inherit_max_sibling_width": true,
+    "clips_children": true,
+    "modifications": [
+      {
+        "array_name": "controls",
+        "operation": "insert_front",
+        "value": [
+          { "background": {
+            "type": "image",
+            "texture": "textures/ui/Black",
+            // Fixed suggestion background: alpha 208/255.
+            "alpha": 0.8156862745098039,
+            "size": [ "100%", "100%" ],
+            "layer": -1
+          } }
+        ]
+      }
+    ]
+  },
+  "auto_complete_panel_contents_with_item/auto_complete_item_renderer": {
+    "ignored": true
+  },
+  "auto_complete_panel_contents_with_item/text": {
+    "size": [ "default", 9 ],
+    "anchor_from": "top_left",
+    "anchor_to": "top_left",
+    "offset": [ 1, 2 ]
+  },
+  "messages_text": {
+    "bindings": [],
+    "modifications": [
+      {
+        "array_name": "controls",
+        "operation": "insert_front",
+        "value": [
+          { "background": {
+            "type": "image",
+            "texture": "textures/ui/Black",
+            "alpha": "$chat_background_opacity",
+            "bindings": [ { "binding_name": "#chat_background_opacity", "binding_name_override": "#alpha" } ],
+            "size": [ "100%", "100%" ]
+          } }
+        ]
+      }
+    ]
+  },
+  "messages_text/text": {
+    "offset": [ 4, 0 ],
+    "size": [ "100% - 8px", "default" ],
+    "anchor_from": "top_left",
+    "anchor_to": "top_left",
+    "font_type": "$chat_font_type",
+    "font_scale_factor": "$chat_font_scale_factor",
+    "line_padding": "($chat_line_spacing - 1)",
+    "shadow": true,
+    "layer": 1
+  }
+}

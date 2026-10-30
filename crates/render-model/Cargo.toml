@@ -1,0 +1,47 @@
+[package]
+name = "render-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[package.metadata.cinnabar]
+reads = [
+    "assets/cinnangles-sans-source.json",
+    "assets/vanilla-source.json",
+]
+
+[features]
+test-support = []
+enhanced-diagnostics = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cosmetics = { path = "../cosmetics" }
+simulation-clock = { path = "../simulation-clock" }
+hashbrown = { version = "0.16.1", default-features = false }
+foldhash = { version = "0.2.0", default-features = false }
+block-transform = { path = "../block-transform" }
+mod-api = { path = "../mod-api" }
+image.workspace = true
+tracing.workspace = true
+assets = { path = "../assets" }
+bytemuck = { version = "1", features = ["derive"] }
+glam.workspace = true
+render-api = { path = "../render-api" }
+sha2.workspace = true
+world = { path = "../world" }
+
+# ARM hardware dispatch keeps identical digests and falls back on CPUs without SHA2.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
+[dev-dependencies]
+test-alloc = { path = "../test-alloc" }
+pack-compiler = { path = "../pack-compiler" }
+pack-entity-compiler = { path = "../pack-compiler/entity" }
+tempfile = "3"
+
+[lints]
+workspace = true

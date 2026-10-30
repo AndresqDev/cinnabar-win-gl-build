@@ -1,0 +1,903 @@
+//! The menu's presented data: saved servers, catalog cards, and the per-frame
+//! view the renderers draw from.
+
+mod settings;
+pub use settings::SettingsInteraction;
+
+use crate::download::DownloadTracker;
+use std::collections::HashMap;
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    MenuAction, MenuDialog, MenuField, MenuList, MenuScreen, MenuServerTab, auth::AuthState,
+};
+use ui::IconRef;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SavedServer {
+    pub name: String,
+    pub address: String,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub last_joined_unix: u64,
+}
+
+/// One local world for the play screen's worlds tab, supplied by the local
+/// worlds module through [`MenuView::local_worlds`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocalWorldCard {
+    pub name: String,
+    pub game_mode: String,
+    /// The saved world generator label.
+    pub world_type: String,
+    /// The server hosting the world, so Dragonfly and BDS worlds of one name stay distinct.
+    pub server: String,
+    pub date: String,
+    pub size: String,
+    /// Its last captured view, once one was taken.
+    pub thumbnail: Option<crate::local_worlds::world::WorldThumbnail>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct MenuServerCard {
+    pub name: String,
+    pub address: String,
+    pub caption: String,
+    #[serde(default)]
+    pub image_path: String,
+    #[serde(skip)]
+    pub icon: Option<IconRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct MenuRealmCard {
+    pub name: String,
+    pub state: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub online_players: u32,
+    #[serde(default)]
+    pub max_players: u32,
+    #[serde(default)]
+    pub days_left: i32,
+    #[serde(default)]
+    pub expired: bool,
+    /// Joined as a member rather than owned.
+    #[serde(default)]
+    pub member: bool,
+}
+
+impl MenuRealmCard {
+    /// Closed or expired Realms may grant membership but cannot offer a game connection.
+    pub fn can_play(&self) -> bool {
+        !self.expired && self.state.eq_ignore_ascii_case("open")
+    }
+}
+
+/// Marks a featured address as an experience's ID, joined when selected.
+pub const EXPERIENCE_ADDRESS_PREFIX: &str = bridge::contract::GATHERING_TARGET_PREFIX;
+
+/// Marks an address as the friend world hosted by this XUID.
+pub const FRIEND_ADDRESS_PREFIX: &str = bridge::contract::FRIEND_TARGET_PREFIX;
+
+/// Whether the server at `address` can be pinged; an experience has no server until joined.
+pub fn pingable(address: &str) -> bool {
+    !address.starts_with(EXPERIENCE_ADDRESS_PREFIX)
+}
+
+/// A featured server's info-panel details; artwork is a local cached path.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ServerDetails {
+    pub group: String,
+    /// Live experience count; only positive values are shown in its details panel.
+    pub player_count: Option<i64>,
+    pub description: String,
+    /// The details banner; empty uses the first screenshot.
+    pub banner: String,
+    pub news_title: String,
+    pub news: String,
+    pub screenshots: Vec<String>,
+    pub games: Vec<MenuGameCard>,
+    /// The server's remote HTTPS logo, which Discord Rich Presence shows by URL.
+    pub logo_url: String,
+}
+
+/// One game a featured server advertises.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MenuGameCard {
+    pub title: String,
+    pub subtitle: String,
+    pub description: String,
+    pub image_path: String,
+}
+
+/// The signed-in profile as the start screen shows it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MenuProfile {
+    pub loaded: bool,
+    pub unavailable: bool,
+    pub xuid: String,
+    pub statistics_loaded: bool,
+    pub statistics_error: bool,
+    pub achievements_loaded: bool,
+    pub achievements_error: bool,
+    pub achievements: Option<bridge::ProfileAchievements>,
+    pub gamertag: String,
+    pub picture_path: String,
+    pub avatar_path: String,
+    pub avatar_loaded: bool,
+    pub avatar_error: bool,
+    pub featured_screenshot_path: String,
+    pub featured_screenshot_loaded: bool,
+    pub featured_screenshot_error: bool,
+    pub real_name: String,
+    pub presence: String,
+    pub gamerscore: Option<i64>,
+    pub friends: Option<u32>,
+    pub followers: Option<u32>,
+    pub statistics: Option<bridge::ProfileStatistics>,
+}
+
+impl MenuProfile {
+    /// Finishes every loading input when the account feed cannot provide a profile.
+    pub fn unavailable() -> Self {
+        Self {
+            loaded: true,
+            unavailable: true,
+            avatar_loaded: true,
+            avatar_error: true,
+            featured_screenshot_loaded: true,
+            featured_screenshot_error: true,
+            statistics_loaded: true,
+            statistics_error: true,
+            achievements_loaded: true,
+            achievements_error: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Service feed data beyond the catalog cards: featured-server details keyed
+/// by address, the profile, and the featured server the info panel shows.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MenuFeeds {
+    pub accounts: Vec<crate::accounts::AccountProfile>,
+    pub account_active_id: Option<String>,
+    pub account_error: Option<String>,
+    pub account_adding: bool,
+    pub inbox_state: super::inbox::InboxState,
+    pub details: HashMap<String, ServerDetails>,
+    pub profile: MenuProfile,
+    pub profile_refresh_requested: bool,
+    pub selected_featured: Option<usize>,
+    /// The saved server the Servers tab's details show, instead of a featured one.
+    pub selected_saved: Option<usize>,
+    /// The Realm the Realms tab's details show.
+    pub selected_realm: Option<usize>,
+    /// RakNet pongs keyed by the address the row joins.
+    pub pings: HashMap<String, PingInfo>,
+    /// The info panel's description and news are expanded past "read more".
+    pub description_expanded: bool,
+    pub news_expanded: bool,
+    pub home: MenuHome,
+    /// The join the progress screen reports while connecting.
+    pub join: JoinProgress,
+    /// The join's pending question whether to trust a NetherNet server.
+    pub server_trust: Option<ServerTrustPrompt>,
+    /// The player's answer to that question, until it is sent to the core that asked.
+    pub server_trust_answer: Option<(ServerTrustPrompt, bool)>,
+}
+
+/// The core asks whether to trust the NetherNet server at `url` before the join goes on.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ServerTrustPrompt {
+    pub id: u64,
+    pub url: String,
+    /// Asked by a per-session core rather than the launcher core; ids are per core.
+    pub from_session_core: bool,
+}
+
+/// Which kind of join is under way; picks vanilla's connect title and progress screen.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JoinKind {
+    #[default]
+    External,
+    Realm,
+    Local,
+}
+
+/// A join's stage, as vanilla's progress handlers split it.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JoinStage {
+    /// The Realm lookup.
+    Realm,
+    /// Transport connect and login.
+    #[default]
+    Connecting,
+    /// Pack acquisition; the byte total stays zero until a download begins.
+    Packs {
+        done: u32,
+        total: u32,
+        received_bytes: u64,
+        total_bytes: u64,
+    },
+    /// The core handed the session over and the world is not ready yet.
+    Generating,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JoinProgress {
+    pub kind: JoinKind,
+    pub stage: JoinStage,
+    /// The core reported this join, so its report vanishing means the handoff.
+    reported: bool,
+    download: DownloadTracker,
+}
+
+impl JoinProgress {
+    pub fn new(kind: JoinKind) -> Self {
+        Self {
+            kind,
+            ..Self::default()
+        }
+    }
+
+    /// Folds in the core's latest report; `None` before its first or after the handoff.
+    pub fn observe(&mut self, core: Option<JoinStage>) {
+        self.observe_at(core, Instant::now());
+    }
+
+    /// Folds in the core's report sampled at `now`, so tests can use fixed clocks.
+    pub fn observe_at(&mut self, core: Option<JoinStage>, now: Instant) {
+        match core {
+            Some(stage) => {
+                self.stage = stage;
+                self.reported = true;
+                self.observe_download(now);
+            }
+            None if self.reported => {
+                self.stage = JoinStage::Generating;
+                self.download.reset();
+            }
+            None => {}
+        }
+    }
+
+    /// Updates the download measurement or clears it when acquisition ends.
+    fn observe_download(&mut self, now: Instant) {
+        if let JoinStage::Packs {
+            received_bytes,
+            total_bytes,
+            ..
+        } = self.stage
+        {
+            if total_bytes == 0 {
+                self.download.reset();
+            } else {
+                self.download.observe(received_bytes, total_bytes, now);
+            }
+        } else {
+            self.download.reset();
+        }
+    }
+
+    /// Average pack download speed over the trailing window, once it steadies.
+    pub fn bytes_per_sec(&self) -> Option<u64> {
+        self.download.bytes_per_sec()
+    }
+
+    /// Estimated seconds until the pack download completes, once the rate steadies.
+    pub fn eta_secs(&self) -> Option<u64> {
+        self.download.eta_secs()
+    }
+
+    /// Whether vanilla's handler for this stage lets the player cancel.
+    pub fn cancellable(&self) -> bool {
+        match self.stage {
+            JoinStage::Realm => false,
+            JoinStage::Connecting => self.kind == JoinKind::External,
+            JoinStage::Packs { total_bytes, .. } => total_bytes > 0,
+            JoinStage::Generating => true,
+        }
+    }
+}
+
+/// The start screen's service data: messaging tile art, inbox and invite
+/// counts, the live event button and the rendered persona head.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MenuHome {
+    pub play_art: Option<ButtonArt>,
+    pub inbox_unread: u32,
+    pub inbox_counts: std::collections::BTreeMap<usize, u32>,
+    pub realm_invites: u32,
+    pub live_event: Option<LiveEventCard>,
+    pub persona_head: String,
+    /// Inbox messages, newest first as the service lists them.
+    pub inbox: Vec<InboxItem>,
+}
+
+/// One inbox message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InboxItem {
+    pub instance_id: String,
+    pub report_id: String,
+    pub received: String,
+    pub source: String,
+    pub header: String,
+    pub body: String,
+    pub category: String,
+    pub unread: bool,
+}
+
+/// A main button's messaging art: local image paths per layer and its banner.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ButtonArt {
+    pub banner_texture: String,
+    pub colors: std::collections::BTreeMap<String, [u8; 3]>,
+    pub default_background: String,
+    pub hover_background: String,
+    pub default_foreground: String,
+    pub hover_foreground: String,
+    pub banner: String,
+}
+
+/// The live gathering the start screen's event button leads to.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LiveEventCard {
+    pub button_text: String,
+    pub caption: String,
+    pub countdown: bool,
+    pub start_unix: i64,
+    pub badge_path: String,
+    pub address: String,
+    pub route_to_servers: bool,
+}
+
+impl MenuFeeds {
+    /// Show another featured server; its panel opens collapsed.
+    pub fn select(&mut self, index: usize) {
+        if self.selected_featured != Some(index) {
+            self.description_expanded = false;
+            self.news_expanded = false;
+        }
+        self.selected_featured = Some(index);
+        self.selected_saved = None;
+    }
+
+    /// Show a saved server's details in place of the featured one.
+    pub fn select_saved(&mut self, index: usize) {
+        self.selected_saved = Some(index);
+        self.selected_featured = None;
+    }
+
+    pub fn toggle_read_more(&mut self, section: u8) {
+        match section {
+            0 => self.description_expanded = !self.description_expanded,
+            _ => self.news_expanded = !self.news_expanded,
+        }
+    }
+}
+
+/// One server's pong: `online` is false when it did not answer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PingInfo {
+    pub motd: String,
+    pub online: bool,
+    pub players: u32,
+    pub max_players: u32,
+    pub ping_ms: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MenuFriendCard {
+    pub gamertag: String,
+    pub world_name: String,
+    pub members: String,
+    pub xuid: String,
+    /// The world's player limit; zero when the host did not publish one.
+    pub max_members: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuView {
+    /// Verified update notice and the available release-channel choices.
+    pub updates: super::updates::View,
+    pub visible: bool,
+    /// The menu opened over the session's world rather than the launcher's.
+    pub over_world: bool,
+    pub screen: MenuScreen,
+    pub focused_action: Option<MenuAction>,
+    pub hovered: Option<MenuAction>,
+    pub pressed: Option<MenuAction>,
+    /// Keyboard and gamepad focus draws an outline; pointer focus still navigates.
+    pub navigation_focus_visible: bool,
+    pub gamepad_input: bool,
+    /// Touch hardware remains available when a mouse or controller becomes active.
+    pub touch_available: bool,
+    /// The touch-control draft owns this settings surface.
+    pub touch_editor_open: bool,
+    pub server_tab: MenuServerTab,
+    pub profile_tab: super::ProfileTab,
+    pub dialog: Option<MenuDialog>,
+    pub field: Option<MenuField>,
+    /// The focused field's caret.
+    pub caret: MenuCaret,
+    pub name: String,
+    pub address: String,
+    pub port: String,
+    /// The friends drawer's editable gamertag filter.
+    pub friend_query: String,
+    /// Transient text filtering settings across categories.
+    pub settings_query: String,
+    /// Command box drafts, including invalid edits that have not been saved.
+    pub macro_commands: Option<[String; super::settings_options::COMMAND_MACRO_COUNT]>,
+    pub message: Option<String>,
+    /// Localized server-authored reason projected by the gameplay UI.
+    pub death_reason: String,
+    /// A respawn request is waiting for authoritative recovery.
+    pub death_loading: bool,
+    /// Real-time OreUI death stages, independent of the simulation clock.
+    pub death_presentation: super::death::DeathPresentation,
+    /// Ordinary death controls have completed their delay and may accept input.
+    pub death_controls_visible: bool,
+    pub gui_scale_offset: i8,
+    pub gui_scale_choices: Vec<ui::DesktopGuiScaleChoice>,
+    pub fullscreen: bool,
+    pub render_mode: ui::RenderMode,
+    /// Names of the discovered shader packs that [`super::RendererChoice::ShaderPack`] indexes.
+    pub shader_packs: std::sync::Arc<[String]>,
+    /// Revision of the discovered list carried by shader-pack picker actions.
+    pub shader_packs_revision: u64,
+    /// The imported pack currently being removed by the host.
+    pub shader_pack_removing: Option<std::sync::Arc<str>>,
+    /// A picked shader-pack import is open or copying; another waits until it finishes.
+    pub shader_pack_importing: bool,
+    /// The requested pack while shader-pack mode is active, even if discovery no longer lists it.
+    pub shader_pack: Option<String>,
+    /// The highlighted renderer or shader-pack choice; `None` while the selected shader pack is missing.
+    pub renderer: Option<super::RendererChoice>,
+    /// The requested pack has an option screen, including a command-line pack not listed.
+    pub shader_options_available: bool,
+    /// Load failure or partial-program warning for the selected shader pack.
+    pub renderer_issue: Option<super::shader_pack_status::PackIssue>,
+    /// The render host is still loading the selected shader pack.
+    pub shader_pack_loading: bool,
+    /// Session VSync forced by a launch flag; the saved toggle is shown locked to it.
+    pub vsync_override: Option<bool>,
+    pub display_name: String,
+    pub servers: MenuList<SavedServer>,
+    pub featured: MenuList<MenuServerCard>,
+    pub realms: MenuList<MenuRealmCard>,
+    pub friends: MenuList<MenuFriendCard>,
+    pub featured_icon: Option<IconRef>,
+    pub realm_icon: Option<IconRef>,
+    pub friend_icon: Option<IconRef>,
+    pub saved_icon: Option<IconRef>,
+    pub profile_icon: Option<IconRef>,
+    pub catalog_loading: bool,
+    pub catalog_message: Option<String>,
+    pub auth_state: AuthState,
+    /// Result of handing the current sign-in code to the default browser.
+    pub sign_in_browser: super::sign_in::BrowserState,
+    /// Interactive sign-in may show waiting and recovery prompts over the current route.
+    pub sign_in_requested: bool,
+    pub connecting: bool,
+    pub dressing_room: std::sync::Arc<crate::dressing_room::DressingRoomView>,
+    pub player_skin: Option<render_api::StandardSkin>,
+    pub player_skin_model: crate::dressing_room::SkinModel,
+    pub global_resources: std::sync::Arc<crate::global_resources::Snapshot>,
+    pub mods: std::sync::Arc<crate::mods::Snapshot>,
+    /// The Shader Pack Settings screen in the Shaders tab, while open.
+    pub shader_options: Option<std::sync::Arc<crate::shader_options::View>>,
+    pub minecraft_import: std::sync::Arc<crate::minecraft_import::Snapshot>,
+    /// Why the last session ended, shown until acknowledged.
+    pub disconnect_message: Option<String>,
+    /// The failed remote destination can be retried by the current account.
+    pub can_reconnect: bool,
+    /// The saved server the add screen is editing.
+    pub editing: Option<usize>,
+    pub local_worlds: MenuList<LocalWorldCard>,
+    /// The local-world create, edit and template screens and their modals.
+    pub local: crate::local_worlds::WorldsView,
+    pub settings: SettingsInteraction,
+    pub settings_options: std::sync::Arc<super::settings_options::SettingsOptions>,
+    pub storage: std::sync::Arc<super::settings_storage::StorageView>,
+    pub language_choices: std::sync::Arc<[(String, String)]>,
+    pub feeds: MenuFeeds,
+    /// The open local world is hosted for Xbox friends, so the pause screen offers invites.
+    pub hosting: bool,
+    /// The host's own local world while playing it, which Settings can change.
+    pub world_settings: Option<std::sync::Arc<crate::local_worlds::in_world::View>>,
+    /// The code invitation flow covering the Realms tab.
+    pub realm_membership: Option<super::realm_membership::State>,
+    /// The invite screen's friends and picks while it is up.
+    pub invite: Option<std::sync::Arc<super::invite::InviteState>>,
+    /// Who sent the oldest open Discord join request.
+    pub join_request: Option<String>,
+}
+
+/// An active settings slider retains the unrounded pointer fraction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsSliderPointer {
+    pub option: u16,
+    pub fraction: f32,
+    pub mouse_input: bool,
+}
+
+/// A control's complete layout bounds, retained even outside a scroll viewport.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsFocusTarget {
+    pub action: MenuAction,
+    pub bounds: ui::UiRect,
+    pub landmark: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsFocusAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Directional navigation enters a landmark through its remembered or delegated control.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SettingsFocusLandmark {
+    pub id: u16,
+    pub parent: Option<u16>,
+    pub bounds: ui::UiRect,
+    pub scroll_axis: Option<SettingsFocusAxis>,
+    pub delegate: Option<MenuAction>,
+    pub delegate_landmark: Option<u16>,
+    pub remember: bool,
+    pub trap: bool,
+    pub focus_control_disabled: bool,
+}
+
+/// The focused text field's caret.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MenuCaret {
+    /// Byte offset into the focused field's text.
+    pub byte: usize,
+    /// Selected byte range, when the focused editor has a selection.
+    pub selection: Option<[usize; 2]>,
+    /// Changes with every edit and caret move, restarting the blink.
+    pub revision: u64,
+    /// The blink phase, which the presentation sets from its clock.
+    pub shown: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CatalogFile {
+    #[serde(default)]
+    pub featured: Vec<CatalogServer>,
+    #[serde(default)]
+    pub realms: Vec<MenuRealmCard>,
+    #[serde(default)]
+    pub friends: Vec<CatalogFriend>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// A featured server as the one-shot catalog lists it; the client caches `image_url` itself.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct CatalogServer {
+    pub name: String,
+    pub address: String,
+    pub caption: String,
+    #[serde(default)]
+    pub image_url: String,
+}
+
+impl From<CatalogServer> for MenuServerCard {
+    fn from(server: CatalogServer) -> Self {
+        Self {
+            name: server.name,
+            address: server.address,
+            caption: server.caption,
+            image_path: String::new(),
+            icon: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CatalogFriend {
+    pub gamertag: String,
+    pub world_name: String,
+    pub xuid: String,
+    pub members: i32,
+    pub max_members: i32,
+}
+
+impl From<CatalogFriend> for MenuFriendCard {
+    fn from(friend: CatalogFriend) -> Self {
+        let members = if friend.max_members > 0 {
+            format!("{}/{} players", friend.members, friend.max_members)
+        } else {
+            format!("{} players", friend.members)
+        };
+        Self {
+            gamertag: friend.gamertag,
+            world_name: friend.world_name,
+            members,
+            xuid: friend.xuid,
+            max_members: u32::try_from(friend.max_members).unwrap_or(0),
+        }
+    }
+}
+
+impl MenuView {
+    /// Hides a channel choice until the update service has verified that channel's release.
+    pub fn setting_choice_visible(
+        &self,
+        option: &super::settings_options::SettingDefinition,
+        choice: usize,
+    ) -> bool {
+        if option.id == super::settings_options::graphics_api::OPTION.id {
+            return super::settings_options::graphics_api::visible(
+                choice,
+                crate::graphics_backend::Platform::current(),
+            );
+        }
+        option.id != super::settings_options::UPDATE_CHANNEL_OPTION.id
+            || self.updates.channel_visible(choice)
+    }
+
+    /// The join's pending trust question, which draws as a popup over the join screen.
+    pub fn server_trust_prompt(&self) -> Option<&ServerTrustPrompt> {
+        self.feeds.server_trust.as_ref().filter(|_| self.connecting)
+    }
+
+    /// The oldest Discord join request's sender, asked in a popup once no other popup is up.
+    pub fn join_request_prompt(&self) -> Option<&str> {
+        self.join_request.as_deref().filter(|_| {
+            self.dialog.is_none()
+                && !self.sign_in_prompt_open()
+                && self.server_trust_prompt().is_none()
+        })
+    }
+
+    /// Whether Settings lists `section`: Server only over a world, Game only in the host's world.
+    pub fn settings_section_shown(
+        &self,
+        section: super::settings_sections::SettingSection,
+    ) -> bool {
+        use super::settings_sections::SettingSection;
+        match section {
+            SettingSection::Server => self.over_world,
+            SettingSection::Game => self.world_settings.is_some(),
+            _ => true,
+        }
+    }
+
+    /// Whether a popup draws over the screen and takes its input.
+    pub fn popup_open(&self) -> bool {
+        self.dialog.is_some()
+            || self.sign_in_prompt_open()
+            || self.server_trust_prompt().is_some()
+            || self.join_request.is_some()
+            || self.dressing_room.editor.is_some()
+    }
+
+    /// The standalone sign-in prompt replaces the route until it finishes or is cancelled.
+    pub fn sign_in_prompt_open(&self) -> bool {
+        self.dialog.is_none()
+            && !self.connecting
+            && self.local.progress.is_none()
+            && self.disconnect_message.is_none()
+            && (self.auth_state.awaiting_browser()
+                || (self.sign_in_requested
+                    && matches!(self.auth_state, AuthState::Checking | AuthState::Failed(_))))
+    }
+
+    /// Whether the launcher is waiting for Microsoft sign-in or Xbox signup in a browser.
+    pub fn auth_state_awaiting_browser(&self) -> bool {
+        self.auth_state.awaiting_browser()
+    }
+
+    /// Creates the empty home view used before host settings and service feeds are loaded.
+    pub fn new(visible: bool, display_name: String) -> Self {
+        Self {
+            updates: super::updates::View::default(),
+            visible,
+            over_world: !visible,
+            screen: MenuScreen::Home,
+            focused_action: Some(MenuAction::Navigate(MenuScreen::Home)),
+            hovered: None,
+            pressed: None,
+            navigation_focus_visible: true,
+            gamepad_input: false,
+            touch_available: crate::TOUCH_PRIMARY,
+            touch_editor_open: false,
+            server_tab: MenuServerTab::Featured,
+            profile_tab: super::ProfileTab::default(),
+            dialog: None,
+            friend_query: String::new(),
+            settings_query: String::new(),
+            field: None,
+            caret: MenuCaret {
+                shown: true,
+                ..MenuCaret::default()
+            },
+            name: String::new(),
+            address: String::new(),
+            port: String::new(),
+            macro_commands: None,
+            message: None,
+            death_reason: String::new(),
+            death_loading: false,
+            death_presentation: super::death::DeathPresentation::default(),
+            death_controls_visible: true,
+            gui_scale_offset: 0,
+            gui_scale_choices: ui::DesktopGuiScale::for_window([1, 1]).choices().collect(),
+            fullscreen: false,
+            render_mode: ui::RenderMode::Vanilla,
+            shader_packs: std::sync::Arc::from([]),
+            shader_packs_revision: 0,
+            shader_pack_removing: None,
+            shader_pack_importing: false,
+            shader_pack: None,
+            renderer: Some(super::RendererChoice::Vanilla),
+            shader_options_available: false,
+            renderer_issue: None,
+            shader_pack_loading: false,
+            vsync_override: None,
+            display_name,
+            servers: MenuList::default(),
+            featured: MenuList::default(),
+            realms: MenuList::default(),
+            friends: MenuList::default(),
+            featured_icon: None,
+            realm_icon: None,
+            friend_icon: None,
+            saved_icon: None,
+            profile_icon: None,
+            catalog_loading: false,
+            catalog_message: None,
+            auth_state: AuthState::SignedOut,
+            sign_in_browser: Default::default(),
+            sign_in_requested: false,
+            connecting: false,
+            dressing_room: Default::default(),
+            player_skin: None,
+            player_skin_model: Default::default(),
+            global_resources: Default::default(),
+            mods: Default::default(),
+            shader_options: None,
+            minecraft_import: Default::default(),
+            disconnect_message: None,
+            can_reconnect: false,
+            editing: None,
+            local_worlds: MenuList::default(),
+            local: Default::default(),
+            world_settings: None,
+            settings: SettingsInteraction::default(),
+            settings_options: Default::default(),
+            storage: Default::default(),
+            language_choices: Default::default(),
+            feeds: Default::default(),
+            hosting: false,
+            realm_membership: None,
+            invite: None,
+            join_request: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const MIB: u64 = 1 << 20;
+
+    /// Builds a pack download report with the requested byte counts.
+    fn packs(received: u64, total: u64) -> JoinStage {
+        JoinStage::Packs {
+            done: 0,
+            total: 5,
+            received_bytes: received,
+            total_bytes: total,
+        }
+    }
+
+    // The download rate steadies after half a second and predicts the time left.
+    #[test]
+    fn pack_download_tracks_rate_and_eta() {
+        let mut join = JoinProgress::new(JoinKind::External);
+        let start = Instant::now();
+        join.observe_at(Some(packs(0, 20 * MIB)), start);
+        assert_eq!(join.bytes_per_sec(), None);
+        assert_eq!(join.eta_secs(), None);
+        // Too soon to steady: no rate yet.
+        join.observe_at(
+            Some(packs(MIB, 20 * MIB)),
+            start + Duration::from_millis(100),
+        );
+        assert_eq!(join.bytes_per_sec(), None);
+        // 5 MiB in 2 s averages 2.5 MiB/s, leaving 15 MiB (~6 s).
+        join.observe_at(
+            Some(packs(5 * MIB, 20 * MIB)),
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(join.bytes_per_sec(), Some(5 * MIB / 2));
+        assert_eq!(join.eta_secs(), Some(6));
+    }
+
+    #[test]
+    fn pack_download_tracks_rate_at_render_frame_frequencies() {
+        for fps in [60_u64, 120] {
+            let mut join = JoinProgress::new(JoinKind::External);
+            let start = Instant::now();
+            for frame in 0..=fps * 8 {
+                let elapsed = Duration::from_nanos(frame * 1_000_000_000 / fps);
+                let received = (frame * 4 / fps) * (MIB / 4);
+                join.observe_at(Some(packs(received, 100 * MIB)), start + elapsed);
+                if elapsed >= Duration::from_secs(1) {
+                    let rate = join.bytes_per_sec().unwrap_or_else(|| {
+                        panic!("missing download rate at {fps} FPS, frame {frame}")
+                    });
+                    assert!(rate.abs_diff(MIB) < MIB / 10);
+                    assert!(join.eta_secs().is_some_and(|eta| eta > 0));
+                }
+            }
+        }
+    }
+
+    // A stalled or restarted download clears its rate rather than showing stale math.
+    #[test]
+    fn pack_download_resets_when_stalled_or_restarted() {
+        let mut join = JoinProgress::new(JoinKind::External);
+        let start = Instant::now();
+        join.observe_at(Some(packs(0, 20 * MIB)), start);
+        join.observe_at(
+            Some(packs(5 * MIB, 20 * MIB)),
+            start + Duration::from_secs(2),
+        );
+        assert!(join.bytes_per_sec().is_some());
+        // No new bytes past the 3 s window clears the rate.
+        join.observe_at(
+            Some(packs(5 * MIB, 20 * MIB)),
+            start + Duration::from_secs(6),
+        );
+        assert_eq!(join.bytes_per_sec(), None);
+        assert_eq!(join.eta_secs(), None);
+        // Fewer bytes means a new download, restarting the average.
+        join.observe_at(Some(packs(MIB, 20 * MIB)), start + Duration::from_secs(7));
+        assert_eq!(join.bytes_per_sec(), None);
+        // Leaving the download clears its rate for the next join.
+        join.observe_at(Some(JoinStage::Generating), start + Duration::from_secs(8));
+        assert_eq!(join.bytes_per_sec(), None);
+        assert_eq!(join.eta_secs(), None);
+    }
+
+    #[test]
+    fn standalone_sign_in_defers_join_requests_until_it_closes() {
+        let mut view = MenuView::new(true, "Offline Player".into());
+        view.join_request = Some("Placeholder friend".into());
+        for state in [
+            AuthState::AwaitingCode {
+                uri: "https://example.invalid".into(),
+                code: "TEST-CODE".into(),
+            },
+            AuthState::Checking,
+            AuthState::Failed("Try again.".into()),
+        ] {
+            view.sign_in_requested = true;
+            view.auth_state = state;
+            assert!(view.sign_in_prompt_open());
+            assert_eq!(view.join_request_prompt(), None);
+            assert_eq!(view.join_request.as_deref(), Some("Placeholder friend"));
+        }
+        view.sign_in_requested = false;
+        view.auth_state = AuthState::SignedOut;
+        assert_eq!(view.join_request_prompt(), Some("Placeholder friend"));
+    }
+}

@@ -1,0 +1,161 @@
+//! Bounded, read-only admission for server resource-pack archives received during login.
+//!
+//! Each archive is admitted independently: a bad pack is dropped with a counted
+//! reason and the rest of the stack still applies. Encrypted packs are decrypted
+//! in memory with a bounded shared read cache. Compiled outputs derived from any
+//! server pack, encrypted ones included, may persist in the install's local compile cache.
+
+use std::sync::Arc;
+
+#[cfg(feature = "handoff")]
+use protocol::ResourcePackHandoff;
+use thiserror::Error;
+
+mod added;
+mod crypto;
+mod dependencies;
+mod fingerprint;
+mod import;
+mod library;
+mod manifest;
+mod merge;
+mod pack;
+mod parser;
+mod read_cache;
+pub mod subpacks;
+#[cfg(all(feature = "handoff", any(test, feature = "test-support")))]
+pub mod test_support;
+mod view;
+
+pub use added::{AddedPack, compose_added_packs};
+pub use dependencies::{PackDependencies, PackDependency};
+pub use fingerprint::StackFingerprint;
+pub use import::{
+    GlobalSelectionEntry, PACK_IMPORT_EXTENSIONS, ParsedGlobalSelection, PreparedImport,
+    is_pack_import_path, merge_global_selection, parse_global_selection, prepare_import,
+};
+pub use library::{
+    ActivePack, GlobalPackLibrary, ImportReport, InstalledPack, LibraryError, Subpack,
+};
+pub use merge::{MAX_MERGED_ENTRIES, MAX_WINNING_BYTES, MAX_WINNING_FILES};
+pub use pack::{PackRejection, ValidatedPack, ValidatedPackStack};
+pub use parser::validate_archive_bytes;
+pub use view::LayeredPackView;
+
+/// Maximum compressed source bytes decoded for one pack texture.
+pub const MAX_PACK_TEXTURE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Maximum number of globally selected local packs; server selections are independent.
+pub const MAX_PACKS: usize = 32;
+/// Maximum compressed archive bytes accepted by local import readers.
+pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum compressed archive bytes accepted in one local import.
+pub const MAX_STACK_ARCHIVE_BYTES: usize = 128 * 1024 * 1024;
+/// Explicit read allowance for local import metadata and skin manifests.
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+/// Explicit name allowance for stored global selections and local skin import.
+pub const MAX_PATH_BYTES: usize = 512;
+pub const MAX_ENTRIES_PER_PACK: usize = 32_768;
+pub const MAX_ENTRIES_PER_STACK: usize = 65_536;
+/// Explicit read allowance for local imports and bounded content subscribers.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_DECLARED_BYTES_PER_PACK: u64 = 512 * 1024 * 1024;
+pub const MAX_DECLARED_BYTES_PER_STACK: u64 = 1024 * 1024 * 1024;
+
+/// A stable, attacker-data-free reason why the whole selected stack was rejected.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum AdmissionError {
+    #[error("resource-pack stack exceeds its pack limit")]
+    TooManyPacks,
+    #[error("resource-pack identity repeats an earlier stack entry")]
+    DuplicatePack,
+    #[error("resource-pack archive exceeds its compressed-size limit")]
+    ArchiveTooLarge,
+    #[error("resource-pack stack exceeds its compressed-size limit")]
+    StackArchiveTooLarge,
+    #[error("resource-pack ZIP footer is invalid or unsupported")]
+    InvalidZipFooter,
+    #[error("resource-pack ZIP64 is unsupported")]
+    UnsupportedZip64,
+    #[error("resource-pack ZIP structure is malformed")]
+    MalformedZip,
+    #[error("resource-pack ZIP entry count exceeds its limit")]
+    TooManyEntries,
+    #[error("resource-pack stack entry count exceeds its limit")]
+    TooManyStackEntries,
+    #[error("resource-pack ZIP compression method is unsupported")]
+    UnsupportedCompression,
+    #[error("resource-pack file exceeds its uncompressed-size limit")]
+    FileTooLarge,
+    #[error("resource-pack declared size exceeds its limit")]
+    DeclaredSizeTooLarge,
+    #[error("resource-pack stack declared size exceeds its limit")]
+    StackDeclaredSizeTooLarge,
+    #[error("resource-pack content key is invalid")]
+    InvalidContentKey,
+    #[error("encrypted resource pack has no contents index")]
+    MissingContentsIndex,
+    #[error("encrypted resource-pack contents index is malformed")]
+    MalformedContentsIndex,
+    #[error("resource-pack manifest is missing")]
+    MissingManifest,
+    #[error("resource-pack manifest exceeds its size limit")]
+    ManifestTooLarge,
+    #[error("resource-pack manifest JSONC is malformed")]
+    MalformedManifest,
+    #[error("resource-pack manifest format is unsupported")]
+    UnsupportedManifestFormat,
+    #[error("resource-pack manifest identity does not match the selected pack")]
+    ManifestIdentityMismatch,
+    #[error("resource-pack manifest version is invalid")]
+    InvalidVersion,
+    #[error("resource-pack manifest declares no resources module")]
+    InvalidModules,
+    #[error("resource-pack selected subpack is invalid")]
+    InvalidSubpack,
+    #[error("resource-pack file data is malformed or inconsistent")]
+    InvalidFileData,
+}
+
+impl From<zip_footer::FooterError> for AdmissionError {
+    fn from(error: zip_footer::FooterError) -> Self {
+        match error {
+            zip_footer::FooterError::Invalid => Self::InvalidZipFooter,
+            zip_footer::FooterError::Zip64 => Self::UnsupportedZip64,
+            zip_footer::FooterError::TooManyEntries => Self::TooManyEntries,
+        }
+    }
+}
+
+/// Admission result carried with StartGame, including per-pack rejection reasons.
+#[derive(Clone, Debug)]
+pub enum PackAdmission {
+    None,
+    Validated(Arc<ValidatedPackStack>),
+}
+
+/// Admits a highest-priority-first server handoff into lowest-priority-first layers.
+#[cfg(feature = "handoff")]
+#[must_use]
+pub fn validate_handoff(handoff: ResourcePackHandoff) -> Arc<ValidatedPackStack> {
+    Arc::new(parser::validate_stack(handoff.into_archives(), None))
+}
+
+/// Admits server packs using the device's physical RAM for automatic subpack selection.
+#[cfg(feature = "handoff")]
+#[must_use]
+pub fn validate_handoff_for_device(
+    handoff: ResourcePackHandoff,
+    physical_memory_bytes: u64,
+) -> Arc<ValidatedPackStack> {
+    Arc::new(parser::validate_stack(
+        handoff.into_archives(),
+        Some(subpacks::device_memory_tier(physical_memory_bytes)),
+    ))
+}
+
+#[cfg(all(test, feature = "handoff"))]
+mod handoff_tests;
+
+#[cfg(test)]
+mod subpack_count_tests;

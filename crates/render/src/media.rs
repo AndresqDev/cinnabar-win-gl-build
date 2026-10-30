@@ -1,0 +1,129 @@
+//! One retained media texture shared by host UI, quad and entity-material adapters.
+
+use crate::queue_writes::ProfiledQueue as _;
+use bevy::render::{
+    render_resource::{
+        Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture,
+        TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+        TextureViewDescriptor,
+    },
+    renderer::{RenderDevice, RenderQueue},
+};
+
+const TEXTURE_LABEL: &str = "Cinnabar server media";
+const FRAME_LABEL: &str = "Cinnabar server media frame";
+
+/// The outcome of offering one decoded frame to a [`MediaTexture`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaUpload {
+    Uploaded,
+    /// Stale, resized midstream or malformed; a later frame replaces it.
+    Rejected,
+    /// The device had no staging memory; the same frame may retry.
+    OutOfMemory,
+}
+
+pub struct MediaTexture {
+    view: TextureView,
+    texture: mod_render::GpuAllocation<Texture>,
+    size: [u32; 2],
+    generation: u64,
+}
+
+impl MediaTexture {
+    /// Allocates one texture against its bundle's shared GPU ledger.
+    pub fn new(
+        device: &RenderDevice,
+        size: [u32; 2],
+        generation: u64,
+        ledger: Option<&mod_render::GpuLedger>,
+    ) -> Option<Self> {
+        let [width, height] = size;
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))?
+            .checked_mul(4)?;
+        let max_side = device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max_side || height > max_side {
+            return None;
+        }
+        let texture = mod_render::GpuAllocation::new(ledger, bytes, || {
+            crate::gpu_allocation::checked(device, TEXTURE_LABEL, bytes, || {
+                device.create_texture(&TextureDescriptor {
+                    label: Some(TEXTURE_LABEL),
+                    size: Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    usage: TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            })
+        })?;
+        let view = texture.create_view(&TextureViewDescriptor::default());
+        Some(Self {
+            texture,
+            view,
+            size,
+            generation,
+        })
+    }
+
+    /// Updates existing storage; stale frames and midstream size changes are rejected.
+    pub fn upload(
+        &self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        size: [u32; 2],
+        generation: u64,
+        rgba: &[u8],
+    ) -> MediaUpload {
+        if size != self.size
+            || generation != self.generation
+            || rgba.len() as u64 != self.allocated_bytes()
+        {
+            return MediaUpload::Rejected;
+        }
+        let [width, height] = size;
+        crate::gpu_allocation::checked(device, FRAME_LABEL, self.allocated_bytes(), || {
+            queue.profiled_write_texture(
+                TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: Default::default(),
+                },
+                rgba,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            )
+        })
+        .map_or(MediaUpload::OutOfMemory, |()| MediaUpload::Uploaded)
+    }
+
+    /// Every authorized surface samples this view; it does not create another decoder.
+    pub fn view(&self, generation: u64) -> Option<&TextureView> {
+        (generation == self.generation).then_some(&self.view)
+    }
+
+    pub fn size(&self) -> [u32; 2] {
+        self.size
+    }
+
+    /// Exact texture charge; decoder surfaces and staging are accounted separately.
+    pub fn allocated_bytes(&self) -> u64 {
+        u64::from(self.size[0]) * u64::from(self.size[1]) * 4
+    }
+}

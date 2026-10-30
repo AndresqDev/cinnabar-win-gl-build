@@ -1,0 +1,693 @@
+use super::*;
+use bevy::prelude::Vec3;
+use render_model::ActorRigVertex;
+use render_model::{ActorGpuInstance, ActorRigGeometrySpan};
+use {
+    render_model::{
+        ActorRigRenderFrame, HAND_ITEM_LAYER_FLAG, HAND_OFFHAND_LAYER_FLAG, HandItemAlphaMode,
+        HandItemAtlas, HandRigLight,
+    },
+    render_scene::HandRigScene,
+};
+
+#[test]
+fn compact_hand_uploads_both_pose_endpoints_with_four_storage_buffers() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor {
+        required_limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 4,
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut world = World::new();
+    world.insert_resource(RenderDevice::from(device));
+    world.insert_resource(RenderQueue::new(queue));
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    assert_eq!(
+        crate::device_settings::vertex_storage_buffers(&gpu.layout),
+        4
+    );
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    let mut state =
+        bevy::ecs::system::SystemState::<crate::upload_staging::FrameUploads>::new(&mut world);
+    let uploads = state.get(&world).unwrap();
+    let frame = scene.frame.as_ref().unwrap();
+    assert!(upload_pose(&mut gpu, &uploads, frame));
+    assert_eq!(
+        gpu.previous_bones.as_ref().unwrap().size() as usize,
+        std::mem::size_of_val(&*frame.rig.previous_bones)
+            + std::mem::size_of_val(&*frame.rig.current_bones)
+    );
+    assert!(gpu.current_bones.is_none());
+    let source = crate::shader_safety::from_actor_wesl(
+        include_str!("../hand_rig.wesl"),
+        "hand_rig.wesl",
+        render_model::ACTOR_GPU_INSTANCE_WORDS,
+        render_model::ACTOR_RIG_VERTEX_WORDS,
+    );
+    let bevy::shader::Source::Wesl(source) = source.source else {
+        panic!("hand source is WESL");
+    };
+    crate::shader_test_support::assert_binding_visibility(
+        &crate::shader_source::standalone(&source, &["COMPACT_BONES"]),
+        0,
+        &gpu.layout,
+    );
+}
+
+/// Missing hand depth backs off, recovers, and retries a resized request immediately.
+#[test]
+fn hand_depth_allocation_failure_backs_off_then_recovers() {
+    use bevy::ecs::system::RunSystemOnce;
+    let device = RenderDevice::from(wgpu::Device::noop(&default()).0);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+    let failure = crate::gpu_allocation::inject({
+        let attempts = attempts.clone();
+        move |label, _| {
+            if label != "first-person rig private reverse-Z depth" {
+                return false;
+            }
+            attempts.set(attempts.get() + 1);
+            true
+        }
+    });
+    for _ in 0..3 {
+        ensure_depth(&mut gpu, &device, [4, 4], 1);
+        assert!(gpu.depth.is_none());
+    }
+    assert_eq!(attempts.get(), 1);
+    drop(failure);
+    ensure_depth(&mut gpu, &device, [4, 4], 1);
+    let depth = gpu.depth.as_ref().expect("hand depth recovers").view.id();
+    ensure_depth(&mut gpu, &device, [4, 4], 1);
+    assert_eq!(gpu.depth.as_ref().unwrap().view.id(), depth);
+    {
+        let _failure = crate::gpu_allocation::inject(|_, _| true);
+        ensure_depth(&mut gpu, &device, [8, 4], 1);
+        assert!(gpu.depth.is_none(), "old depth cannot survive a resize");
+    }
+    ensure_depth(&mut gpu, &device, [8, 8], 1);
+    assert_eq!(gpu.depth.as_ref().unwrap().size, [8, 8]);
+}
+
+#[test]
+fn reshaped_hand_glint_reuploads_shared_pixels_and_retains_unchanged_shapes() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&Default::default());
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    let pixels: Arc<[u8]> = vec![255; 4 * 2 * 4].into();
+    let mut previous = None;
+    for (width, height) in [(4, 2), (2, 4), (2, 4)] {
+        scene.set_item_glint(Some(render_model::EquipmentRaster {
+            width,
+            height,
+            rgba8: Arc::clone(&pixels),
+        }));
+        upload_glint(&mut gpu, &device, &queue, scene.frame.as_ref().unwrap());
+        let texture = &gpu.glint.as_ref().unwrap()._texture;
+        let size = [texture.width(), texture.height()];
+        assert_eq!(size, [u32::from(width), u32::from(height)]);
+        if let Some((previous_size, id)) = previous {
+            assert_eq!(texture.id() == id, size == previous_size);
+        }
+        previous = Some((size, texture.id()));
+    }
+}
+
+#[test]
+fn oversized_hand_glint_is_fitted_and_unchanged_uploads_are_retained() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&Default::default());
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    let limit = device.limits().max_texture_dimension_2d;
+    let width = u16::try_from(limit * 2).expect("the noop device admits oversized pack artwork");
+    let pixels: Arc<[u8]> = vec![255; usize::from(width) * 4].into();
+    scene.set_item_glint(Some(render_model::EquipmentRaster {
+        width,
+        height: 1,
+        rgba8: Arc::clone(&pixels),
+    }));
+    let frame = scene.frame.as_ref().unwrap();
+    upload_glint(&mut gpu, &device, &queue, frame);
+    let glint = gpu.glint.as_ref().unwrap();
+    assert_eq!(
+        [glint._texture.width(), glint._texture.height()],
+        [limit, 1]
+    );
+    assert!(Arc::ptr_eq(glint.pixels.as_ref().unwrap(), &pixels));
+    let id = glint._texture.id();
+    let allocations = test_alloc::thread_allocations();
+    upload_glint(&mut gpu, &device, &queue, frame);
+    assert_eq!(test_alloc::thread_allocations() - allocations, 0);
+    assert_eq!(gpu.glint.as_ref().unwrap()._texture.id(), id);
+}
+
+fn single_instance_frame() -> ActorRigRenderFrame {
+    ActorRigRenderFrame {
+        frame_generation: 1,
+        geometry_revision: 1,
+        instances: Arc::from([ActorGpuInstance::default()]),
+        previous_bones: Arc::from([[[0.0; 4]; 3]]),
+        current_bones: Arc::from([[[0.0; 4]; 3]]),
+        geometry_vertices: render_model::ActorRigVertexSegments::from_vertices([
+            ActorRigVertex::default(),
+        ]),
+        geometry_spans: Arc::from([ActorRigGeometrySpan {
+            first_vertex: 0,
+            vertex_count: 1,
+        }]),
+        manifest: Arc::from([]),
+        maximum_vertex_count: 36,
+        rejects: render_model::ActorRigRejects::default(),
+    }
+}
+
+fn skin() -> render_api::SkinRgba8 {
+    vec![0u8; render_model::STANDARD_SKIN_BYTES].into()
+}
+
+fn light() -> HandRigLight {
+    HandRigLight {
+        block_level: 15,
+        sky_level: 0,
+        daylight: 1.0,
+        pad: 0,
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn recurring_hand_pose_updates_allocate_no_gpu_staging_buffers() {
+    use bevy::{ecs::system::RunSystemOnce, render::view::RetainedViewEntity};
+    let Some(mut app) = crate::upload_allocation_tests::app(HandRigRenderPlugin) else {
+        return;
+    };
+    let world = app.sub_app_mut(RenderApp).world_mut();
+    world.spawn((
+        Msaa::Off,
+        crate::render_test_support::camera(false),
+        ExtractedView {
+            retained_view_entity: RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0),
+            clip_from_view: Mat4::IDENTITY,
+            world_from_view: GlobalTransform::IDENTITY,
+            clip_from_world: None,
+            target_format: render_scene::SCENE_COLOR_FORMAT,
+            viewport: UVec4::new(0, 0, 64, 64),
+            color_grading: default(),
+            invert_culling: false,
+        },
+    ));
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    world.insert_resource(scene);
+    world.run_system_once(prepare).unwrap();
+    assert_eq!(world.resource::<HandRigGpu>().revision, Some(1));
+    let initial_buffers = crate::upload_allocation_tests::buffers(world);
+    for revision in 2..=4 {
+        let mut rig = single_instance_frame();
+        Arc::make_mut(&mut rig.current_bones)[0][0][0] = revision as f32;
+        assert!(
+            world
+                .resource_mut::<HandRigScene>()
+                .publish(rig, skin(), light(), 1.2, revision,)
+        );
+        world.run_system_once(prepare).unwrap();
+        assert_eq!(world.resource::<HandRigGpu>().revision, Some(revision));
+        assert_eq!(
+            crate::upload_allocation_tests::buffers(world),
+            initial_buffers,
+            "a changed hand pose must not allocate another Metal staging buffer"
+        );
+    }
+}
+
+/// A pose the device has no memory to resize must not be drawn with the previous bones.
+#[cfg(target_os = "macos")]
+#[test]
+fn failed_pose_resize_skips_the_hand_draw_and_retries() {
+    use bevy::{ecs::system::RunSystemOnce, render::view::RetainedViewEntity};
+    let Some(mut app) = crate::upload_allocation_tests::app(HandRigRenderPlugin) else {
+        return;
+    };
+    let world = app.sub_app_mut(RenderApp).world_mut();
+    world.spawn((
+        Msaa::Off,
+        crate::render_test_support::camera(false),
+        ExtractedView {
+            retained_view_entity: RetainedViewEntity::new(Entity::PLACEHOLDER.into(), None, 0),
+            clip_from_view: Mat4::IDENTITY,
+            world_from_view: GlobalTransform::IDENTITY,
+            clip_from_world: None,
+            target_format: render_scene::SCENE_COLOR_FORMAT,
+            viewport: UVec4::new(0, 0, 64, 64),
+            color_grading: default(),
+            invert_culling: false,
+        },
+    ));
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    world.insert_resource(scene);
+    world.run_system_once(prepare).unwrap();
+    assert_eq!(world.resource::<HandRigGpu>().instance_count, 1);
+
+    let mut rig = single_instance_frame();
+    rig.instances = Arc::from([ActorGpuInstance::default(); 2]);
+    assert!(
+        world
+            .resource_mut::<HandRigScene>()
+            .publish(rig, skin(), light(), 1.2, 2)
+    );
+    {
+        let _failure =
+            crate::gpu_allocation::inject(|label, _| label == "first-person rig instance");
+        world.run_system_once(prepare).unwrap();
+    }
+    let gpu = world.resource::<HandRigGpu>();
+    assert_eq!(gpu.instance_count, 0);
+    assert!(gpu.bind_group.is_none());
+    assert_eq!(gpu.revision, None);
+
+    world.run_system_once(prepare).unwrap();
+    let gpu = world.resource::<HandRigGpu>();
+    assert_eq!(gpu.revision, Some(2));
+    assert_eq!(gpu.instance_count, 2);
+}
+
+#[test]
+fn steady_uploads_hand_uniforms_are_independent_and_allocation_free() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&Default::default());
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(RenderDevice::from(device));
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    world.insert_resource(queue.clone());
+    let mut upload_state =
+        bevy::ecs::system::SystemState::<crate::upload_staging::FrameUploads>::new(&mut world);
+    let uploads = upload_state.get(&world).unwrap();
+    let buffers = [gpu.view_uniform.id(), gpu.light_uniform.id()];
+    let projection = glam::camera::rh::proj::directx::perspective_infinite_reverse(
+        1.2,
+        1.5,
+        CAMERA_NEAR_PLANE_BLOCKS,
+    );
+    let mut light = light();
+    upload_uniforms(&mut gpu, &uploads, projection, light);
+    assert_eq!(gpu.uniform_uploads, [1, 1]);
+    let allocated = test_alloc::thread_allocations();
+    upload_uniforms(&mut gpu, &uploads, projection, light);
+    assert_eq!(
+        gpu.uniform_uploads,
+        [1, 1],
+        "equal uniforms issue no queue writes"
+    );
+    assert_eq!(test_alloc::thread_allocations() - allocated, 0);
+
+    let projection = glam::camera::rh::proj::directx::perspective_infinite_reverse(
+        1.2,
+        2.0,
+        CAMERA_NEAR_PLANE_BLOCKS,
+    );
+    upload_uniforms(&mut gpu, &uploads, projection, light);
+    assert_eq!(gpu.uniform_uploads, [2, 1]);
+    light.java_lights[1][2] = 0.75;
+    upload_uniforms(&mut gpu, &uploads, projection, light);
+    assert_eq!(gpu.uniform_uploads, [2, 2]);
+    light.java_normal_axes[2][0] = 0.25;
+    upload_uniforms(&mut gpu, &uploads, projection, light);
+    assert_eq!(gpu.uniform_uploads, [2, 3]);
+    assert_eq!([gpu.view_uniform.id(), gpu.light_uniform.id()], buffers);
+}
+
+#[test]
+fn java_fixed_light_directions_rotate_without_translation_or_world_brightness_changes() {
+    let base = light();
+    let transform = Mat4::from_translation(Vec3::new(3.0, 4.0, 5.0))
+        * Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2);
+    let java = base.with_java_lighting(transform);
+    assert_eq!(java.block_level, base.block_level);
+    assert_eq!(java.sky_level, base.sky_level);
+    for (direction, original) in java
+        .java_lights
+        .into_iter()
+        .zip([Vec3::new(0.2, 1.0, -0.7), Vec3::new(-0.2, 1.0, 0.7)])
+    {
+        let expected = transform.transform_vector3(original.normalize());
+        assert!(Vec3::from_slice(&direction).abs_diff_eq(expected, 1e-6));
+        assert_eq!(direction[3], 1.0);
+    }
+    assert_eq!(base.java_lights, [[0.0; 4]; 2]);
+}
+
+#[test]
+fn first_person_target_blends_translucent_block_texels_over_the_scene() {
+    let pipeline = pipeline_descriptor(hand_rig_layout());
+    let target = pipeline.fragment.unwrap().targets.remove(0).unwrap();
+    assert_eq!(target.blend, Some(BlendState::ALPHA_BLENDING));
+}
+
+#[test]
+fn held_alpha_selectors_preserve_each_hands_artwork_layer() {
+    for alpha_mode in [
+        HandItemAlphaMode::Opaque,
+        HandItemAlphaMode::Cutout,
+        HandItemAlphaMode::Blend,
+    ] {
+        for hand in [0, HAND_OFFHAND_LAYER_FLAG] {
+            let layer = 17 | HAND_ITEM_LAYER_FLAG | hand | alpha_mode.texture_layer_flag();
+            assert_eq!(layer & HAND_TEXTURE_LAYER_MASK, 17);
+            assert_eq!(layer & HAND_OFFHAND_LAYER_FLAG, hand);
+            assert_eq!(
+                layer & (HAND_BLEND_LAYER_FLAG | HAND_CUTOUT_LAYER_FLAG),
+                alpha_mode.texture_layer_flag(),
+            );
+        }
+    }
+}
+
+#[test]
+fn publish_accepts_a_single_instance_lit_rig_and_activates() {
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 7));
+    assert!(scene.is_active());
+}
+
+#[test]
+fn publish_rejects_a_wrong_sized_skin_and_stays_inactive() {
+    let mut scene = HandRigScene::default();
+    let bad_skin = vec![0u8; 10].into();
+    assert!(!scene.publish(single_instance_frame(), bad_skin, light(), 1.2, 7));
+    assert!(!scene.is_active());
+}
+
+#[test]
+fn publish_rejects_non_finite_or_out_of_range_fov_and_zero_revision() {
+    let mut scene = HandRigScene::default();
+    assert!(!scene.publish(single_instance_frame(), skin(), light(), f32::NAN, 7));
+    assert!(!scene.publish(single_instance_frame(), skin(), light(), 0.0, 7));
+    assert!(!scene.publish(single_instance_frame(), skin(), light(), 4.0, 7));
+    assert!(!scene.publish(single_instance_frame(), skin(), light(), 1.2, 0));
+    assert!(!scene.is_active());
+}
+
+#[test]
+fn publish_rejects_an_empty_rig_and_clears_a_prior_frame() {
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 7));
+    assert!(!scene.publish(ActorRigRenderFrame::default(), skin(), light(), 1.2, 8));
+    assert!(!scene.is_active());
+}
+
+#[test]
+fn item_atlas_is_kept_only_when_its_pixel_count_matches_and_a_frame_is_active() {
+    let atlas = |bytes: usize| HandItemAtlas {
+        width: 2,
+        height: 2,
+        layers: 2,
+        rgba8: Arc::from(vec![0u8; bytes]),
+    };
+    let mut scene = HandRigScene::default();
+    scene.set_item_atlases([Some(atlas(32)), None]);
+    assert!(!scene.is_active());
+
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 7));
+    scene.set_item_atlases([Some(atlas(31)), Some(atlas(32))]);
+    let frame = scene.frame.as_ref().unwrap();
+    assert!(frame.item_atlases[0].is_none());
+    assert!(frame.item_atlases[1].is_some());
+    scene.set_item_atlases([Some(atlas(32)), None]);
+    assert!(scene.frame.as_ref().unwrap().item_atlases[0].is_some());
+    assert!(scene.frame.as_ref().unwrap().item_atlases[1].is_none());
+    scene.set_item_atlases([
+        Some(HandItemAtlas {
+            width: u16::MAX,
+            height: u16::MAX,
+            layers: u32::MAX,
+            rgba8: Arc::from([]),
+        }),
+        None,
+    ]);
+    assert!(scene.frame.as_ref().unwrap().item_atlases[0].is_none());
+}
+
+/// A per-frame pose rewrites the same buffers instead of reallocating them and the bind group.
+#[test]
+fn pose_updates_reuse_their_buffers() {
+    use bevy::{
+        ecs::system::RunSystemOnce,
+        render::renderer::{RenderDevice, RenderQueue},
+    };
+    use std::{
+        future::Future,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::NOOP,
+        backend_options: wgpu::BackendOptions {
+            noop: wgpu::NoopBackendOptions {
+                enable: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok(adapter)) =
+        pin!(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).poll(&mut context)
+    else {
+        panic!("noop adapter must be immediate");
+    };
+    let Poll::Ready(Ok((device, queue))) =
+        pin!(adapter.request_device(&wgpu::DeviceDescriptor::default())).poll(&mut context)
+    else {
+        panic!("noop device must be immediate");
+    };
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = bevy::prelude::World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    world.insert_resource(queue.clone());
+    let mut upload_state =
+        bevy::ecs::system::SystemState::<crate::upload_staging::FrameUploads>::new(&mut world);
+    let uploads = upload_state.get(&world).unwrap();
+    let mut scene = HandRigScene::default();
+    let mut buffers = Vec::new();
+    for revision in 1..=3 {
+        assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, revision));
+        assert!(upload_pose(
+            &mut gpu,
+            &uploads,
+            scene.frame.as_ref().unwrap()
+        ));
+        buffers.push(gpu.instances.as_ref().unwrap().id());
+    }
+    assert!(buffers.windows(2).all(|pair| pair[0] == pair[1]));
+
+    // Main and offhand pages may have unrelated dimensions and layer counts.
+    let main_pixels: Arc<[u8]> = vec![255; 16].into();
+    let off_pixels: Arc<[u8]> = vec![127; 48].into();
+    scene.set_item_atlases([
+        Some(HandItemAtlas {
+            width: 2,
+            height: 2,
+            layers: 1,
+            rgba8: Arc::clone(&main_pixels),
+        }),
+        Some(HandItemAtlas {
+            width: 4,
+            height: 1,
+            layers: 3,
+            rgba8: Arc::clone(&off_pixels),
+        }),
+    ]);
+    upload_atlas(&mut gpu, &device, &queue, scene.frame.as_ref().unwrap());
+    assert_eq!(gpu.atlases[0].as_ref().unwrap().size, [2, 2, 1]);
+    assert_eq!(gpu.atlases[1].as_ref().unwrap().size, [4, 1, 3]);
+    assert!(Arc::ptr_eq(
+        &gpu.atlases[1].as_ref().unwrap().pixels,
+        &off_pixels
+    ));
+
+    // The same pixel allocation with new dimensions is not the same texture.
+    scene.set_item_atlases([
+        Some(HandItemAtlas {
+            width: 1,
+            height: 4,
+            layers: 1,
+            rgba8: main_pixels,
+        }),
+        Some(HandItemAtlas {
+            width: 4,
+            height: 1,
+            layers: 3,
+            rgba8: Arc::clone(&off_pixels),
+        }),
+    ]);
+    upload_atlas(&mut gpu, &device, &queue, scene.frame.as_ref().unwrap());
+    assert_eq!(gpu.atlases[0].as_ref().unwrap().size, [1, 4, 1]);
+    assert_eq!(gpu.atlases[1].as_ref().unwrap().size, [4, 1, 3]);
+    scene.set_item_atlases([
+        None,
+        Some(HandItemAtlas {
+            width: 4,
+            height: 1,
+            layers: 3,
+            rgba8: off_pixels,
+        }),
+    ]);
+    upload_atlas(&mut gpu, &device, &queue, scene.frame.as_ref().unwrap());
+    assert!(gpu.atlases[0].is_none());
+    assert!(gpu.atlases[1].is_some());
+}
+
+#[test]
+fn review_render_hand_atlas_rejects_device_dimension_and_layer_limits() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    let wide = u16::try_from(device.limits().max_texture_dimension_2d + 1).unwrap();
+    let layers = device.limits().max_texture_array_layers + 1;
+    for (width, layer_count) in [(wide, 1), (1, layers)] {
+        scene.set_item_atlases([
+            Some(HandItemAtlas {
+                width,
+                height: 1,
+                layers: layer_count,
+                rgba8: vec![255; width as usize * layer_count as usize * 4].into(),
+            }),
+            None,
+        ]);
+        upload_atlas(&mut gpu, &device, &queue, scene.frame.as_ref().unwrap());
+        assert!(gpu.atlases[0].is_none());
+    }
+}
+
+#[test]
+fn native_skin_hand_uploads_match_source_dimensions_and_reuse_textures() {
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&Default::default());
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    for side in render_model::SKIN_CLASS_SIDES {
+        let pixels = vec![73; side * side * 4].into();
+        let mut scene = HandRigScene::default();
+        assert!(scene.publish(single_instance_frame(), pixels, light(), 1.2, 7));
+        let frame = scene.frame.as_ref().unwrap();
+        upload_skin(&mut gpu, &device, &queue, frame);
+        let texture = &gpu.skin.as_ref().unwrap()._texture;
+        assert_eq!(
+            (texture.width(), texture.height()),
+            (side as u32, side as u32)
+        );
+        let id = texture.id();
+        upload_skin(&mut gpu, &device, &queue, frame);
+        assert_eq!(gpu.skin.as_ref().unwrap()._texture.id(), id);
+        assert!(!HandRigScene::accepts_skin_and_fov(
+            &vec![0; side * side * 4 - 1].into(),
+            1.2
+        ));
+    }
+}
+
+#[test]
+fn animated_hand_pipeline_matches_every_scene_sample_count_and_format() {
+    for samples in [1, 2, 4, 8] {
+        for hdr in [false, true] {
+            let descriptor = specialized_pipeline(hand_rig_layout(), samples, hdr);
+            assert_eq!(descriptor.multisample.count, samples);
+            assert_eq!(
+                descriptor.depth_stencil.unwrap().format,
+                CORE_3D_DEPTH_FORMAT
+            );
+            assert_eq!(
+                descriptor.fragment.unwrap().targets[0]
+                    .as_ref()
+                    .unwrap()
+                    .format,
+                if hdr {
+                    render_scene::SCENE_HDR_FORMAT
+                } else {
+                    render_scene::SCENE_COLOR_FORMAT
+                }
+            );
+        }
+    }
+}
+
+/// Hand artwork allows the pack's raw view only while a pack draws; switching recreates it.
+#[test]
+fn hand_artwork_allows_raw_views_only_while_a_pack_draws() {
+    use crate::actor::gpu::{ArtworkRawViews, permits_raw_view};
+    use bevy::ecs::system::RunSystemOnce;
+    let (device, queue) = wgpu::Device::noop(&Default::default());
+    let device = RenderDevice::from(device);
+    let queue = RenderQueue::new(queue);
+    let mut world = World::new();
+    world.insert_resource(device.clone());
+    world.run_system_once(init_gpu).unwrap();
+    let mut gpu = world.remove_resource::<HandRigGpu>().unwrap();
+    let mut scene = HandRigScene::default();
+    assert!(scene.publish(single_instance_frame(), skin(), light(), 1.2, 1));
+    scene.set_item_atlases([
+        Some(HandItemAtlas {
+            width: 2,
+            height: 2,
+            layers: 1,
+            rgba8: vec![255; 16].into(),
+        }),
+        None,
+    ]);
+    for pack in [false, true, false] {
+        gpu.raw_views = ArtworkRawViews(pack);
+        let frame = scene.frame.as_ref().unwrap();
+        upload_skin(&mut gpu, &device, &queue, frame);
+        upload_atlas(&mut gpu, &device, &queue, frame);
+        upload_glint(&mut gpu, &device, &queue, frame);
+        let textures = [
+            &gpu.skin.as_ref().unwrap()._texture,
+            &gpu.atlases[0].as_ref().unwrap()._texture,
+            &gpu.glint.as_ref().unwrap()._texture,
+        ];
+        for texture in textures {
+            assert_eq!(permits_raw_view(device.wgpu_device(), texture), pack);
+        }
+    }
+}

@@ -1,0 +1,262 @@
+use crate::shader_source;
+
+#[path = "support/liquid_shader_contract.rs"]
+mod liquid_shader_contract;
+
+use liquid_shader_contract::LiquidShaderContract;
+use meshing::Face;
+
+const SHADER: &str = include_str!("../../src/liquid.wesl");
+
+/// Resolve the vanilla shader for standalone validation.
+fn shader_for_naga() -> String {
+    shader_source::standalone(SHADER, &[])
+}
+
+fn assert_uv_close(actual: [f32; 2], expected: [f32; 2], context: &str) {
+    assert!(
+        (actual[0] - expected[0]).abs() < 1.0e-6 && (actual[1] - expected[1]).abs() < 1.0e-6,
+        "{context}: expected {expected:?}, got {actual:?}",
+    );
+}
+
+#[test]
+fn liquid_shader_parses_validates_and_uses_shared_address_contract() {
+    let shader = shader_for_naga();
+    let module = naga::front::wgsl::parse_str(&shader).expect("parse liquid WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .expect("validate liquid WGSL");
+
+    let bindings: std::collections::BTreeSet<_> = module
+        .global_variables
+        .iter()
+        .filter_map(|(_, global)| global.binding.as_ref())
+        .filter(|binding| binding.group == 0)
+        .map(|binding| binding.binding)
+        .collect();
+    assert!(
+        bindings.contains(&16),
+        "native terrain sampling needs its encoded texture view"
+    );
+    assert!(
+        bindings.contains(&17),
+        "native auxiliary sampling needs its encoded texture view"
+    );
+    assert!(shader.contains("struct TransparentDrawRef"));
+    assert!(shader.contains("liquid_record_index: u32"));
+    assert!(shader.contains("metadata_index: u32"));
+    assert!(shader.contains("let liquid_word = record_index * 4u"));
+    assert!(
+        shader.contains("let chunk_origin = chunk_origins(geometry_streams[liquid_word + 3u])")
+    );
+    assert!(
+        shader.contains("chunk_origin.stream_bases.w + record_index - chunk_origin.stream_bases.z")
+    );
+    assert!(shader.contains("geometry_streams[lighting_record_index * 2u + corner / 2u]"));
+}
+
+#[test]
+fn liquid_shader_cpu_and_wgsl_decode_share_task12_winding_and_height_scale() {
+    let contract = LiquidShaderContract::parse(SHADER);
+    let cases = [
+        (
+            Face::NegativeX,
+            [0, 10, 40, 0],
+            [
+                [3.0, 4.0, 5.0],
+                [3.0, 4.0 + 10.0 / 255.0, 5.0],
+                [3.0, 4.0 + 40.0 / 255.0, 6.0],
+                [3.0, 4.0, 6.0],
+            ],
+        ),
+        (
+            Face::PositiveX,
+            [0, 30, 20, 0],
+            [
+                [4.0, 4.0, 6.0],
+                [4.0, 4.0 + 30.0 / 255.0, 6.0],
+                [4.0, 4.0 + 20.0 / 255.0, 5.0],
+                [4.0, 4.0, 5.0],
+            ],
+        ),
+        (
+            Face::NegativeY,
+            [0, 0, 0, 0],
+            [
+                [3.0, 4.0, 5.0],
+                [3.0, 4.0, 6.0],
+                [4.0, 4.0, 6.0],
+                [4.0, 4.0, 5.0],
+            ],
+        ),
+        (
+            Face::PositiveY,
+            [10, 20, 30, 40],
+            [
+                [3.0, 4.0 + 10.0 / 255.0, 5.0],
+                [4.0, 4.0 + 20.0 / 255.0, 5.0],
+                [4.0, 4.0 + 30.0 / 255.0, 6.0],
+                [3.0, 4.0 + 40.0 / 255.0, 6.0],
+            ],
+        ),
+        (
+            Face::NegativeZ,
+            [0, 20, 10, 0],
+            [
+                [4.0, 4.0, 5.0],
+                [4.0, 4.0 + 20.0 / 255.0, 5.0],
+                [3.0, 4.0 + 10.0 / 255.0, 5.0],
+                [3.0, 4.0, 5.0],
+            ],
+        ),
+        (
+            Face::PositiveZ,
+            [0, 40, 30, 0],
+            [
+                [3.0, 4.0, 6.0],
+                [3.0, 4.0 + 40.0 / 255.0, 6.0],
+                [4.0, 4.0 + 30.0 / 255.0, 6.0],
+                [4.0, 4.0, 6.0],
+            ],
+        ),
+    ];
+    for (face, (_, heights, mut expected)) in cases.into_iter().enumerate() {
+        for position in &mut expected {
+            match face {
+                0 => position[0] += meshing::liquid::LIQUID_FACE_INSET,
+                1 => position[0] -= meshing::liquid::LIQUID_FACE_INSET,
+                4 => position[2] += meshing::liquid::LIQUID_FACE_INSET,
+                5 => position[2] -= meshing::liquid::LIQUID_FACE_INSET,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            std::array::from_fn(|corner| {
+                contract.corner(face, corner, [3.0, 4.0, 5.0], heights[corner])
+            }),
+            expected,
+            "Task 12 winding mismatch for face {face}",
+        );
+    }
+}
+
+#[test]
+fn liquid_shader_cpu_and_wgsl_uv_rules_cover_still_flow_side_and_falling() {
+    let contract = LiquidShaderContract::parse(SHADER);
+    let face_uvs = [
+        [[0.0, 1.0], [0.0, 0.498_039_22], [1.0, 0.0], [1.0, 1.0]],
+        [[0.0, 1.0], [0.0, 0.498_039_22], [1.0, 0.0], [1.0, 1.0]],
+        [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        [[0.0, 1.0], [0.0, 0.498_039_22], [1.0, 0.0], [1.0, 1.0]],
+        [[0.0, 1.0], [0.0, 0.498_039_22], [1.0, 0.0], [1.0, 1.0]],
+    ];
+    for (face, expected) in face_uvs.into_iter().enumerate() {
+        let heights = [0, 128, 255, 0];
+        for (corner, expected) in expected.into_iter().enumerate() {
+            assert_uv_close(
+                contract.uv(face, corner, heights[corner], [0, 0], false, [0.0, 0.0]),
+                expected,
+                &format!("base UV mismatch for face {face}, corner {corner}"),
+            );
+        }
+    }
+    assert_eq!(
+        contract.uv(3, 2, 128, [0, 0], false, [0.0, 0.0]),
+        [1.0, 1.0]
+    );
+    // Cardinal flows rotate the whole tile; flipbook tiles already hold what one block shows.
+    let cardinal_flow = [
+        ([1, 0], [1.0, 0.0]),
+        ([0, 1], [0.0, 0.0]),
+        ([-1, 0], [0.0, 1.0]),
+        ([0, -1], [1.0, 1.0]),
+    ];
+    for (flow, expected) in cardinal_flow {
+        let actual = contract.uv(3, 0, 128, flow, false, [0.0, 0.0]);
+        assert!((actual[0] - expected[0]).abs() < 1.0e-6, "flow {flow:?}");
+        assert!((actual[1] - expected[1]).abs() < 1.0e-6, "flow {flow:?}");
+    }
+    // A diagonal flow shrinks until its corners touch the tile edges, never past them.
+    for corner in 0..4 {
+        let [u, v] = contract.uv(3, corner, 128, [1, 1], false, [0.0, 0.0]);
+        assert!(
+            (-1.0e-6..=1.0 + 1.0e-6).contains(&u),
+            "diagonal corner {corner} u {u}"
+        );
+        assert!(
+            (-1.0e-6..=1.0 + 1.0e-6).contains(&v),
+            "diagonal corner {corner} v {v}"
+        );
+        assert!(
+            u.abs() < 1.0e-6
+                || v.abs() < 1.0e-6
+                || (u - 1.0).abs() < 1.0e-6
+                || (v - 1.0).abs() < 1.0e-6,
+            "diagonal corner {corner} touches an edge: {u}, {v}"
+        );
+    }
+    let side = contract.uv(1, 3, 128, [0, 0], false, [0.0, 0.0]);
+    assert_eq!(side, [1.0, 1.0 - 128.0 / 255.0]);
+    let falling = contract.uv(1, 3, 128, [0, 0], true, [4.0, 0.0]);
+    assert_eq!(
+        falling, side,
+        "falling animation must not invent another UV scroll"
+    );
+}
+
+#[test]
+fn shader_contract_decoder_observes_wgsl_table_and_operator_mutations() {
+    let baseline = LiquidShaderContract::parse(SHADER);
+
+    let face_table_mutation = SHADER.replacen(
+        "vec2(0.0, 0.0), vec2(0.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0)",
+        "vec2(1.0, 0.0), vec2(0.0, 0.0), vec2(0.0, 1.0), vec2(0.0, 1.0)",
+        1,
+    );
+    let changed_table = LiquidShaderContract::parse(&face_table_mutation);
+    assert_ne!(
+        baseline.corner(0, 0, [0.0; 3], 0),
+        changed_table.corner(0, 0, [0.0; 3], 0),
+    );
+
+    let angle_mutation = SHADER.replacen(
+        "FLOW_ANGLE_DIRECTION * atan2(f32(flow_z), f32(flow_x))",
+        "-FLOW_ANGLE_DIRECTION * atan2(f32(flow_z), f32(flow_x))",
+        1,
+    );
+    let changed_angle = LiquidShaderContract::parse(&angle_mutation);
+    assert_ne!(
+        baseline.uv(3, 0, 255, [0, 1], false, [0.0, 0.0]),
+        changed_angle.uv(3, 0, 255, [0, 1], false, [0.0, 0.0]),
+    );
+
+    let side_mutation = SHADER.replacen(
+        "SIDE_HEIGHT_BIAS + SIDE_HEIGHT_SCALE * height",
+        "SIDE_HEIGHT_BIAS - SIDE_HEIGHT_SCALE * height",
+        1,
+    );
+    let changed_side = LiquidShaderContract::parse(&side_mutation);
+    assert_ne!(
+        baseline.uv(0, 1, 128, [0, 0], false, [0.0, 0.0]),
+        changed_side.uv(0, 1, 128, [0, 0], false, [0.0, 0.0]),
+    );
+}
+
+#[test]
+fn liquid_shader_preserves_straight_alpha_animation_tint_and_light() {
+    assert!(SHADER.contains("fn animation_sample("));
+    assert!(SHADER.contains("textureSampleGrad(block_textures_page_0"));
+    assert!(SHADER.contains("textureSampleGrad(block_textures_page_1"));
+    assert!(SHADER.contains("mix(current_sample, next_sample, in.frame_blend)"));
+    assert!(SHADER.contains("out.water_tint = blended_biome_tint("));
+    assert!(SHADER.contains("native_liquid_colour(sampled.rgb, in.water_tint.rgb, in)"));
+    assert!(SHADER.contains("terrain_light_colour(in.native_light_levels)"));
+    assert!(SHADER.contains("sampled.a * in.water_tint.a"));
+    assert!(!SHADER.contains("sampled.rgb * sampled.a"));
+    assert!(!SHADER.contains("sampled.a <"));
+}

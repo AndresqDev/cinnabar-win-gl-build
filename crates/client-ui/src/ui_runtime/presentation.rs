@@ -1,0 +1,260 @@
+use std::{fmt, sync::Arc};
+
+use assets::{RuntimeFontCatalog, RuntimeHudCatalog, RuntimeIconCatalog};
+use render_model::{UiRenderInput, UiRenderTextureArray};
+use sha2::{Digest, Sha256};
+
+use ui::{
+    DpiScale, LoadingStage, ObfuscationGlyphs, SafeArea, TextEffects, TextLayoutCache, UiNode,
+    UiNodeId, UiPoint, UiRect, UiScale, UiVisual,
+};
+
+use super::scene_stack::Scene;
+use super::{UiRuntime, render_adapter::UiRenderViewport};
+#[cfg(test)]
+use crate::ui_runtime::render_adapter::adapt_ui_draw_list;
+
+mod accessors;
+mod color_icons;
+mod construction;
+pub mod debug_overlay;
+mod dial_icons;
+pub mod dynamic_textures;
+pub mod forms;
+mod frame;
+pub mod gui_models;
+pub use gui_models::{GuiModelPreparation, PreparedGuiModels};
+pub mod gui_scale_settings;
+pub mod hud_layout;
+pub mod inventory_pointer;
+pub mod inventory_tooltip;
+mod item_activation;
+pub(super) mod item_glint;
+pub mod item_gui;
+pub mod item_sprite;
+pub mod item_viewmodel;
+mod local_player_identity;
+pub mod menu;
+pub mod menu_artwork;
+pub mod menu_branding;
+pub mod menu_scroll;
+mod mod_hud_bindings;
+mod mod_panel_font;
+mod runtime_assets;
+
+pub mod nametag_atlas;
+pub mod nametags;
+pub mod paper_doll;
+pub mod player_preview;
+pub mod primitive_shapes;
+pub mod primitives;
+pub mod publish;
+pub mod retained_hud;
+pub mod screens;
+pub mod session_glyphs;
+pub mod session_icons;
+pub use forms::{PreparedJsonUi, ServerUiPack};
+
+pub use session_glyphs::SessionGlyphSheets;
+pub use session_icons::{SessionIcon, SessionIcons};
+pub mod startup;
+pub mod texture_atlas;
+
+pub use debug_overlay::DebugLines;
+pub use hud_layout::HudFrame;
+use hud_layout::{HudGeometry, HudLayout};
+use launcher::menu::{MenuAction, MenuView};
+use primitives::rect;
+#[cfg(any(test, feature = "test-support"))]
+pub use publish::commit::refresh_hud_frame;
+pub use publish::{
+    capture_hud_frame,
+    commit::{PendingUiPublication, PreviewCapture, render_prepared_ui},
+    item_icons::ItemIconFrames,
+};
+use retained_hud::{PresentedScoreboardCache, ScoreboardOwnerNameAuthority};
+use startup::StartupPresentationState;
+use texture_atlas::{
+    HudTexturePages, font_texture_array, font_texture_array_with_hud_and_icons,
+    font_texture_array_with_optional_hud,
+};
+use ui::IconRef;
+use ui_engine::text_metrics::TextMetrics;
+use ui_screens::text::{bounded_visible_text, resolve_chat_line};
+
+const TEXT_CACHE_ENTRIES: usize = 1_024;
+const TEXT_CACHE_BYTES: usize = 8 * 1024 * 1024;
+#[derive(Debug)]
+pub enum UiPresentationError {
+    InvalidFontTexture,
+    Geometry(ui::GeometryError),
+    Text(ui::TextError),
+    Tree(ui::UiError),
+    Adapter(super::render_adapter::UiRenderAdapterError),
+    Render(render_model::UiRenderReject),
+}
+
+impl fmt::Display for UiPresentationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "UI presentation failed: {self:?}")
+    }
+}
+
+impl std::error::Error for UiPresentationError {}
+
+impl From<ui_engine::engine::screen::PaintError> for UiPresentationError {
+    fn from(error: ui_engine::engine::screen::PaintError) -> Self {
+        use ui_engine::engine::screen::PaintError;
+        match error {
+            PaintError::InvalidFontTexture => Self::InvalidFontTexture,
+            PaintError::Geometry(error) => Self::Geometry(error),
+            PaintError::Text(error) => Self::Text(error),
+            PaintError::Tree(error) => Self::Tree(error),
+        }
+    }
+}
+
+pub struct UiPresentationRuntime {
+    font: Arc<RuntimeFontCatalog>,
+    /// The startup font without the session's glyph sheets.
+    base_font: Arc<RuntimeFontCatalog>,
+    mod_panel_font: Option<mod_panel_font::InstalledFont>,
+    local_player_identity: local_player_identity::LocalPlayerIdentity,
+    textures: Arc<UiRenderTextureArray>,
+    texture_session: Option<u64>,
+    item_glint: item_glint::ItemGlintTextures,
+    blank_dynamic_page: render_model::UiTexturePage,
+    solid_texture_page: u16,
+    hud_textures: Option<HudTexturePages>,
+    icon_catalog: Option<Arc<RuntimeIconCatalog>>,
+    /// The strip frame each dial item shows this frame.
+    dial_frames: inventory::DialFrames,
+    icon_refs: Option<Box<[IconRef]>>,
+    layouts: TextLayoutCache,
+    rejected_frames: u64,
+    obfuscation: ObfuscationGlyphs, // same-width pools for the per-frame §k swap
+    revision: u64,
+    last_input: Option<UiRenderInput>, // last built frame; see `stabilize_revision`
+    /// What the last frame was built from; later frames re-emit only changed and `§k` nodes.
+    last_frame: Option<frame::BuiltFrame>,
+    /// Scene assembly keeps its capacity across unchanged frames and failed builds.
+    assembly_nodes: Vec<UiNode>,
+    /// Immutable geometry reuses storage only after all render readers release it.
+    vertex_buffers: render_model::FrameBuffers<render_model::UiRenderVertex>,
+    retained_menu: Option<forms::RetainedMenu>,
+    #[cfg(test)]
+    tree_builds: usize,
+    /// Nodes emitted again by frames drawn from the last frame's draw list.
+    #[cfg(test)]
+    redrawn_nodes: usize,
+    #[cfg(test)]
+    oreui_paints: usize,
+    scoreboard: PresentedScoreboardCache,
+    scoreboard_owner_names: ScoreboardOwnerNameAuthority,
+    debug_lines: Option<DebugLines>,
+    debug_overlay: debug_overlay::OverlayCache,
+    /// Bedrock desktop GUI-scale preference: `None`/0 selects the auto rule.
+    gui_scale_preference: Option<u8>,
+    /// Platform safe-area insets in logical px, applied to the HUD geometry,
+    /// the retained tree layout, and the render viewport alike.
+    safe_area: SafeArea,
+    /// Item facts and camera state refreshed immediately before each build.
+    hud_frame: HudFrame,
+    /// Inventory projections retained across HUD publications.
+    inventory_cache: Option<Box<publish::inventory_cache::InventoryCache>>,
+    /// External projection changes that invalidate closed-inventory preparation.
+    inventory_preparation_revision: std::sync::atomic::AtomicU64,
+    /// Semantic HUD content retained before binding construction.
+    hud_cache: forms::hud::SemanticHud,
+    /// What the presentation's renderers drew the engine HUD and its crosshair overlay from.
+    hud_renderers: [forms::hud::HudRendererInputs; 2],
+    /// Owner-scoped extension globals layered over the gameplay HUD's retained data.
+    mod_hud_bindings: mod_hud_bindings::Bindings,
+    /// Text metrics of the last painted HUD, for `hud.measure-text`.
+    label_metrics: Option<Arc<mod_ui::LabelMetrics>>,
+    /// Vanilla HUD elements of the last painted HUD, for `hud.read-elements`.
+    hud_elements: forms::hud::HudElements,
+    /// Last logged skip/odd-data counters, so changes surface exactly once.
+    last_hud_diagnostics: crate::ui_runtime::gameplay_hud::GameplayHudDiagnostics,
+    /// This frame's world-space tags, including scores, and their retained glyph atlas.
+    nametag_anchors: Vec<nametags::NametagAnchor>,
+    nametag_local_actor: Option<u64>,
+    nametag_atlas: nametag_atlas::NametagAtlas,
+    nametag_bounds: nametags::bounds::BoundsCache,
+    primitive_text: primitive_shapes::PrimitiveTextRasterizer,
+    /// Stable reserved logical page for the optional preview raster.
+    paper_doll: paper_doll::PaperDoll,
+    player_preview_page: Option<u16>,
+    player_preview_source_hash: Option<[u8; 32]>,
+    player_preview_pose: Option<player_preview::PlayerPreviewPose>,
+    /// The pose the software rasters were drawn at; with model geometry only the hands read it.
+    player_preview_raster_pose: Option<player_preview::PlayerPreviewPose>,
+    /// How the UI last asked to show the model, and the idle sway it was drawn at.
+    player_preview_view: player_preview::PreviewView,
+    /// How the HUD's own player renderer last asked to show the model.
+    hud_preview_view: player_preview::PreviewView,
+    menu_preview_model: player_preview::model::MenuPreviewModel,
+    menu_preview: player_preview::controller::MenuPreview,
+    player_preview_drawn: Option<(
+        player_preview::PreviewView,
+        f32,
+        player_preview::PreviewEquipment,
+    )>,
+    player_preview_bob: f32,
+    /// Worn armor and the held item the model shows, and where armor art comes from.
+    player_preview_gear: player_preview::PreviewEquipment,
+    equipment_catalog: Option<Arc<assets::RuntimeEquipmentCatalog>>,
+    preview_equipment_selection: player_preview::selection::EquipmentSelection,
+    gui_models: gui_models::GuiModels,
+    player_preview_pixels: Option<player_preview::PlayerPreviewRasters>,
+    preview_dirty: bool,
+    player_preview_icon: Option<IconRef>,
+    left_hand_icon: Option<IconRef>,
+    right_hand_icon: Option<IconRef>,
+    held_viewmodel_source: Option<IconRef>,
+    offhand_viewmodel_source: Option<IconRef>,
+    held_viewmodel_icon: Option<IconRef>,
+    offhand_viewmodel_icon: Option<IconRef>,
+    /// The art set last requested: service art plus engine textures too big for a server page.
+    menu_artwork_set: menu_artwork::ArtworkSet,
+    mod_menu_branding: Option<Arc<menu_branding::PreparedMenuBranding>>,
+    menu_artwork_loader: menu_artwork::ArtworkLoader,
+    /// This frame's clock in seconds, which engine screen animations paint at.
+    menu_seconds: f64,
+    scene_clocks: super::scene_stack::SceneClocks,
+    /// The drawing scene's transition event clocks.
+    scene_clock: std::collections::BTreeMap<String, f64>,
+    menu_artwork: menu_artwork::MenuArtworkAtlas,
+    /// The installed refs must be rebased onto moved art pages.
+    menu_artwork_dirty: bool,
+    session_icons: session_icons::SessionIconPage,
+    session_glyphs: session_glyphs::SessionGlyphPages,
+    /// Identifiers already logged as iconless.
+    missing_icons: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The hotbar last logged: each slot's identifier and whether it had an icon.
+    logged_hotbar: [Option<(Arc<str>, bool)>; 9],
+    menu_view: Option<Arc<MenuView>>,
+    menu_hit_targets: Vec<(MenuAction, UiRect)>,
+    menu_skin_thumbnail_indices: Vec<usize>,
+    menu_cape_thumbnail_indices: Vec<usize>,
+    menu_cosmetic_thumbnail_indices: Vec<usize>,
+    /// Full settings slider geometry, including steps clipped from view.
+    settings_slider_drag_targets: Vec<(MenuAction, UiRect)>,
+    menu_scrolls: ui_engine::menu_scroll::MenuScrolls<launcher::menu::MenuAction>,
+    /// The JSON-UI engine: catalogs, layout caches and animation state.
+    engine: Option<Box<ui_engine::engine::FormEngine>>,
+    /// The server UI pack last applied to the engine, compared by identity.
+    engine_pack: Option<Arc<ServerUiPack>>,
+    /// The live catalog's screen settings, published to the runtime.
+    screen_settings: Arc<super::scene_stack::ScreenSettingsTable>,
+    /// Each screen family's own state, carried across builds.
+    screens: forms::ScreenStates,
+    /// What the last build exposes to input; reset as each build starts.
+    projections: forms::FrameProjections,
+    /// Window-space rect of the sign editor's Done button in the last build.
+    loading_stage: Option<LoadingStage>,
+    startup: StartupPresentationState,
+}
+
+#[cfg(test)]
+pub mod tests;

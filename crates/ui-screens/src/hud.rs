@@ -1,0 +1,371 @@
+//! The gameplay HUD through the JSON-UI engine: the frame's [`HudModel`] binds to
+//! `hud.hud_screen` and the crosshair overlay over the session's pack stack (the built-in Java
+//! HUD pack at the bottom). The bound and laid-out screen is reused until the model, catalog,
+//! viewport, or scale changes; each frame only repaints it, evaluating fades and the native
+//! renderers against the live state.
+
+use json_ui::vanilla::Reference;
+use std::{collections::BTreeMap, sync::Arc};
+
+use json_ui::{Catalog, Context, DataSource, HudBindings, HudChanges, HudModel, hud_clocks};
+use ui::{FONT_DESIGN_PIXEL_TEXELS, IconRef};
+use ui_engine::{
+    cached_screen::CachedScreen,
+    engine::{
+        FormEngine, RetainedPaint, ScreenArt,
+        item_renderer::ItemRenderer,
+        pack_catalog::CarrierRestore,
+        screen::{CustomRenderer, PaintError, PaintFrame, ScreenRegistry},
+    },
+    frame::EngineFrame,
+};
+
+use crate::hud_renderers::{HudPaint, HudRenderer, HungerAnimation};
+
+mod chat;
+#[cfg(test)]
+mod color_tests;
+#[cfg(test)]
+mod crisp_tests;
+#[cfg(test)]
+mod image_tests;
+pub mod prepared;
+#[cfg(test)]
+mod retention_tests;
+mod titles;
+#[cfg(test)]
+mod visibility_tests;
+
+/// The built-in Java-styled HUD pack: `(pack path, namespace, bytes)`, layered
+/// under every server pack.
+pub const JAVA_HUD_PACK: [(&str, &str, &[u8]); 4] = [
+    (
+        "ui/_global_variables.json",
+        "",
+        include_bytes!("../../../assets/java-hud/ui/_global_variables.json"),
+    ),
+    (
+        "ui/chat_screen.json",
+        "chat",
+        include_bytes!("../../../assets/java-hud/ui/chat_screen.json"),
+    ),
+    (
+        "ui/hud_screen.json",
+        "hud",
+        include_bytes!("../../../assets/java-hud/ui/hud_screen.json"),
+    ),
+    (
+        "ui/scoreboards.json",
+        "scoreboard",
+        include_bytes!("../../../assets/java-hud/ui/scoreboards.json"),
+    ),
+];
+
+/// The built-in Java HUD pack's original images, by extensionless pack path.
+pub const JAVA_HUD_IMAGES: [(&str, &[u8]); 3] = [
+    (
+        crate::player_list::CINNABAR_BADGE,
+        crate::player_list::CINNABAR_BADGE_PNG,
+    ),
+    (
+        "textures/ui/hotbar_offhand_left",
+        include_bytes!("../../../assets/java-hud/textures/ui/hotbar_offhand_left.png"),
+    ),
+    (
+        "textures/ui/hotbar_offhand_right",
+        include_bytes!("../../../assets/java-hud/textures/ui/hotbar_offhand_right.png"),
+    ),
+];
+
+/// Layers the built-in Java HUD pack and the rules server HUD layers follow over it.
+pub fn register(registry: &mut ScreenRegistry) {
+    for (path, bytes) in JAVA_HUD_IMAGES {
+        registry.builtin_image(path, bytes);
+    }
+    let catalog = registry.catalog_mut();
+    catalog.layer_builtin(install_java_hud);
+    catalog.restore_before(CarrierRestore {
+        authored: titles::authored,
+        restore: titles::restore,
+    });
+    catalog.after_layers(chat::prefer_builtin);
+}
+
+/// Installs the original HUD artwork below server layers.
+fn install_java_hud(catalog: &mut Catalog) {
+    catalog.apply_pack(JAVA_HUD_PACK.iter().map(|(path, _, bytes)| (*path, *bytes)));
+}
+
+/// The HUD and crosshair screens, carried across frames.
+#[derive(Default)]
+pub struct HudScreens {
+    pub hud: CachedScreen,
+    /// The crosshair overlay screen.
+    pub crosshair: CachedScreen,
+    /// The toast screen, drawn above everything in game.
+    pub toast: CachedScreen,
+    /// Where the showing toast takes presses and what they open, when it opens anything.
+    pub toast_press: Option<(ui::ToastPress, ui::UiRect)>,
+    /// The world-loading screen shown while joining.
+    pub loading: CachedScreen,
+    /// This frame's fade clocks (title, action bar, item name).
+    clocks: BTreeMap<String, f64>,
+    opacity: Option<i32>,
+    bindings: HudBindings,
+    /// Presentation color kept separate from the factory and collection message inputs.
+    chat_color: Option<char>,
+    chat_mention_color: Option<char>,
+    chat_local_player: Arc<str>,
+    crosshair_data: Arc<DataSource>,
+    model_clocks: BTreeMap<String, f64>,
+    hunger_animation: HungerAnimation,
+    /// The HUD context, kept while the engine context and placement stay.
+    context: crate::hud_placement::PlacedContext,
+    /// The HUD screen's last paint, reused while nothing it drew from changes.
+    hud_paint: RetainedHud,
+    /// The crosshair overlay's last paint.
+    crosshair_paint: RetainedHud,
+}
+
+/// One HUD screen's retained paint and the HUD state it was painted from.
+#[derive(Default)]
+struct RetainedHud {
+    paint: RetainedPaint,
+    /// The native renderers' state, item icons, and chat and mention colours the retained paint
+    /// drew.
+    drawn: Option<(HudPaint, Vec<IconRef>, ChatColors)>,
+    /// Hunger controls the paint advanced, advanced again whenever it is reused.
+    hunger: Vec<(String, Option<u64>)>,
+    /// Whether the screen's last paint reused the retained one.
+    reused: bool,
+}
+
+/// The chat message and mention formatting colours a HUD paint's labels read.
+type ChatColors = [Option<char>; 2];
+
+impl RetainedHud {
+    /// Whether a paint of `paint`, `icons` and `colors` would draw what the retained one did.
+    /// Shaking hunger icons change with every paint, so they always paint.
+    fn unchanged(&self, paint: &HudPaint, icons: &[IconRef], colors: ChatColors) -> bool {
+        self.drawn
+            .as_ref()
+            .is_some_and(|(drawn, drawn_icons, drawn_colors)| {
+                drawn.paints_as(paint) && drawn_icons.as_slice() == icons && *drawn_colors == colors
+            })
+            && (!paint.hunger.saturation_empty || self.hunger.is_empty())
+    }
+}
+
+/// What one HUD paint reads.
+pub struct HudInput<'a> {
+    /// The crosshair overlay rather than the HUD.
+    pub crosshair: bool,
+    /// Whether the caller's renderers in the paint frame draw exactly as they did when this
+    /// screen was last painted, so an otherwise unchanged paint may be reused.
+    pub renderers_unchanged: bool,
+    pub catalog: &'a Arc<Catalog>,
+    /// The HUD context with the chat placement.
+    pub context: &'a Context,
+    /// What [`HudScreens::begin`] returned.
+    pub data: Arc<DataSource>,
+    pub paint: &'a HudPaint,
+    /// Icons the model's item cells index.
+    pub icons: &'a [IconRef],
+}
+
+impl HudScreens {
+    /// Preserve bindings while relaying out screens for a changed texture pack.
+    pub fn invalidate_textures(&mut self) {
+        self.hud.invalidate_textures();
+        self.crosshair.invalidate_textures();
+        self.toast.invalidate_textures();
+        self.loading.invalidate_textures();
+    }
+
+    /// The HUD screens' context: `base` with the HUD flags and `placement`'s chat and hotbar.
+    /// It is rebuilt only when `base` or the placement changes.
+    pub fn context(
+        &mut self,
+        base: &Context,
+        placement: crate::hud_placement::HudPlacement,
+    ) -> Context {
+        self.context.get(base, placement, |base, placement| {
+            placement.placed(json_ui::hud_context(&base))
+        })
+    }
+
+    /// Binds retained semantic components while advancing the live scene and paint clocks.
+    pub fn begin(
+        &mut self,
+        model: Option<(&HudModel, HudChanges, i32)>,
+        scene_clock: &BTreeMap<String, f64>,
+        session: u64,
+        catalog: &Arc<Catalog>,
+    ) -> Arc<DataSource> {
+        let data = match model {
+            None => Arc::clone(&self.crosshair_data),
+            Some((model, changes, opacity)) => {
+                self.chat_color = model.chat_color;
+                self.chat_mention_color = model.chat_mention_color;
+                if self.chat_local_player != model.chat_local_player {
+                    self.hud_paint.drawn = None;
+                    self.crosshair_paint.drawn = None;
+                    self.chat_local_player = Arc::clone(&model.chat_local_player);
+                }
+                if changes.text {
+                    self.model_clocks = hud_clocks(model);
+                }
+                self.clocks.clone_from(&self.model_clocks);
+                let mut data = self.bindings.update(model, changes);
+                if changes.status || self.opacity != Some(opacity) {
+                    // A status refresh restores the default alpha binding.
+                    drop(data);
+                    data = self.bindings.set_opacity(opacity);
+                    self.opacity = Some(opacity);
+                }
+                data
+            }
+        };
+        self.clocks.extend(
+            scene_clock
+                .iter()
+                .map(|(clock, born)| (clock.clone(), *born)),
+        );
+        self.hunger_animation.begin(session, catalog);
+        data
+    }
+
+    /// Paints the HUD screen, or its crosshair overlay, returning its laid-out frame; `frame`'s
+    /// renderers draw ahead of the HUD's native and item renderers. A paint whose inputs all
+    /// match the screen's last one, with no animation or hunger shake running, reuses its output.
+    pub fn paint(
+        &mut self,
+        engine: &FormEngine,
+        input: HudInput<'_>,
+        frame: &mut PaintFrame<'_>,
+    ) -> Result<Option<EngineFrame>, PaintError> {
+        let HudInput {
+            crosshair,
+            renderers_unchanged,
+            catalog,
+            context,
+            data,
+            paint,
+            icons,
+        } = input;
+        let reference = if crosshair {
+            Reference::HudCrosshairHudCrosshairScreen.as_str()
+        } else {
+            Reference::HudHudScreen.as_str()
+        };
+        let px = frame.metrics.scale.get() * FONT_DESIGN_PIXEL_TEXELS as f32;
+        let language = frame.language;
+        let hunger_animation = std::cell::RefCell::new(&mut self.hunger_animation);
+        let advanced = std::cell::RefCell::new(Vec::new());
+        let advance_hunger = |key: &str, instance| {
+            advanced.borrow_mut().push((key.to_owned(), instance));
+            hunger_animation.borrow_mut().advance(key, instance)
+        };
+        let color = self.chat_color;
+        let mention = self.chat_mention_color;
+        let history = Reference::HudChatGridItem
+            .as_str()
+            .rsplit('.')
+            .next()
+            .unwrap_or_default();
+        let text_format = |node: &json_ui::DrawNode, text: &str| {
+            crate::settings_chat::message_text(
+                &node.key,
+                history,
+                text,
+                color,
+                mention,
+                &self.chat_local_player,
+            )
+        };
+        let art = ScreenArt {
+            text_format: Some(&text_format),
+            nearest_sampling: true,
+            clocks: Some(&self.clocks),
+            ..ScreenArt::default()
+        };
+        let mut items = ItemRenderer { icons, id_aux: &[] };
+        let (screen, retained) = if crosshair {
+            (&mut self.crosshair, &mut self.crosshair_paint)
+        } else {
+            (&mut self.hud, &mut self.hud_paint)
+        };
+        let reuse = renderers_unchanged && retained.unchanged(paint, icons, [color, mention]);
+        let paints = retained.paint.paints;
+        let caller = std::mem::take(&mut frame.renderers);
+        let drawn = {
+            let mut hud_renderer = HudRenderer {
+                hud: paint,
+                hunger_update: Some(&advance_hunger),
+                bounds: None,
+            };
+            let mut renderers: Vec<&mut dyn CustomRenderer> = Vec::with_capacity(caller.len() + 2);
+            for renderer in caller.iter_mut() {
+                renderers.push(&mut **renderer);
+            }
+            renderers.push(&mut hud_renderer);
+            renderers.push(&mut items);
+            let mut paint_frame = frame.with_renderers(&mut renderers);
+            engine.draw_retained(
+                &mut retained.paint,
+                reuse,
+                art,
+                &mut paint_frame,
+                |env, root| {
+                    screen.render(reference, catalog, context, data, (root, px, language), env)
+                },
+            )
+        };
+        frame.renderers = caller;
+        let hunger_animation = hunger_animation.into_inner();
+        retained.reused = retained.paint.paints == paints && matches!(drawn, Ok(Some(_)));
+        if retained.reused {
+            // The reused paint's hunger controls advance as painting them would have.
+            for (key, instance) in &retained.hunger {
+                hunger_animation.advance(key, *instance);
+            }
+        } else if retained.paint.paints != paints {
+            retained.drawn = matches!(drawn, Ok(Some(_)))
+                .then(|| (paint.clone(), icons.to_vec(), [color, mention]));
+            retained.hunger = advanced.into_inner();
+        }
+        drawn
+    }
+
+    /// Whether the HUD screen's, or the crosshair overlay's, last paint reused its previous
+    /// output instead of running its renderers.
+    pub fn reused(&self, crosshair: bool) -> bool {
+        if crosshair {
+            self.crosshair_paint.reused
+        } else {
+            self.hud_paint.reused
+        }
+    }
+
+    /// Paints each HUD screen ran rather than reused: `[hud, crosshair]`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn paints(&self) -> [usize; 2] {
+        [
+            self.hud_paint.paint.paints,
+            self.crosshair_paint.paint.paints,
+        ]
+    }
+
+    /// Drops both screens' retained paints, so their next paints run in full.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forget_paints(&mut self) {
+        self.hud_paint = RetainedHud::default();
+        self.crosshair_paint = RetainedHud::default();
+    }
+
+    /// This frame's fade clocks.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clocks(&self) -> &BTreeMap<String, f64> {
+        &self.clocks
+    }
+}

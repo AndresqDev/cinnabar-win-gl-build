@@ -1,0 +1,501 @@
+function Invoke-CheckedBuild {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+        # Windows PowerShell 5.1 represents a native process's stderr as non-terminating
+        # ErrorRecords. Compilers routinely use stderr for progress even when they exit 0.
+        $ErrorActionPreference = 'Continue'
+        & $Executable @Arguments 2>&1 |
+            ForEach-Object { $_.ToString() } |
+            Tee-Object -FilePath $LogPath
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        Pop-Location
+    }
+    if ($exitCode -ne 0) {
+        throw "build failed ($exitCode): $(Format-ResolvedCommand $Executable $Arguments)"
+    }
+}
+
+function Start-LoggedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath
+    )
+
+    $handle = [pscustomobject]@{
+        Process = $null
+        StdoutPath = $StdoutPath
+        StderrPath = $StderrPath
+        StdoutStream = $null
+        StderrStream = $null
+        StdoutCopy = $null
+        StderrCopy = $null
+        StdoutMarkerCursor = [pscustomobject]@{
+            Offset = [long]0
+            PartialLine = ''
+            LineNumber = [uint64]0
+        }
+    }
+    $started = $false
+    try {
+        $handle.StdoutStream = New-ProcessLogStream -Path $StdoutPath
+        $handle.StderrStream = New-ProcessLogStream -Path $StderrPath
+        $startInfo = [Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $Executable
+        $startInfo.Arguments = (@($Arguments | ForEach-Object { ConvertTo-CommandArgument $_ }) -join ' ')
+        $startInfo.WorkingDirectory = $WorkingDirectory
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardInput = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $false
+        $handle.Process = [Diagnostics.Process]::new()
+        $handle.Process.StartInfo = $startInfo
+        $started = $handle.Process.Start()
+        if (-not $started) { throw "failed to start $Executable" }
+        $handle.StdoutCopy = Start-ProcessLogCopy -Source $handle.Process.StandardOutput.BaseStream -Destination $handle.StdoutStream
+        $handle.StderrCopy = Start-ProcessLogCopy -Source $handle.Process.StandardError.BaseStream -Destination $handle.StderrStream
+        return $handle
+    }
+    catch {
+        $failure = $_
+        Invoke-IndependentProcessCleanup -PrimaryFailure $failure -Actions @(
+            { if ($started) { Stop-BoundedProcess -Handle $handle -Kind app } },
+            { Complete-ProcessLogs -Handle $handle },
+            { if ($null -ne $handle.Process) { $handle.Process.Dispose() } }
+        )
+        throw $failure
+    }
+}
+
+# Opens one continuously visible asynchronous process log, owned by the returned handle.
+function New-ProcessLogStream {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [IO.FileStream]::new(
+        $Path, [IO.FileMode]::Create, [IO.FileAccess]::Write,
+        [IO.FileShare]::ReadWrite, 1,
+        ([IO.FileOptions]::Asynchronous -bor [IO.FileOptions]::WriteThrough)
+    )
+}
+
+# Starts one drain without transferring ownership of either stream.
+function Start-ProcessLogCopy {
+    param($Source, $Destination)
+    return $Source.CopyToAsync($Destination)
+}
+
+# Attempts every action, preserving an in-flight error and reporting all cleanup failures.
+function Invoke-IndependentProcessCleanup {
+    param([scriptblock[]]$Actions, $PrimaryFailure = $null)
+    $failures = [Collections.Generic.List[Exception]]::new()
+    foreach ($action in $Actions) {
+        try { & $action | Out-Null }
+        catch {
+            $failures.Add($_.Exception)
+            Write-Warning "process cleanup failed: $_" -WarningAction Continue
+        }
+    }
+    if ($null -eq $PrimaryFailure -and $failures.Count -gt 0) {
+        throw [AggregateException]::new('Process cleanup failed', $failures.ToArray())
+    }
+}
+
+# Finalizes reporting and each child independently, retaining the original run error.
+function Complete-RemoteAcceptanceRun {
+    param($Manifest, [string]$ManifestPath, [bool]$RunSucceeded,
+        $ClientHandle, $CoreHandle, [bool]$ClientLogsCompleted,
+        [bool]$CoreLogsCompleted, $PrimaryFailure = $null)
+    Invoke-IndependentProcessCleanup -PrimaryFailure $PrimaryFailure -Actions @(
+        { if (-not $RunSucceeded) {
+            $Manifest.status = 'failed'
+            Write-AcceptanceJson -Path $ManifestPath -Value $Manifest
+        } },
+        { if ($null -ne $ClientHandle) { Stop-BoundedProcess -Handle $ClientHandle -Kind app } },
+        { if ($null -ne $ClientHandle -and -not $ClientLogsCompleted) { Complete-ProcessLogs $ClientHandle } },
+        { if ($null -ne $ClientHandle) { $ClientHandle.Process.Dispose() } },
+        { if ($null -ne $CoreHandle) { Stop-BoundedProcess -Handle $CoreHandle -Kind core } },
+        { if ($null -ne $CoreHandle -and -not $CoreLogsCompleted) { Complete-ProcessLogs $CoreHandle } },
+        { if ($null -ne $CoreHandle) { $CoreHandle.Process.Dispose() } }
+    )
+}
+
+function Test-RakNetUnconnectedPong {
+    param(
+        [Parameter(Mandatory = $true)][string]$Address,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 5000)][int]$TimeoutMilliseconds
+    )
+
+    $magic = [byte[]]@(
+        0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe,
+        0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78
+    )
+    $probe = [byte[]]::new(33)
+    $probe[0] = 0x01
+    $sentAt = [BitConverter]::GetBytes([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+    $guid = [BitConverter]::GetBytes([DateTime]::UtcNow.Ticks)
+    if ([BitConverter]::IsLittleEndian) {
+        [Array]::Reverse($sentAt)
+        [Array]::Reverse($guid)
+    }
+    [Array]::Copy($sentAt, 0, $probe, 1, $sentAt.Length)
+    [Array]::Copy($magic, 0, $probe, 9, $magic.Length)
+    [Array]::Copy($guid, 0, $probe, 25, $guid.Length)
+
+    $client = [Net.Sockets.UdpClient]::new()
+    try {
+        $client.Client.ReceiveTimeout = $TimeoutMilliseconds
+        $client.Connect($Address, $Port)
+        $null = $client.Send($probe, $probe.Length)
+        $remote = [Net.IPEndPoint]::new([Net.IPAddress]::Any, 0)
+        $response = $client.Receive([ref]$remote)
+        if ($response.Length -lt 33 -or $response[0] -ne 0x1c) {
+            return $false
+        }
+        for ($index = 0; $index -lt $magic.Length; $index++) {
+            if ($response[17 + $index] -ne $magic[$index]) {
+                return $false
+            }
+        }
+        return $true
+    }
+    catch [Net.Sockets.SocketException] {
+        return $false
+    }
+    finally {
+        $client.Dispose()
+    }
+}
+
+function Get-ContiguousProcessLogByteCount {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Buffer,
+        [Parameter(Mandatory = $true)][ValidateRange(0, [int]::MaxValue)][int]$Count
+    )
+
+    if ($Count -gt $Buffer.Length) {
+        throw "process-log byte count exceeds buffer length: count=$Count length=$($Buffer.Length)"
+    }
+    for ($index = 0; $index -lt $Count; $index++) {
+        if ($Buffer[$index] -eq 0) {
+            return $index
+        }
+    }
+    return $Count
+}
+
+function Advance-ProcessOutputCursorToCurrentEnd {
+    param([Parameter(Mandatory = $true)]$Handle)
+
+    $cursorProperty = $Handle.PSObject.Properties['StdoutMarkerCursor']
+    if ($null -eq $cursorProperty) {
+        $Handle | Add-Member -MemberType NoteProperty -Name StdoutMarkerCursor -Value ([pscustomobject]@{
+            Offset = [long]0
+            PartialLine = ''
+            LineNumber = [uint64]0
+        })
+    }
+    $cursor = $Handle.StdoutMarkerCursor
+    $startOffset = [long]$cursor.Offset
+    $reader = [IO.FileStream]::new(
+        $Handle.StdoutPath,
+        [IO.FileMode]::Open,
+        [IO.FileAccess]::Read,
+        [IO.FileShare]::ReadWrite
+    )
+    try {
+        $null = $reader.Seek($startOffset, [IO.SeekOrigin]::Begin)
+        $remaining = $reader.Length - $reader.Position
+        if ($remaining -lt 0 -or $remaining -gt [int]::MaxValue) {
+            throw "process stdout drain length was invalid: offset=$startOffset length=$($reader.Length)"
+        }
+        $bytes = [byte[]]::new([int]$remaining)
+        $read = 0
+        while ($read -lt $bytes.Length) {
+            $count = $reader.Read($bytes, $read, $bytes.Length - $read)
+            if ($count -eq 0) { break }
+            $read += $count
+        }
+        $contiguous = if ($read -eq 0) { 0 } else { Get-ContiguousProcessLogByteCount -Buffer $bytes -Count $read }
+        $decodeCount = $contiguous
+        $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+        $decoded = $null
+        while ($decodeCount -ge [Math]::Max(0, $contiguous - 3)) {
+            try {
+                $decoded = $strictUtf8.GetString($bytes, 0, $decodeCount)
+                break
+            }
+            catch [Text.DecoderFallbackException] {
+                $decodeCount--
+            }
+        }
+        if ($null -eq $decoded) {
+            throw 'process stdout drain encountered invalid UTF-8 outside a trailing partial code point'
+        }
+        $cursor.Offset = $startOffset + $decodeCount
+        $cursor.PartialLine += $decoded
+    }
+    finally {
+        $reader.Dispose()
+    }
+
+    $completeLines = 0
+    while (($newline = $cursor.PartialLine.IndexOf("`n", [StringComparison]::Ordinal)) -ge 0) {
+        $cursor.PartialLine = $cursor.PartialLine.Substring($newline + 1)
+        $cursor.LineNumber = [uint64]$cursor.LineNumber + 1
+        $completeLines++
+    }
+    return [pscustomobject][ordered]@{
+        start_offset = $startOffset
+        end_offset = [long]$cursor.Offset
+        complete_lines = $completeLines
+        line_number = [uint64]$cursor.LineNumber
+        partial_line_length = $cursor.PartialLine.Length
+    }
+}
+
+function Wait-ProcessOutputMarker {
+    param(
+        [Parameter(Mandatory = $true)]$Handle,
+        [Parameter(Mandatory = $true)][string]$Marker,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [scriptblock]$ReadinessProbe,
+        [string]$RejectMarker,
+        [switch]$PassThruEvidence
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $cursorProperty = $Handle.PSObject.Properties['StdoutMarkerCursor']
+    if ($null -eq $cursorProperty) {
+        $Handle | Add-Member -MemberType NoteProperty -Name StdoutMarkerCursor -Value ([pscustomobject]@{
+            Offset = [long]0
+            PartialLine = ''
+            LineNumber = [uint64]0
+        })
+    }
+    $cursor = $Handle.StdoutMarkerCursor
+    $buffer = [byte[]]::new(65536)
+    $skippedLines = [Collections.Generic.List[string]]::new()
+    $finalFlushPerformed = $false
+    while ([DateTime]::UtcNow -lt $deadline) {
+        while (($newline = $cursor.PartialLine.IndexOf("`n", [StringComparison]::Ordinal)) -ge 0) {
+            $line = $cursor.PartialLine.Substring(0, $newline).TrimEnd("`r")
+            $cursor.PartialLine = $cursor.PartialLine.Substring($newline + 1)
+            $cursor.LineNumber = [uint64]$cursor.LineNumber + 1
+            if ($line.Contains($Marker)) {
+                $evidence = [pscustomobject][ordered]@{
+                    Line = $line
+                    Marker = $Marker
+                    LineNumber = [uint64]$cursor.LineNumber
+                    ReadOffset = [long]$cursor.Offset
+                    ObservedAtUtc = [DateTime]::UtcNow.ToString('o')
+                    SkippedLines = @($skippedLines)
+                }
+                if ($PassThruEvidence) {
+                    return $evidence
+                }
+                return $line
+            }
+            if (-not [string]::IsNullOrEmpty($RejectMarker) -and $line.Contains($RejectMarker)) {
+                throw "observed rejected process output while waiting for '$Marker': $line"
+            }
+            $skippedLines.Add($line)
+        }
+        $reader = [IO.FileStream]::new(
+            $Handle.StdoutPath,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
+        try {
+            $null = $reader.Seek([long]$cursor.Offset, [IO.SeekOrigin]::Begin)
+            while ($reader.Position -lt $reader.Length) {
+                $wanted = [Math]::Min($buffer.Length, $reader.Length - $reader.Position)
+                $read = $reader.Read($buffer, 0, [int]$wanted)
+                if ($read -eq 0) {
+                    break
+                }
+                $contiguousRead = Get-ContiguousProcessLogByteCount -Buffer $buffer -Count $read
+                if ($contiguousRead -gt 0) {
+                    $cursor.Offset = [long]$cursor.Offset + $contiguousRead
+                    $cursor.PartialLine += [Text.Encoding]::UTF8.GetString($buffer, 0, $contiguousRead)
+                }
+                if ($contiguousRead -lt $read) {
+                    break
+                }
+                if ($cursor.PartialLine.Length -gt 131072) {
+                    $cursor.PartialLine = $cursor.PartialLine.Substring($cursor.PartialLine.Length - 131072)
+                }
+            }
+        }
+        finally {
+            $reader.Dispose()
+        }
+        while (($newline = $cursor.PartialLine.IndexOf("`n", [StringComparison]::Ordinal)) -ge 0) {
+            $line = $cursor.PartialLine.Substring(0, $newline).TrimEnd("`r")
+            $cursor.PartialLine = $cursor.PartialLine.Substring($newline + 1)
+            $cursor.LineNumber = [uint64]$cursor.LineNumber + 1
+            if ($line.Contains($Marker)) {
+                $evidence = [pscustomobject][ordered]@{
+                    Line = $line
+                    Marker = $Marker
+                    LineNumber = [uint64]$cursor.LineNumber
+                    ReadOffset = [long]$cursor.Offset
+                    ObservedAtUtc = [DateTime]::UtcNow.ToString('o')
+                    SkippedLines = @($skippedLines)
+                }
+                if ($PassThruEvidence) {
+                    return $evidence
+                }
+                return $line
+            }
+            if (-not [string]::IsNullOrEmpty($RejectMarker) -and $line.Contains($RejectMarker)) {
+                throw "observed rejected process output while waiting for '$Marker': $line"
+            }
+            $skippedLines.Add($line)
+        }
+        if (-not $Handle.Process.HasExited -and
+            $null -ne $ReadinessProbe -and
+            (& $ReadinessProbe)) {
+            if ($PassThruEvidence) {
+                return [pscustomobject][ordered]@{
+                    Line = $Marker
+                    Marker = $Marker
+                    LineNumber = [uint64]$cursor.LineNumber
+                    ReadOffset = [long]$cursor.Offset
+                    ObservedAtUtc = [DateTime]::UtcNow.ToString('o')
+                    SkippedLines = @($skippedLines)
+                }
+            }
+            return $Marker
+        }
+        if ($Handle.Process.HasExited -and $Handle.StdoutCopy.IsCompleted -and -not $finalFlushPerformed) {
+            $Handle.StdoutStream.Flush()
+            $finalFlushPerformed = $true
+            continue
+        }
+        if ($Handle.Process.HasExited -and $Handle.StdoutCopy.IsCompleted) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "timed out waiting for '$Marker'; process exit=$($Handle.Process.HasExited) log=$($Handle.StdoutPath)"
+}
+
+# Drains both copy tasks and disposes both streams, including partially built handles.
+function Complete-ProcessLogs {
+    param($Handle)
+    if ($null -eq $Handle) { return }
+    foreach ($copy in @($Handle.StdoutCopy, $Handle.StderrCopy)) {
+        if ($null -eq $copy) { continue }
+        try {
+            if (-not $copy.Wait(10000)) {
+                Write-Warning 'timed out flushing a child log stream' -WarningAction Continue
+            }
+        }
+        catch { Write-Warning "child log stream failed: $_" -WarningAction Continue }
+    }
+    Invoke-IndependentProcessCleanup -Actions @(
+        { if ($null -ne $Handle.StdoutStream) { $Handle.StdoutStream.Flush($true) } },
+        { if ($null -ne $Handle.StdoutStream) { $Handle.StdoutStream.Dispose() } },
+        { if ($null -ne $Handle.StderrStream) { $Handle.StderrStream.Flush($true) } },
+        { if ($null -ne $Handle.StderrStream) { $Handle.StderrStream.Dispose() } }
+    )
+}
+
+function Stop-BoundedProcess {
+    param(
+        $Handle,
+        [Parameter(Mandatory = $true)][ValidateSet('app', 'core', 'bds')][string]$Kind,
+        [string]$BdsConsoleLogPath
+    )
+
+    if ($null -eq $Handle -or $Handle.Process.HasExited) {
+        return
+    }
+    if ($Kind -eq 'bds') {
+        try {
+            try {
+                Write-BdsConsoleCommand `
+                    -Handle $Handle `
+                    -Command 'stop' `
+                    -LogPath $BdsConsoleLogPath
+            }
+            finally {
+                $Handle.Process.StandardInput.Close()
+            }
+        }
+        catch {
+            Write-Warning "BDS graceful stop failed: $_"
+        }
+        $timeout = 20000
+    }
+    elseif ($Kind -eq 'core') {
+        try {
+            $Handle.Process.StandardInput.Close()
+        }
+        catch {
+            Write-Warning "core EOF stop failed: $_"
+        }
+        $timeout = 10000
+    }
+    else {
+        try {
+            $null = $Handle.Process.CloseMainWindow()
+        }
+        catch {
+            Write-Warning "app close request failed: $_"
+        }
+        $timeout = 10000
+    }
+    try {
+        $exited = $Handle.Process.WaitForExit($timeout)
+    }
+    catch {
+        if ($Handle.Process.HasExited) {
+            return
+        }
+        throw
+    }
+    if (-not $exited) {
+        Write-Warning "$Kind did not stop gracefully in $timeout ms; forcing termination"
+        try {
+            $Handle.Process.Kill()
+        }
+        catch {
+            if (-not $Handle.Process.HasExited) {
+                throw
+            }
+        }
+        if (-not $Handle.Process.WaitForExit(10000)) {
+            throw "$Kind remained alive after forced termination"
+        }
+    }
+}
+
+# Waits on the current core's stderr publication signal without assuming an endpoint path.
+function Wait-CoreReady {
+    param(
+        [Parameter(Mandatory = $true)]$Handle,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $logHandle = [pscustomobject]@{ Process = $Handle.Process; StdoutPath = $Handle.StderrPath }
+    $line = Wait-ProcessOutputMarker -Handle $logHandle `
+        -Marker 'msg="listener ready; waiting for local Rust client"' -TimeoutSeconds $TimeoutSeconds
+    if ($Handle.Process.HasExited) { throw 'core exited while publishing its endpoint' }
+    return $line
+}

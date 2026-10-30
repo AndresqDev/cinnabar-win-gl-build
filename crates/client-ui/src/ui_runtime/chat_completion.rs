@@ -1,0 +1,188 @@
+//! Command-suggestion servicing, acceptance and tab cycling for the chat input.
+
+use std::sync::Arc;
+
+use protocol::{ChatAutocompleteCatalog, CompletionContext};
+use ui::{
+    ChatAutocompleteAction, ChatAutocompleteApply, ChatAutocompleteDelta, ChatAutocompleteRequest,
+    ChatAutocompleteResponse, MAX_CHAT_INPUT_BYTES, PointerPhase, UiAction,
+};
+
+use super::UiRuntime;
+
+impl UiRuntime {
+    /// Completes `request` against the catalog snapshot; false when it was stale or invalid.
+    pub fn complete_chat_autocomplete(
+        &mut self,
+        player_runtime: &player_state::PlayerState,
+        request: ChatAutocompleteRequest,
+    ) -> bool {
+        // UpdateSoftEnum and AvailableCommands arrive unsolicited without an editor request
+        // identity, so the immutable catalog is queried locally and applied only through the
+        // session/input/request correlation below.
+        let command_permission = player_runtime
+            .facts
+            .local_abilities()
+            .map(|update| update.command_permission);
+        let context = CompletionContext {
+            players: &self.session.known_player_names,
+            command_permission,
+        };
+        let Ok(completion) = self.session.chat_autocomplete_catalog.complete_in(
+            &request.input,
+            usize::from(request.cursor_byte),
+            context,
+        ) else {
+            return false;
+        };
+        let usage = completion.usage.clone();
+        let applied = matches!(
+            self.session
+                .chat_autocomplete
+                .apply_response(ChatAutocompleteResponse {
+                    session: request.session,
+                    input_revision: request.input_revision,
+                    request_id: request.request_id,
+                    catalog_revision: completion.catalog_revision,
+                    suggestions: completion.suggestions,
+                }),
+            Ok(ChatAutocompleteApply::Applied)
+        );
+        if applied {
+            self.session.chat_usage_hint = usage;
+        }
+        applied
+    }
+
+    pub fn handle_chat_ui_action(&mut self, action: UiAction) -> bool {
+        if matches!(action, UiAction::TabNext | UiAction::TabPrevious) {
+            return self.cycle_chat_suggestion(action);
+        }
+        let Some(suggestion) = self.session.chat_autocomplete.handle_action(action) else {
+            return false;
+        };
+        self.accept_chat_suggestion(&suggestion);
+        true
+    }
+
+    pub fn handle_chat_ui_action_with_suggestion_hit(
+        &mut self,
+        action: UiAction,
+        suggestion_hit: Option<usize>,
+    ) -> bool {
+        if let UiAction::PointerPrimary {
+            position: _,
+            phase: PointerPhase::Pressed,
+        } = action
+        {
+            let Some(index) = suggestion_hit else {
+                return false;
+            };
+            if !self.session.chat_autocomplete.select_index(index) {
+                return false;
+            }
+            let Some(suggestion) = self.session.chat_autocomplete.selected_suggestion() else {
+                return false;
+            };
+            self.accept_chat_suggestion(&suggestion);
+            return true;
+        }
+        self.handle_chat_ui_action(action)
+    }
+
+    /// Accepts a suggestion, ending completion when it already matches the active token.
+    fn accept_chat_suggestion(&mut self, value: &str) {
+        let cursor = self.session.chat_editor.cursor_byte();
+        let start = self.chat_token_start();
+        if &self.session.chat_editor.as_str()[start..cursor] == value {
+            self.session.chat_autocomplete.clear();
+            self.session.pending_chat_autocomplete_request = None;
+            self.session.chat_tab_cycling = false;
+            self.session.chat_tab_start = None;
+        } else {
+            self.replace_chat_token(value);
+        }
+    }
+
+    /// Tab inserts the selected suggestion; repeated Tab steps through the same list.
+    fn cycle_chat_suggestion(&mut self, action: UiAction) -> bool {
+        if self.session.chat_autocomplete.suggestions().is_empty() {
+            return false;
+        }
+        if self.session.chat_tab_cycling {
+            self.session.chat_autocomplete.handle_action(action);
+        }
+        let Some(selected) = self.session.chat_autocomplete.selected_suggestion() else {
+            return false;
+        };
+        let list = self.session.chat_autocomplete.suggestions().to_vec();
+        let index = self.session.chat_autocomplete.selected_index();
+        let hint = self.session.chat_usage_hint.clone();
+        let start = self.chat_token_start();
+        self.replace_chat_token(&selected);
+        // The edit re-arms completion; restoring the list keeps the cycle stable.
+        if let Some(request) = self.session.pending_chat_autocomplete_request.take() {
+            let restored = self.session.chat_autocomplete.apply(
+                request,
+                ChatAutocompleteDelta {
+                    enum_name: Arc::from("catalog"),
+                    action: ChatAutocompleteAction::Replace,
+                    suggestions: Arc::from(list),
+                },
+            );
+            if restored.is_ok()
+                && let Some(index) = index
+            {
+                self.session.chat_autocomplete.select_index(index);
+            }
+        }
+        self.session.chat_usage_hint = hint;
+        self.session.chat_tab_cycling = true;
+        self.session.chat_tab_start = Some(start);
+        true
+    }
+
+    /// Keeps the original replacement boundary while Tab cycles a suggestion list.
+    fn chat_token_start(&self) -> usize {
+        if self.session.chat_tab_cycling
+            && let Some(start) = self.session.chat_tab_start
+        {
+            return start;
+        }
+        let head = &self.session.chat_editor.as_str()[..self.session.chat_editor.cursor_byte()];
+        ChatAutocompleteCatalog::replacement_start(head)
+    }
+
+    /// Replaces the active token, including any text up to its existing closing quote.
+    fn replace_chat_token(&mut self, value: &str) {
+        let text = self.session.chat_editor.as_str();
+        let cursor = self.session.chat_editor.cursor_byte();
+        let head = &text[..cursor];
+        let start = self.chat_token_start();
+        let tail = &text[cursor..];
+        let inside_quotes = head[start..].bytes().filter(|&byte| byte == b'"').count() % 2 != 0;
+        let tail = if inside_quotes && let Some(end) = tail.find('"') {
+            &tail[end + 1..]
+        } else {
+            tail
+        };
+        if start + value.len() + tail.len() > MAX_CHAT_INPUT_BYTES {
+            return;
+        }
+        let next = format!("{}{value}{tail}", &head[..start]);
+        if next == text {
+            self.mutate_chat_editor(|editor| editor.place_cursor(start + value.len()));
+            return;
+        }
+        let tail_chars = tail.chars().count();
+        self.session.chat_editor.clear();
+        self.session
+            .chat_editor
+            .insert(&next)
+            .expect("length was checked against the chat input bound");
+        for _ in 0..tail_chars {
+            self.session.chat_editor.move_left();
+        }
+        self.note_chat_editor_change();
+    }
+}

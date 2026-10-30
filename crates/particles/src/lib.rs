@@ -1,0 +1,46 @@
+//! Engine-independent Bedrock particle simulation: effect definitions, Molang-driven emitters,
+//! world collision, triggers and camera-facing draw lists ready for GPU upload.
+
+pub mod actor;
+mod atlas;
+mod def;
+mod dragon_egg;
+mod draw;
+mod emitter;
+mod event_budget;
+mod library;
+mod molang;
+mod particle;
+mod system;
+mod triggers;
+mod world;
+
+pub mod ambient;
+pub mod tiles;
+
+pub use atlas::{ATLAS_SIDE, AtlasPatch, FALLBACK_TEXEL, TILE_SLOT, particle_textures_fit};
+pub use dragon_egg::dragon_egg_teleport_requests;
+pub use draw::{DrawLists, ParticleInstance, ParticleView};
+pub use emitter::{ParticleSound, SpawnRequest, TileRequest};
+pub use event_budget::EventOverflows;
+pub use molang::Queries;
+pub use system::{MAX_EMITTERS, MAX_LIVE_PARTICLES, ParticleSystem};
+pub use triggers::{
+    ITEM_ICON_PARTICLES, LevelParticle, TOTEM_PARTICLE_EFFECT, block_break_request,
+    block_crack_request, burst_requests, classify_level_event, crack_cadence_due,
+    critical_hit_request, eating_item_request, face_toward, is_particle_level_event,
+    item_icon_request, named_request, native_request, parse_molang_variables, terrain_request,
+    totem_activation_request,
+};
+pub use world::{BlockIdentity, BlockList, EmptyWorld, Fluid, ParticleWorld};
+
+#[cfg(test)]
+mod eating_tests;
+#[cfg(test)]
+mod event_tests;
+#[cfg(test)]
+mod explosion_tests;
+#[cfg(test)]
+mod snowball_tests;
+#[cfg(test)]
+mod terrain_tests;

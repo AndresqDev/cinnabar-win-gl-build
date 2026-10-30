@@ -1,0 +1,86 @@
+use super::*;
+use launcher_host::settings_storage::entries;
+use std::{fs, path::PathBuf};
+
+/// Gives each test a private, canonical data directory.
+fn fixture() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "cinnabar-storage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&path).unwrap();
+    fs::canonicalize(path).unwrap()
+}
+
+#[test]
+fn confirmed_screenshot_delete_only_removes_saved_pngs() {
+    let root = fixture();
+    let mut layout = launcher::test_support::scratch("screenshots");
+    layout.user_data_root = root.clone();
+    fs::create_dir_all(layout.screenshots_dir()).unwrap();
+    fs::create_dir_all(layout.resource_pack_cache_dir()).unwrap();
+    let screenshot = layout.screenshots_dir().join("saved.png");
+    let other = layout.screenshots_dir().join("notes.txt");
+    let pack = layout.resource_pack_cache_dir().join("downloaded-pack");
+    fs::write(&screenshot, b"png").unwrap();
+    fs::write(&other, b"notes").unwrap();
+    fs::write(&pack, b"pack").unwrap();
+    let mut menu = MenuRuntime::new(true, 2, "Steve".into());
+    menu.layout = layout;
+    menu.refresh_storage();
+    menu.activate_storage(StorageAction::RequestScreenshots);
+    assert!(
+        screenshot.exists(),
+        "request must not delete before confirmation"
+    );
+    menu.activate_storage(StorageAction::ConfirmDelete);
+    assert!(!screenshot.exists());
+    assert!(other.exists());
+    assert!(pack.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn deleting_without_selection_preserves_every_cached_pack() {
+    let root = fixture();
+    let mut menu = MenuRuntime::new(true, 2, "Steve".into());
+    menu.layout.user_data_root = root.clone();
+    let cache = menu.layout.resource_pack_cache_dir();
+    fs::create_dir_all(&cache).unwrap();
+    for name in ["a", "b"] {
+        fs::write(cache.join(name), name).unwrap();
+    }
+    menu.refresh_storage();
+    menu.activate_storage(StorageAction::Select(0));
+    menu.activate_storage(StorageAction::Select(0));
+    menu.activate_storage(StorageAction::RequestDelete);
+    assert_ne!(menu.dialog, Some(MenuDialog::StorageDelete));
+    menu.activate_storage(StorageAction::ConfirmDelete);
+    assert_eq!(entries(&cache).unwrap().len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn individual_delete_keeps_the_requested_target_after_selection_changes() {
+    let root = fixture();
+    let mut menu = MenuRuntime::new(true, 2, "Steve".into());
+    menu.layout.user_data_root = root.clone();
+    let cache = menu.layout.resource_pack_cache_dir();
+    fs::create_dir_all(&cache).unwrap();
+    for name in ["a", "b"] {
+        fs::write(cache.join(name), name).unwrap();
+    }
+    menu.refresh_storage();
+    let requested = menu.storage.cached[0].path.clone();
+    menu.activate_storage(StorageAction::Select(0));
+    menu.activate_storage(StorageAction::RequestDelete);
+    menu.activate_storage(StorageAction::Select(0));
+    menu.activate_storage(StorageAction::ConfirmDelete);
+    assert!(!requested.exists());
+    assert_eq!(entries(&cache).unwrap().len(), 1);
+    fs::remove_dir_all(root).unwrap();
+}

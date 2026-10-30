@@ -1,0 +1,133 @@
+//! Draws shadow volumes over opaque geometry, multiplying each covered sample once.
+//! Rules: `docs/reference/entity-shadows.md`.
+
+use bevy::prelude::IntoScheduleConfigs;
+#[cfg(test)]
+use bevy::prelude::System;
+use bevy::render::render_resource::ShaderType;
+#[cfg(test)]
+use bevy::render::renderer::RenderQueue;
+use render_scene::EntityShadowScene;
+use std::num::NonZeroU64;
+
+#[cfg(test)]
+use bevy::prelude::IntoSystem;
+use bevy::prelude::SystemSet;
+use bevy::{
+    asset::{load_internal_asset, uuid_handle},
+    core_pipeline::{Core3d, Core3dSystems},
+    mesh::VertexBufferLayout,
+    prelude::{
+        App, Camera3d, Commands, Component, Entity, Handle, Last, Msaa, Plugin, Query, Res, ResMut,
+        Resource, Result, Shader, With, World, default,
+    },
+    render::{
+        Render, RenderApp, RenderSystems,
+        camera::ExtractedCamera,
+        extract_resource::ExtractResourcePlugin,
+        render_resource::{
+            BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
+            BindingResource, BindingType, BlendComponent, BlendFactor, BlendOperation, BlendState,
+            Buffer, BufferBindingType, BufferDescriptor, BufferId, BufferUsages,
+            CachedRenderPipelineId, ColorTargetState, ColorWrites, CompareFunction,
+            DepthStencilState, Face, FragmentState, LoadOp, MultisampleState, Operations,
+            PipelineCache, PrimitiveState, RenderPassDepthStencilAttachment, RenderPassDescriptor,
+            RenderPipelineDescriptor, ShaderStages, StencilFaceState, StencilOperation,
+            StencilState, StoreOp, Texture, TextureDescriptor, TextureDimension, TextureFormat,
+            TextureSampleType, TextureUsages, TextureView, TextureViewDimension, TextureViewId,
+            VertexAttribute, VertexFormat, VertexState, VertexStepMode,
+        },
+        renderer::{RenderContext, RenderDevice},
+        view::{
+            ExtractedView, ViewDepthStencilTexture, ViewTarget, ViewUniform, ViewUniformOffset,
+            ViewUniforms,
+        },
+    },
+};
+use render_model::{
+    EntityShadow, EntityShadowParams, SHADOW_VOLUME_VERTICES, entity_shadow_colour,
+    shadow_screen_rect, shadow_volume_mesh,
+};
+
+use {crate::scene_target::SceneTarget, render_scene::SkyKind};
+
+const SHADER: Handle<Shader> = uuid_handle!("6b0e5c1d-3f8a-4e27-9b41-2d7c0a5e8f13");
+const INSTANCE_BYTES: u64 = size_of::<EntityShadow>() as u64;
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, SystemSet)]
+pub(crate) struct EntityShadowLabel;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EntityShadowRenderPlugin;
+
+impl Plugin for EntityShadowRenderPlugin {
+    fn build(&self, app: &mut App) {
+        crate::upload_staging::install(app);
+        crate::pipeline_warmup::register::<EntityShadowGpu>(app);
+        load_internal_asset!(
+            app,
+            SHADER,
+            "entity_shadow.wesl",
+            crate::shader_safety::from_wesl
+        );
+        app.init_resource::<EntityShadowScene>()
+            .add_plugins(ExtractResourcePlugin::<EntityShadowScene>::default())
+            .add_systems(Last, crate::chunk::admit_depth_sampling);
+    }
+
+    fn finish(&self, app: &mut App) {
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        let device = render_app.world().resource::<RenderDevice>().clone();
+        render_app
+            .insert_resource(EntityShadowGpu::new(&device))
+            .add_systems(
+                Render,
+                (
+                    prepare_shadow_buffers.in_set(RenderSystems::PrepareResources),
+                    prepare_shadow_views
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(bevy::render::view::prepare_view_targets)
+                        .after(bevy::core_pipeline::core_3d::prepare_core_3d_depth_textures),
+                    prepare_shadow_bind_groups.in_set(RenderSystems::PrepareBindGroups),
+                ),
+            );
+        install_graph(render_app.world_mut());
+    }
+}
+
+/// Orders shadows after all opaque terrain and before transparent geometry.
+pub(crate) fn install_graph(world: &mut World) {
+    if world.contains_resource::<ShadowPassInstalled>() {
+        return;
+    }
+    let installed = world
+        .try_schedule_scope(Core3d, |_, schedule| {
+            schedule.add_systems(
+                crate::gpu_timing::profiled(node::entity_shadows, None, "EntityShadowLabel")
+                    .in_set(EntityShadowLabel)
+                    .after(crate::scene_target::ScenePass::Opaque)
+                    .after(crate::chunk::GpuCullLateLabel)
+                    .after(crate::far_terrain::FarTerrainLabel)
+                    .before(crate::scene_target::ScenePass::Transparent)
+                    .in_set(Core3dSystems::MainPass),
+            );
+        })
+        .is_ok();
+    if installed {
+        world.insert_resource(ShadowPassInstalled);
+    }
+}
+
+#[derive(Resource)]
+struct ShadowPassInstalled;
+
+mod gpu;
+mod node;
+mod view;
+use gpu::*;
+use view::*;
+
+#[cfg(test)]
+mod tests;

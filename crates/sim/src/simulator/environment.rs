@@ -1,0 +1,494 @@
+use std::collections::BTreeSet;
+
+use crate::world::DEFAULT_SURFACE_FRICTION;
+use crate::{
+    Aabb, BlockPhysicsFlags, CollisionWorld, SurfaceResponse, Vec3, WorldCollisionIdentity,
+    WorldQueryError,
+};
+
+use super::MovementEnvironment;
+use crate::fluid::liquid_contact;
+
+pub const MAX_BLOCK_SAMPLES_PER_TICK: usize = 64;
+
+pub(super) struct SampledEnvironment {
+    pub movement: MovementEnvironment,
+    /// New water contact seen by the resolved move's fall check.
+    pub entered_water: bool,
+    pub friction: f64,
+    pub identity: WorldCollisionIdentity,
+    pub block_samples: usize,
+    /// This tick's descent through a climbable block, which removes scaffolding support.
+    pub descend_through: bool,
+    /// Primary physics and liquid materials already read this tick, sorted by cell.
+    cells: Vec<([i32; 3], CachedPhysics)>,
+    /// Move multiplier of the berry-bush and powder-snow cells the body is inside.
+    pub stuck: Option<[f32; 3]>,
+    /// Response of the block under the friction probe, which selects soul sand acceleration.
+    pub friction_surface: SurfaceResponse,
+    /// Honey at the feet cell, or below integer-aligned feet, scales the jump.
+    pub honey_jump: bool,
+}
+
+impl SampledEnvironment {
+    /// An empty sample whose reads start from `identity`, for ticks that skip
+    /// the movement sampler.
+    pub(super) fn unsampled(identity: WorldCollisionIdentity) -> Self {
+        Self {
+            movement: MovementEnvironment::default(),
+            entered_water: false,
+            friction: DEFAULT_SURFACE_FRICTION,
+            identity,
+            block_samples: 0,
+            descend_through: false,
+            cells: Vec::new(),
+            stuck: None,
+            friction_surface: SurfaceResponse::None,
+            honey_jump: false,
+        }
+    }
+
+    /// Reads primary physics without spending the shared budget twice on a cached cell.
+    pub(super) fn primary(
+        &mut self,
+        world: &(impl CollisionWorld + ?Sized),
+        block: [i32; 3],
+    ) -> Result<(crate::BlockPhysicsFacts, Option<WorldCollisionIdentity>), WorldQueryError> {
+        self.read_cell(world, block)
+            .map(|(facts, identity)| (facts.primary, identity))
+    }
+
+    /// Reads liquid materials from every layer, retaining the fresh read's identity.
+    pub(super) fn liquids(
+        &mut self,
+        world: &(impl CollisionWorld + ?Sized),
+        block: [i32; 3],
+    ) -> Result<(BlockPhysicsFlags, Option<WorldCollisionIdentity>), WorldQueryError> {
+        self.read_cell(world, block)
+            .map(|(facts, identity)| (facts.liquids, identity))
+    }
+
+    /// Reuses a cell or records one complete material read within the tick's budget.
+    fn read_cell(
+        &mut self,
+        world: &(impl CollisionWorld + ?Sized),
+        block: [i32; 3],
+    ) -> Result<(CachedPhysics, Option<WorldCollisionIdentity>), WorldQueryError> {
+        match self.cells.binary_search_by(|(cell, _)| cell.cmp(&block)) {
+            Ok(index) => Ok((self.cells[index].1, None)),
+            Err(index) => {
+                let sample = sample_block(world, block, &mut self.block_samples)?;
+                let facts = CachedPhysics::from_sample(&sample);
+                self.cells.insert(index, (block, facts));
+                Ok((facts, Some(sample.identity)))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CachedPhysics {
+    primary: crate::BlockPhysicsFacts,
+    liquids: BlockPhysicsFlags,
+}
+
+impl CachedPhysics {
+    /// Keeps primary behavior separate from liquid materials in secondary layers.
+    fn from_sample(sample: &crate::BlockPhysicsSample) -> Self {
+        Self {
+            primary: *sample.primary(),
+            liquids: BlockPhysicsFlags::from_bits(sample.layers.iter().fold(0, |bits, facts| {
+                (bits | facts.flags.bits()) & BlockPhysicsFlags::KNOWN_BITS
+            }))
+            .expect("known physics flag mask stays valid"),
+        }
+    }
+}
+
+/// Reads all layers of one cell without exceeding the tick's shared physics budget.
+fn sample_block(
+    world: &(impl CollisionWorld + ?Sized),
+    block: [i32; 3],
+    block_samples: &mut usize,
+) -> Result<crate::BlockPhysicsSample, WorldQueryError> {
+    if *block_samples == MAX_BLOCK_SAMPLES_PER_TICK {
+        return Err(WorldQueryError::QueryExtentExceeded);
+    }
+    let sample = world.block_physics(block)?;
+    *block_samples += 1;
+    Ok(sample)
+}
+
+/// Reads one primary block without exceeding the tick's shared physics budget.
+pub(super) fn sample_primary(
+    world: &(impl CollisionWorld + ?Sized),
+    block: [i32; 3],
+    block_samples: &mut usize,
+) -> Result<crate::CollisionQuery<crate::BlockPhysicsFacts>, WorldQueryError> {
+    let sample = sample_block(world, block, block_samples)?;
+    Ok(crate::CollisionQuery {
+        value: *sample.primary(),
+        identity: sample.identity,
+    })
+}
+
+/// Samples the current body and preceding liquid-sensing pose, without sweeping motion.
+pub(super) fn sample(
+    world: &(impl CollisionWorld + ?Sized),
+    position: Vec3,
+    height: f64,
+    liquid_contact_height: Option<f64>,
+) -> Result<SampledEnvironment, WorldQueryError> {
+    let player = Aabb::player_with_height_at(position, height);
+    let liquid_player =
+        Aabb::player_with_height_at(position, liquid_contact_height.unwrap_or(height));
+    let contact = Aabb::new(
+        player.min.component_min(liquid_player.min),
+        player.max.component_max(liquid_player.max),
+    );
+    crate::world::validate_collision_query(contact)?;
+    world.ensure_movement_origin(position)?;
+    let min = block_at(contact.min)?;
+    let max = inclusive_max_block_at(contact.max)?;
+    let support = block_below(position)?;
+    let feet = block_at(position)?;
+    let inside = inside_cells(player)?;
+    let feet_aligned = position.y as f32 == (position.y as f32).floor();
+    let friction_block = block_at(Vec3::new(
+        f64::from(position.x as f32),
+        f64::from(position.y as f32 - 0.1_f32),
+        f64::from(position.z as f32),
+    ))?;
+    let mut blocks = BTreeSet::from([support, friction_block, feet]);
+    for x in min[0]..=max[0] {
+        for y in min[1]..=max[1] {
+            for z in min[2]..=max[2] {
+                if blocks.insert([x, y, z]) && blocks.len() > MAX_BLOCK_SAMPLES_PER_TICK {
+                    return Err(WorldQueryError::QueryExtentExceeded);
+                }
+            }
+        }
+    }
+
+    let block_samples = blocks.len();
+    let mut cells = Vec::with_capacity(block_samples);
+    let mut identity: Option<WorldCollisionIdentity> = None;
+    let mut movement = MovementEnvironment::default();
+    let mut friction = DEFAULT_SURFACE_FRICTION;
+    let mut stuck = None;
+    let mut friction_surface = SurfaceResponse::None;
+    let (mut feet_honey, mut support_honey) = (false, false);
+    for block in blocks {
+        let sample = world.block_physics(block)?;
+        cells.push((block, CachedPhysics::from_sample(&sample)));
+        identity = Some(match identity {
+            None => sample.identity.clone(),
+            Some(previous) => previous.merge(&sample.identity)?,
+        });
+        if block == friction_block && !probes_air(world, block, &mut identity)? {
+            friction = sample.primary().friction;
+            friction_surface = sample.primary().surface_response;
+        }
+        // Climbing reads only the block at the feet cell, never body contact.
+        if block == feet {
+            movement.on_climbable = sample
+                .primary()
+                .flags
+                .contains(BlockPhysicsFlags::CLIMBABLE);
+        }
+        let honey = sample.primary().surface_response == SurfaceResponse::Honey;
+        feet_honey |= block == feet && honey;
+        support_honey |= block == support && honey;
+        if block == support {
+            let response = active_surface_response(sample.primary(), player, block);
+            if response != SurfaceResponse::None {
+                movement.surface_response = response;
+            }
+        }
+        for facts in &sample.layers {
+            let body_contact = fluid_intersects(player, block, 1.0);
+            let active_response = if contains(inside, block)
+                && matches!(
+                    facts.surface_response,
+                    SurfaceResponse::Honey
+                        | SurfaceResponse::BubbleUp
+                        | SurfaceResponse::BubbleDown
+                ) {
+                active_surface_response(facts, player, block)
+            } else {
+                SurfaceResponse::None
+            };
+            if movement.surface_response == SurfaceResponse::None
+                && active_response != SurfaceResponse::None
+            {
+                movement.surface_response = active_response;
+            }
+            // Stuck-block slowdown belongs to the displacement phase, not acceleration.
+            let stuck_block = facts.flags.contains(BlockPhysicsFlags::COBWEB)
+                || facts.flags.contains(BlockPhysicsFlags::POWDER_SNOW)
+                || is_slowdown_plant(facts);
+            if stuck_block
+                && !facts.flags.contains(BlockPhysicsFlags::COBWEB)
+                && contains(inside, block)
+            {
+                stuck = Some(merge_stuck(
+                    stuck,
+                    [
+                        facts.horizontal_speed_factor as f32,
+                        facts.vertical_speed_factor as f32,
+                        facts.horizontal_speed_factor as f32,
+                    ],
+                ));
+            }
+            if !stuck_block && (body_contact || (block == support && facts.flags.bits() == 0)) {
+                movement.horizontal_speed_factor = movement
+                    .horizontal_speed_factor
+                    .min(facts.horizontal_speed_factor);
+                movement.vertical_speed_factor = movement
+                    .vertical_speed_factor
+                    .min(facts.vertical_speed_factor);
+            }
+            movement.in_water |= facts.flags.contains(BlockPhysicsFlags::WATER)
+                && liquid_contact(liquid_player, block, true);
+            movement.in_lava |= facts.flags.contains(BlockPhysicsFlags::LAVA)
+                && liquid_contact(liquid_player, block, false);
+            // Inside-block effects use the inset body, independently of solid boxes.
+            movement.in_cobweb |=
+                facts.flags.contains(BlockPhysicsFlags::COBWEB) && contains(inside, block);
+            movement.in_powder_snow |=
+                contains(inside, block) && facts.flags.contains(BlockPhysicsFlags::POWDER_SNOW);
+        }
+    }
+    let identity = identity.expect("the support block guarantees one bounded sample");
+    Ok(SampledEnvironment {
+        movement,
+        entered_water: false,
+        friction,
+        identity,
+        block_samples,
+        descend_through: false,
+        cells,
+        stuck,
+        friction_surface,
+        // Integer-aligned feet also read the block below the feet cell.
+        honey_jump: feet_honey || (feet_aligned && support_honey),
+    })
+}
+
+/// Vanilla keeps the default friction over air, such as with the feet probe past a block edge.
+fn probes_air(
+    world: &(impl CollisionWorld + ?Sized),
+    block: [i32; 3],
+    identity: &mut Option<WorldCollisionIdentity>,
+) -> Result<bool, WorldQueryError> {
+    let Some(air) = world.primary_is_air(block)? else {
+        return Ok(false);
+    };
+    *identity = Some(match identity.take() {
+        None => air.identity,
+        Some(previous) => previous.merge(&air.identity)?,
+    });
+    Ok(air.value)
+}
+
+/// Checks a bounded volume against the same block-physics authority used for
+/// movement, returning every queried identity so an exit probe cannot treat an
+/// unloaded or mismatched liquid region as clear.
+pub(super) fn contains_liquid(
+    world: &impl CollisionWorld,
+    query: Aabb,
+    samples: &mut usize,
+) -> Result<(bool, WorldCollisionIdentity), WorldQueryError> {
+    crate::world::validate_collision_query(query)?;
+    let min = block_at(query.min)?;
+    let max = inclusive_max_block_at(query.max)?;
+    let mut identity: Option<WorldCollisionIdentity> = None;
+    let mut contains = false;
+    for x in min[0]..=max[0] {
+        for y in min[1]..=max[1] {
+            for z in min[2]..=max[2] {
+                if *samples == MAX_BLOCK_SAMPLES_PER_TICK {
+                    return Err(WorldQueryError::QueryExtentExceeded);
+                }
+                *samples += 1;
+                let block = [x, y, z];
+                let sample = world.block_physics(block)?;
+                identity = Some(match identity {
+                    None => sample.identity.clone(),
+                    Some(previous) => previous.merge(&sample.identity)?,
+                });
+                // The raised exit probe asks whether its sampled block cells
+                // carry liquid, not whether the liquid surface reaches it.
+                // Vanilla reads only the primary block's material here,
+                // without secondary layers.
+                let flags = sample.primary().flags;
+                contains |= flags.contains(BlockPhysicsFlags::WATER)
+                    || flags.contains(BlockPhysicsFlags::LAVA);
+            }
+        }
+    }
+    Ok((
+        contains,
+        identity.expect("a finite non-empty probe samples at least one block"),
+    ))
+}
+
+/// A collision-free block with reduced speed factors (berry bush class).
+fn is_slowdown_plant(facts: &crate::BlockPhysicsFacts) -> bool {
+    let special = BlockPhysicsFlags::WATER.bits()
+        | BlockPhysicsFlags::LAVA.bits()
+        | BlockPhysicsFlags::COBWEB.bits()
+        | BlockPhysicsFlags::POWDER_SNOW.bits()
+        | BlockPhysicsFlags::SCAFFOLDING.bits();
+    facts.flags.contains(BlockPhysicsFlags::PASSABLE)
+        && facts.flags.bits() & special == 0
+        && (facts.horizontal_speed_factor < 1.0 || facts.vertical_speed_factor < 1.0)
+}
+
+/// The first stuck block sets the multiplier; later ones keep the per-axis minimum.
+pub(super) fn merge_stuck(current: Option<[f32; 3]>, next: [f32; 3]) -> [f32; 3] {
+    match current {
+        Some(current) if current.iter().any(|axis| axis.abs() >= f32::EPSILON) => {
+            [0, 1, 2].map(|axis| current[axis].min(next[axis]))
+        }
+        _ => next,
+    }
+}
+
+/// Cells the body occupies for block-inside effects: the box shrunk by 0.001 on every side.
+pub(super) fn inside_cells(player: Aabb) -> Result<([i32; 3], [i32; 3]), WorldQueryError> {
+    const SHRINK: f32 = 0.001;
+    let low = block_at(Vec3::new(
+        f64::from(player.min.x as f32 + SHRINK),
+        f64::from(player.min.y as f32 + SHRINK),
+        f64::from(player.min.z as f32 + SHRINK),
+    ))?;
+    let high = block_at(Vec3::new(
+        f64::from(player.max.x as f32 - SHRINK),
+        f64::from(player.max.y as f32 - SHRINK),
+        f64::from(player.max.z as f32 - SHRINK),
+    ))?;
+    Ok((low, high))
+}
+
+pub(super) fn contains((low, high): ([i32; 3], [i32; 3]), block: [i32; 3]) -> bool {
+    (0..3).all(|axis| low[axis] <= block[axis] && block[axis] <= high[axis])
+}
+
+fn active_surface_response(
+    facts: &crate::BlockPhysicsFacts,
+    player: Aabb,
+    block: [i32; 3],
+) -> SurfaceResponse {
+    if matches!(
+        facts.surface_response,
+        SurfaceResponse::BubbleUp | SurfaceResponse::BubbleDown
+    ) && !(facts.flags.contains(BlockPhysicsFlags::WATER)
+        && fluid_intersects(player, block, facts.fluid_height_blocks))
+    {
+        SurfaceResponse::None
+    } else {
+        facts.surface_response
+    }
+}
+
+/// Tests contact with a block-height volume after rounding its top and actor faces.
+fn fluid_intersects(player: Aabb, block: [i32; 3], height: f64) -> bool {
+    let low = [
+        player.min.x as f32,
+        player.min.y as f32,
+        player.min.z as f32,
+    ];
+    let high = [
+        player.max.x as f32,
+        player.max.y as f32,
+        player.max.z as f32,
+    ];
+    let block = block.map(|coordinate| coordinate as f32);
+    height > 0.0
+        && low[0] < block[0] + 1.0
+        && high[0] > block[0]
+        && low[1] < block[1] + height as f32
+        && high[1] > block[1]
+        && low[2] < block[2] + 1.0
+        && high[2] > block[2]
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    #[test]
+    fn support_cell_subtraction_rounds_before_flooring() {
+        assert_eq!(
+            block_below(Vec3::new(0.0, 16_777_216.0, 0.0)).unwrap(),
+            [0, 16_777_216, 0]
+        );
+    }
+
+    #[test]
+    fn touching_the_rounded_liquid_surface_does_not_count_as_submerged() {
+        let bounds = Aabb::new(
+            Vec3::new(0.25, f64::from(64.1_f32), 0.25),
+            Vec3::new(0.75, 65.0, 0.75),
+        );
+        let height = f64::from(0.1_f32);
+        assert!(bounds.min.y < 64.0 + height);
+        assert!(!fluid_intersects(bounds, [0, 64, 0], height));
+        let below = Aabb::new(
+            Vec3::new(0.25, f64::from(64.1_f32.next_down()), 0.25),
+            bounds.max,
+        );
+        assert!(fluid_intersects(below, [0, 64, 0], height));
+    }
+}
+
+/// Samples support after subtracting the half-block offset in simulation precision.
+pub(super) fn block_below(position: Vec3) -> Result<[i32; 3], WorldQueryError> {
+    block_at(position - Vec3::new(0.0, 0.5, 0.0))
+}
+
+pub(super) fn block_at(position: Vec3) -> Result<[i32; 3], WorldQueryError> {
+    let values = [position.x.floor(), position.y.floor(), position.z.floor()];
+    if values.into_iter().any(|value| {
+        !value.is_finite() || value < f64::from(i32::MIN) || value > f64::from(i32::MAX)
+    }) {
+        return Err(WorldQueryError::CoordinateOutOfRange);
+    }
+    Ok(values.map(|value| value as i32))
+}
+
+/// Converts an exclusive AABB maximum to its final included block using
+/// `ceil(max) - 1`, without subtracting an inexact floating-point epsilon.
+fn inclusive_max_block_at(maximum: Vec3) -> Result<[i32; 3], WorldQueryError> {
+    let mut blocks = [0; 3];
+    for (index, value) in [maximum.x, maximum.y, maximum.z].into_iter().enumerate() {
+        if !value.is_finite() || value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+            return Err(WorldQueryError::CoordinateOutOfRange);
+        }
+        let block = value.ceil() - 1.0;
+        if block < f64::from(i32::MIN) || block > f64::from(i32::MAX) {
+            return Err(WorldQueryError::CoordinateOutOfRange);
+        }
+        blocks[index] = block as i32;
+    }
+    Ok(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two liquid probes have different vertical and horizontal contact margins.
+    #[test]
+    fn liquid_contact_uses_native_shrink_and_clamps_low_poses_to_their_center() {
+        let near_surface = Aabb::player_at(Vec3::new(0.5, 0.5995, 0.5));
+        assert!(!liquid_contact(near_surface, [0, 0, 0], true));
+        assert!(liquid_contact(near_surface, [0, 0, 0], false));
+        let near_side = Aabb::player_at(Vec3::new(1.25, 0.0, 0.5));
+        assert!(liquid_contact(near_side, [0, 0, 0], true));
+        assert!(!liquid_contact(near_side, [0, 0, 0], false));
+        let swimmer = Aabb::player_with_height_at(Vec3::new(0.5, 0.6, 0.5), 0.6);
+        assert!(liquid_contact(swimmer, [0, 0, 0], true));
+    }
+}

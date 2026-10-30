@@ -1,0 +1,540 @@
+use super::*;
+use crate::{DamageShake, ModGrants};
+use cinnabar::extension::{camera::Host as _, events::Host as _, gameplay::Host as _};
+
+/// Intents need movement authority and focused gameplay, commit atomically and expire each frame.
+#[test]
+fn movement_intents_are_granted_focused_and_frame_scoped() {
+    let intents = GameplayMovementIntents {
+        sprint: true,
+        sneak: false,
+    };
+    let mut denied = state(ModGrants::default());
+    denied.controls.frame.focused = true;
+    denied.controls.frame.gameplay = true;
+    assert!(denied.set_movement_intents(Some(intents)).unwrap().is_err());
+    let mut state = state(ModGrants {
+        movement: true,
+        ..Default::default()
+    });
+    assert!(state.set_movement_intents(Some(intents)).unwrap().is_err());
+    assert!(state.set_movement_intents(None).unwrap().is_ok());
+    state.controls.frame.focused = true;
+    state.controls.frame.gameplay = true;
+    state.set_movement_intents(Some(intents)).unwrap().unwrap();
+    assert!(state.world.movement_intents.is_none());
+    state.world.commit();
+    assert_eq!(state.world.movement_intents, Some(intents));
+    state.world.begin_frame();
+    state.world.commit();
+    assert!(
+        state.world.movement_intents.is_none(),
+        "an intent lasts one frame unless renewed"
+    );
+}
+
+/// Control modes need movement authority and focused gameplay, commit atomically and expire
+/// each frame unless renewed; omission is always allowed.
+#[test]
+fn control_modes_are_granted_focused_and_frame_scoped() {
+    let modes = crate::GameplayControlModes {
+        toggle_sprint: true,
+        toggle_sneak: true,
+        always_sprint: false,
+    };
+    let mut denied = state(ModGrants::default());
+    denied.controls.frame.focused = true;
+    denied.controls.frame.gameplay = true;
+    assert!(denied.set_control_modes(Some(modes)).unwrap().is_err());
+    assert!(denied.set_control_modes(None).unwrap().is_err());
+    let mut state = state(ModGrants {
+        movement: true,
+        ..Default::default()
+    });
+    assert!(state.set_control_modes(Some(modes)).unwrap().is_err());
+    assert!(state.set_control_modes(None).unwrap().is_ok());
+    state.controls.frame.focused = true;
+    state.controls.frame.gameplay = true;
+    state.set_control_modes(Some(modes)).unwrap().unwrap();
+    assert!(state.world.control_modes.is_none(), "staged until commit");
+    state.world.commit();
+    assert_eq!(state.world.control_modes, Some(modes));
+    state.world.begin_frame();
+    state.world.commit();
+    assert!(
+        state.world.control_modes.is_none(),
+        "modes last one frame unless renewed"
+    );
+    state.set_control_modes(Some(modes)).unwrap().unwrap();
+    state.set_control_modes(None).unwrap().unwrap();
+    state.world.commit();
+    assert!(
+        state.world.control_modes.is_none(),
+        "omission clears the modes"
+    );
+}
+
+/// The presented camera follows read-frame's grants and frame; the relayed position needs only
+/// packet-delay authority and a delivered sample.
+#[test]
+fn camera_and_relayed_position_reads_follow_their_grants() {
+    let camera = GameplayCameraPose {
+        position: vector(1.0, 66.0, -3.0),
+        yaw: 0.5,
+        pitch: -0.25,
+    };
+    let facts = GameplayFacts {
+        camera: Some(camera),
+        damage_shake: None,
+        relayed_position: Some(vector(4.0, 64.0, 6.0)),
+        use_held: false,
+    };
+    let mut denied = state(ModGrants::default());
+    denied.gameplay_facts = facts;
+    assert!(denied.read_camera().unwrap().is_err());
+    assert!(denied.read_relayed_position().unwrap().is_err());
+    let mut granted = state(ModGrants {
+        terrain: true,
+        packet_delay: true,
+        ..Default::default()
+    });
+    granted.gameplay_facts = facts;
+    assert_eq!(granted.read_camera().unwrap(), Ok(Some(camera)));
+    assert_eq!(
+        granted.read_relayed_position().unwrap(),
+        Ok(facts.relayed_position)
+    );
+    granted.snapshot = None;
+    assert_eq!(
+        granted.read_camera().unwrap(),
+        Ok(None),
+        "the camera needs input-owned gameplay"
+    );
+    assert_eq!(
+        granted.read_relayed_position().unwrap(),
+        Ok(facts.relayed_position)
+    );
+    granted.gameplay_facts = GameplayFacts::default();
+    assert_eq!(granted.read_relayed_position().unwrap(), Ok(None));
+    for invalid in [
+        GameplayFacts {
+            camera: Some(GameplayCameraPose {
+                yaw: f32::NAN,
+                ..camera
+            }),
+            ..facts
+        },
+        GameplayFacts {
+            relayed_position: Some(vector(f32::INFINITY, 0.0, 0.0)),
+            ..facts
+        },
+    ] {
+        assert!(validate_facts(&invalid).is_err());
+    }
+    assert!(validate_facts(&facts).is_ok());
+}
+
+/// The damage shake needs the camera grant rather than a pose grant, stays readable while a
+/// menu owns input, reads none while idle and must be finite to reach a guest.
+#[test]
+fn damage_shake_read_needs_the_camera_grant() {
+    let shake = DamageShake {
+        roll: -9.5,
+        pitch: 0.0,
+    };
+    let facts = GameplayFacts {
+        damage_shake: Some(shake),
+        ..Default::default()
+    };
+    let mut denied = state(ModGrants {
+        players: true,
+        terrain: true,
+        ..Default::default()
+    });
+    denied.gameplay_facts = facts;
+    assert_eq!(
+        denied.read_damage_shake().unwrap(),
+        Err("camera capability denied".into())
+    );
+    let mut granted = state(ModGrants {
+        camera: true,
+        ..Default::default()
+    });
+    granted.gameplay_facts = facts;
+    assert_eq!(granted.read_damage_shake().unwrap(), Ok(Some(shake)));
+    granted.snapshot = None;
+    assert_eq!(
+        granted.read_damage_shake().unwrap(),
+        Ok(Some(shake)),
+        "a menu owning input keeps the shake, as it keeps a tilt"
+    );
+    granted.gameplay_facts = GameplayFacts::default();
+    assert_eq!(granted.read_damage_shake().unwrap(), Ok(None), "idle");
+    for (roll, pitch) in [(f32::NAN, 0.0), (0.0, f32::INFINITY)] {
+        let invalid = GameplayFacts {
+            damage_shake: Some(DamageShake { roll, pitch }),
+            ..facts
+        };
+        assert!(validate_facts(&invalid).is_err());
+    }
+    assert!(validate_facts(&facts).is_ok());
+}
+
+fn vector(x: f32, y: f32, z: f32) -> GameplayVector3 {
+    GameplayVector3 { x, y, z }
+}
+
+fn snapshot() -> GameplaySnapshot {
+    GameplaySnapshot {
+        session: 1,
+        dimension: 0,
+        eye: vector(0.0, 64.0, 0.0),
+        yaw: 0.0,
+        pitch: 0.0,
+        attack_held: false,
+        frame_seconds: 0.016,
+        players: Vec::new(),
+    }
+}
+
+fn mob(x: f32) -> GameplayMob {
+    GameplayMob {
+        runtime_id: 7,
+        unique_id: -7,
+        type_id: "cinnabar:hollow_warden".into(),
+        position: vector(x, 64.0, 0.0),
+        health: Some(200.0),
+        max_health: Some(400.0),
+    }
+}
+
+fn rig(x: f32, z: f32) -> GameplayCameraRig {
+    GameplayCameraRig {
+        offset: vector(x, 0.5, z),
+        roll: 0.1,
+        fov_delta: 5.0,
+    }
+}
+
+fn granted() -> ModGrants {
+    ModGrants {
+        camera: true,
+        entities: true,
+        commands: vec!["ability".into()],
+        ..Default::default()
+    }
+}
+
+fn state(grants: ModGrants) -> State {
+    let mut state = State::new(grants, String::new(), Default::default());
+    state.snapshot = Some(snapshot());
+    state.world.mobs = vec![mob(3.0)];
+    state
+}
+
+#[test]
+fn new_capabilities_are_denied_by_default() {
+    let mut state = state(ModGrants::default());
+    assert!(state.read_mobs().unwrap().is_err());
+    assert!(state.set_camera_rig(Some(rig(0.8, 3.0))).unwrap().is_err());
+    assert!(state.set_camera_rig(None).unwrap().is_err());
+    assert!(
+        state
+            .request_command("/ability flash".into())
+            .unwrap()
+            .is_err()
+    );
+    state.world.commit();
+    assert_eq!(state.world.rig, None);
+    assert!(state.world.commands.is_empty());
+}
+
+#[test]
+fn granted_reads_return_only_the_current_frame_mobs() {
+    let mut state = state(granted());
+    assert_eq!(state.read_mobs().unwrap().unwrap(), vec![mob(3.0)]);
+    state.world.begin_frame();
+    assert!(state.read_mobs().unwrap().unwrap().is_empty());
+}
+
+#[test]
+fn rig_bounds_and_frame_requirement_are_enforced() {
+    let mut state = state(granted());
+    for bad in [
+        rig(MAX_RIG_SIDE_BLOCKS + 0.1, 3.0),
+        rig(0.0, -0.1),
+        rig(0.0, MAX_RIG_BACK_BLOCKS + 0.1),
+        rig(f32::NAN, 3.0),
+        GameplayCameraRig {
+            roll: MAX_RIG_ROLL_RADIANS + 0.1,
+            ..rig(0.0, 3.0)
+        },
+        GameplayCameraRig {
+            fov_delta: -MAX_RIG_FOV_DELTA_DEGREES - 1.0,
+            ..rig(0.0, 3.0)
+        },
+    ] {
+        assert!(state.set_camera_rig(Some(bad)).unwrap().is_err());
+    }
+    state.snapshot = None;
+    assert!(state.set_camera_rig(Some(rig(0.8, 3.0))).unwrap().is_err());
+    assert!(state.set_camera_rig(None).unwrap().is_ok());
+}
+
+#[test]
+fn rig_is_retained_across_frames_until_cleared() {
+    let mut state = state(granted());
+    state.set_camera_rig(Some(rig(0.8, 3.0))).unwrap().unwrap();
+    assert_eq!(state.world.rig, None, "staged until the callback returns");
+    state.world.commit();
+    assert_eq!(state.world.rig, Some(rig(0.8, 3.0)));
+    state.world.begin_frame();
+    state.world.commit();
+    assert_eq!(state.world.rig, Some(rig(0.8, 3.0)));
+    state.set_camera_rig(None).unwrap().unwrap();
+    state.world.commit();
+    assert_eq!(state.world.rig, None);
+}
+
+#[test]
+fn commands_must_name_a_granted_command_in_printable_text() {
+    let mut state = state(granted());
+    for bad in [
+        "ability flash",
+        "/abilityx flash",
+        "/op me",
+        "/ability \u{a7}flash",
+        "/ability\tflash",
+    ] {
+        assert!(state.request_command(bad.into()).unwrap().is_err(), "{bad}");
+    }
+    let long = format!("/ability {}", "x".repeat(MAX_COMMAND_BYTES));
+    assert!(state.request_command(long).unwrap().is_err());
+    state.snapshot = None;
+    assert!(state.request_command("/ability".into()).unwrap().is_err());
+    state.snapshot = Some(snapshot());
+    state
+        .request_command("/ability beam start".into())
+        .unwrap()
+        .unwrap();
+    state.request_command("/ability".into()).unwrap().unwrap();
+    state.world.commit();
+    assert_eq!(state.world.commands, ["/ability beam start", "/ability"]);
+}
+
+#[test]
+fn per_frame_command_and_cue_budgets_trap() {
+    let mut state = state(granted());
+    for _ in 0..MAX_COMMANDS_PER_FRAME {
+        state
+            .request_command("/ability flash".into())
+            .unwrap()
+            .unwrap();
+    }
+    assert!(state.request_command("/ability flash".into()).is_err());
+    for _ in 0..MAX_CUES_PER_FRAME {
+        state
+            .emit("ability.flash".into(), vec![1.0])
+            .unwrap()
+            .unwrap();
+    }
+    assert!(state.emit("ability.flash".into(), Vec::new()).is_err());
+}
+
+#[test]
+fn cues_need_short_names_and_finite_values() {
+    let mut state = state(ModGrants::default());
+    assert!(state.emit(String::new(), Vec::new()).unwrap().is_err());
+    assert!(state.emit("Upper".into(), Vec::new()).unwrap().is_err());
+    assert!(
+        state
+            .emit("x".repeat(MAX_CUE_NAME_BYTES + 1), Vec::new())
+            .unwrap()
+            .is_err()
+    );
+    assert!(state.emit("a".into(), vec![f32::NAN]).unwrap().is_err());
+    assert!(
+        state
+            .emit("a".into(), vec![0.0; MAX_CUE_VALUES + 1])
+            .unwrap()
+            .is_err()
+    );
+    state
+        .emit("camera.dodge".into(), vec![-1.0])
+        .unwrap()
+        .unwrap();
+    state.world.commit();
+    assert_eq!(
+        state.world.cues,
+        [ModCue {
+            name: "camera.dodge".into(),
+            values: vec![-1.0]
+        }]
+    );
+    state.world.begin_frame();
+    assert!(state.world.cues.is_empty());
+}
+
+#[test]
+fn host_mob_input_is_bounded_by_count_range_and_frame() {
+    let frame = snapshot();
+    assert!(validate_mobs(Some(&frame), &[mob(3.0)]).is_ok());
+    assert!(validate_mobs(None, &[mob(3.0)]).is_err());
+    assert!(validate_mobs(Some(&frame), &[mob(MAX_MOB_RANGE_BLOCKS + 1.0)]).is_err());
+    assert!(validate_mobs(Some(&frame), &vec![mob(1.0); MAX_GAMEPLAY_MOBS + 1]).is_err());
+    let mut unnamed = mob(1.0);
+    unnamed.type_id.clear();
+    assert!(validate_mobs(Some(&frame), &[unnamed]).is_err());
+    let mut bad_health = mob(1.0);
+    bad_health.health = Some(f32::INFINITY);
+    assert!(validate_mobs(Some(&frame), &[bad_health]).is_err());
+}
+
+#[test]
+fn command_grants_reject_non_names() {
+    for commands in [
+        vec!["Ability".to_owned()],
+        vec!["ab ility".to_owned()],
+        vec![String::new()],
+        vec!["a".to_owned(); mod_api::MAX_COMMAND_GRANTS + 1],
+    ] {
+        let grants = ModGrants {
+            commands,
+            ..Default::default()
+        };
+        assert!(grants.validate().is_err());
+    }
+    assert!(granted().validate().is_ok());
+}
+
+#[test]
+fn commands_are_rate_limited_per_second_of_frame_time() {
+    let mut state = state(granted());
+    let mut sent = 0;
+    for _ in 0..MAX_COMMANDS_PER_SECOND * 2 {
+        state.world.begin_frame();
+        state.world.advance_command_window(0.01);
+        if state
+            .request_command("/ability flash".into())
+            .unwrap()
+            .is_ok()
+        {
+            sent += 1;
+        }
+        state.world.commit();
+    }
+    assert_eq!(sent, MAX_COMMANDS_PER_SECOND);
+    state.world.advance_command_window(1.0);
+    assert!(
+        state
+            .request_command("/ability flash".into())
+            .unwrap()
+            .is_ok()
+    );
+}
+
+fn cue(name: &str) -> ModCue {
+    ModCue {
+        name: name.into(),
+        values: vec![1.0],
+    }
+}
+
+#[test]
+fn delivered_cues_are_filtered_bounded_and_polled_within_budget() {
+    let mut delivered = vec![cue("Bad Name"), cue("ability.flash")];
+    delivered.extend(std::iter::repeat_n(cue("x"), MAX_INCOMING_CUES + 4));
+    let kept = incoming(delivered);
+    assert_eq!(kept.len(), MAX_INCOMING_CUES);
+    assert_eq!(kept[0], cue("ability.flash"));
+    assert!(
+        incoming(vec![ModCue {
+            name: "a".into(),
+            values: vec![f32::NAN]
+        }])
+        .is_empty()
+    );
+
+    let mut state = state(ModGrants::default());
+    state.world.incoming = vec![cue("ability.flash")];
+    for _ in 0..MAX_IMPORT_WRITES {
+        assert_eq!(state.poll().unwrap(), [cue("ability.flash")]);
+    }
+    assert!(state.poll().is_err(), "poll budget traps");
+}
+
+/// Builds eligible grounded movement for the current gameplay fixture.
+fn movement() -> GameplayMovementSnapshot {
+    GameplayMovementSnapshot {
+        session: 1,
+        dimension: 0,
+        tick: 20,
+        velocity: vector(0.1, -0.08, 0.1),
+        on_ground: true,
+        jump_held: false,
+        sprint_held: false,
+        sneak_held: false,
+        eligible: true,
+        knockback_sequence: 1,
+    }
+}
+
+#[test]
+fn movement_input_requires_explicit_grant_and_eligible_frame() {
+    let mut denied = state(ModGrants::default());
+    denied.motion.snapshot = Some(movement());
+    assert!(denied.read_movement().unwrap().is_err());
+    assert!(denied.pulse_jump().unwrap().is_err());
+    assert!(!denied.motion.pending_jump);
+    let mut granted = state(ModGrants {
+        movement: true,
+        ..Default::default()
+    });
+    assert_eq!(granted.read_movement().unwrap().unwrap(), None);
+    assert!(granted.pulse_jump().unwrap().is_err());
+    for (eligible, held) in [(false, false), (true, true)] {
+        granted.motion.snapshot = Some(GameplayMovementSnapshot {
+            eligible,
+            jump_held: held,
+            ..movement()
+        });
+        assert!(granted.pulse_jump().unwrap().is_err());
+    }
+    granted.motion.snapshot = Some(movement());
+    assert_eq!(
+        granted.read_movement().unwrap().unwrap(),
+        Some(movement().into())
+    );
+    granted.pulse_jump().unwrap().unwrap();
+    assert!(granted.motion.pending_jump);
+    assert!(
+        !granted.motion.jump_pulse,
+        "not committed during guest callback"
+    );
+    for _ in granted.motion.writes..MAX_IMPORT_WRITES {
+        granted.pulse_jump().unwrap().unwrap();
+    }
+    assert!(granted.pulse_jump().is_err(), "bounded import budget traps");
+}
+
+#[test]
+fn movement_snapshot_rejects_nonfinite_or_foreign_authority() {
+    assert!(validate_movement(Some(&snapshot()), Some(&movement())).is_ok());
+    assert!(validate_movement(None, Some(&movement())).is_err());
+    for bad in [
+        GameplayMovementSnapshot {
+            session: 2,
+            ..movement()
+        },
+        GameplayMovementSnapshot {
+            dimension: 1,
+            ..movement()
+        },
+        GameplayMovementSnapshot {
+            velocity: vector(f32::NAN, 0.0, 0.0),
+            ..movement()
+        },
+    ] {
+        assert!(validate_movement(Some(&snapshot()), Some(&bad)).is_err());
+    }
+}

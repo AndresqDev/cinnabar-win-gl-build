@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "colors": [
+    {
+      "name": "white",
+      "tint": 2
+    },
+    {
+      "name": "orange",
+      "tint": 3
+    },
+    {
+      "name": "magenta",
+      "tint": 4
+    },
+    {
+      "name": "light_blue",
+      "tint": 5
+    },
+    {
+      "name": "yellow",
+      "tint": 6
+    },
+    {
+      "name": "lime",
+      "tint": 7
+    },
+    {
+      "name": "pink",
+      "tint": 8
+    },
+    {
+      "name": "gray",
+      "tint": 9
+    },
+    {
+      "name": "light_gray",
+      "tint": 10
+    },
+    {
+      "name": "cyan",
+      "tint": 11
+    },
+    {
+      "name": "purple",
+      "tint": 12
+    },
+    {
+      "name": "blue",
+      "tint": 13
+    },
+    {
+      "name": "brown",
+      "tint": 14
+    },
+    {
+      "name": "green",
+      "tint": 15
+    },
+    {
+      "name": "red",
+      "tint": 16
+    },
+    {
+      "name": "black",
+      "tint": 17
+    }
+  ],
+  "variants": [
+    "stained_glass",
+    "stained_glass_pane",
+    "hard_stained_glass",
+    "hard_stained_glass_pane"
+  ]
+}

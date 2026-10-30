@@ -1,0 +1,979 @@
+use super::*;
+use semantic_input::{InputContext, PhysicalControl};
+
+use super::BindingId;
+use super::SettingId;
+#[test]
+fn interactive_sharing_preserves_active_late_defaults_across_reset_and_reload() {
+    let hotbar = KEY_BINDINGS
+        .iter()
+        .position(|(action, _)| *action == semantic_input::Action::Hotbar1)
+        .unwrap();
+    for action in [
+        semantic_input::Action::Freelook,
+        semantic_input::Action::InteractWithToast,
+    ] {
+        let row = KEY_BINDINGS
+            .iter()
+            .position(|(candidate, _)| *candidate == action)
+            .unwrap();
+        let mut settings = SettingsOptions::default();
+        let default = settings.key_control(row).unwrap();
+        assert!(settings.remap(hotbar, default));
+        assert_eq!(settings.key_control(row), Some(default));
+        assert!(settings.remap(row, PhysicalControl::KeyboardUsage(0x15)));
+        assert!(settings.reset_key(row));
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.key_control(row), Some(default));
+        assert_eq!(loaded.key_control(hotbar), Some(default));
+        assert!(
+            loaded
+                .controls()
+                .unwrap()
+                .bindings()
+                .iter()
+                .any(|binding| { binding.action == action && binding.chord.control == default })
+        );
+    }
+}
+
+#[test]
+fn perspective_and_hotbar_can_share_a_key_across_remaps_reset_and_reload() {
+    let mut settings = SettingsOptions::default();
+    let perspective = KEY_BINDINGS
+        .iter()
+        .position(|(action, _)| *action == semantic_input::Action::CyclePerspective)
+        .unwrap();
+    let hotbar = KEY_BINDINGS
+        .iter()
+        .position(|(action, _)| *action == semantic_input::Action::Hotbar1)
+        .unwrap();
+    let digit = settings.key_control(hotbar).unwrap();
+    let letter = PhysicalControl::KeyboardUsage(0x15);
+    assert!(settings.remap(hotbar, letter));
+    assert!(settings.remap(perspective, digit));
+    assert!(settings.remap(hotbar, digit));
+    assert!(settings.remap(hotbar, letter));
+    assert!(settings.reset_key(hotbar));
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(loaded.key_control(perspective), Some(digit));
+    assert_eq!(loaded.key_control(hotbar), Some(digit));
+    let mut router = semantic_input::SemanticInputRouter::default();
+    router.replace_bindings(loaded.controls().unwrap()).unwrap();
+    router
+        .route(semantic_input::DeviceFrame {
+            keyboard_mouse: Some(semantic_input::KeyboardMouseFrame {
+                keys: vec![match digit {
+                    PhysicalControl::KeyboardUsage(usage) => usage,
+                    _ => panic!("hotbar keyboard default must be a key"),
+                }],
+                activity_sequence: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let pressed = router.finalize().unwrap();
+    for action in [
+        semantic_input::Action::CyclePerspective,
+        semantic_input::Action::Hotbar1,
+    ] {
+        assert!(pressed.phases[action as usize].pressed);
+    }
+    router.route(Default::default()).unwrap();
+    let released = router.finalize().unwrap();
+    for action in [
+        semantic_input::Action::CyclePerspective,
+        semantic_input::Action::Hotbar1,
+    ] {
+        assert_eq!(released.phases[action as usize], Default::default());
+    }
+}
+
+#[test]
+fn chat_position_defaults_to_bottom_persists_and_resets_only_with_video() {
+    let mut settings = SettingsOptions::decode(br#"{"values":{}}"#).unwrap();
+    assert!(!settings.chat_at_top());
+    let index = SETTINGS_OPTIONS
+        .iter()
+        .position(|option| option.name == CHAT_POSITION_OPTION.name)
+        .unwrap();
+    settings.set(index, CHAT_POSITION_OPTION.max);
+    let mut saved = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(saved.chat_at_top());
+    saved.reset_group(SettingsGroup::Accessibility);
+    assert!(saved.chat_at_top());
+    saved.reset_group(SettingsGroup::Video);
+    assert!(!saved.chat_at_top());
+}
+
+#[test]
+fn existing_f_binding_survives_freelook_default() {
+    let settings =
+        SettingsOptions::decode(br#"{"keys":{"key.drop":9,"key.inventory":12}}"#).unwrap();
+    assert_eq!(
+        settings.named_key_control(BindingId::Drop),
+        Some(PhysicalControl::KeyboardUsage(9))
+    );
+    assert_eq!(
+        settings.named_key_control(BindingId::Inventory),
+        Some(PhysicalControl::KeyboardUsage(12))
+    );
+    assert_eq!(settings.named_key_control(BindingId::Freelook), None);
+    let controls = settings.controls().unwrap();
+    assert!(
+        !controls
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == semantic_input::Action::Freelook)
+    );
+}
+
+#[test]
+fn freelook_defaults_to_f_and_remaps_to_mouse_across_reload() {
+    let mut settings = SettingsOptions::default();
+    let row = KEY_BINDINGS
+        .iter()
+        .position(|(action, _)| *action == semantic_input::Action::Freelook)
+        .unwrap();
+    assert_eq!(
+        settings.key_control(row),
+        Some(PhysicalControl::KeyboardUsage(0x09))
+    );
+    assert!(settings.remap(row, PhysicalControl::MouseButton(4)));
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    let controls = loaded.controls().unwrap();
+    let mut router = semantic_input::SemanticInputRouter::default();
+    router.replace_bindings(controls).unwrap();
+    router
+        .route(semantic_input::DeviceFrame {
+            keyboard_mouse: Some(semantic_input::KeyboardMouseFrame {
+                activity_sequence: 1,
+                mouse_buttons: vec![4],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(router.finalize().unwrap().phases[semantic_input::Action::Freelook as usize].held);
+}
+
+#[test]
+fn open_notification_defaults_to_n_and_remaps_across_reload() {
+    let mut settings = SettingsOptions::default();
+    let row = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == OPEN_NOTIFICATION_KEY)
+        .unwrap();
+    assert_eq!(
+        KEY_BINDINGS[row].0,
+        semantic_input::Action::InteractWithToast
+    );
+    assert_eq!(
+        settings.named_key_control(BindingId::InteractWithToast),
+        Some(PhysicalControl::KeyboardUsage(0x11))
+    );
+    assert!(settings.remap(row, PhysicalControl::KeyboardUsage(0x08)));
+    assert!(settings.remap(row, PhysicalControl::KeyboardUsage(0x0f)));
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(
+        loaded.named_key_control(BindingId::InteractWithToast),
+        Some(PhysicalControl::KeyboardUsage(0x0f))
+    );
+    let mut router = semantic_input::SemanticInputRouter::default();
+    router.replace_bindings(loaded.controls().unwrap()).unwrap();
+    router
+        .route(semantic_input::DeviceFrame {
+            keyboard_mouse: Some(semantic_input::KeyboardMouseFrame {
+                activity_sequence: 1,
+                keys: vec![0x0f],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let phases = router.finalize().unwrap().phases;
+    assert!(phases[semantic_input::Action::InteractWithToast as usize].pressed);
+}
+
+#[test]
+fn a_saved_layout_already_using_n_keeps_it_over_the_open_notification_default() {
+    let settings = SettingsOptions::decode(br#"{"keys":{"key.drop":17}}"#).unwrap();
+    assert_eq!(
+        settings.named_key_control(BindingId::Drop),
+        Some(PhysicalControl::KeyboardUsage(0x11))
+    );
+    assert_eq!(
+        settings.named_key_control(BindingId::InteractWithToast),
+        None
+    );
+    assert!(
+        !settings
+            .controls()
+            .unwrap()
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == semantic_input::Action::InteractWithToast)
+    );
+}
+
+/// Finds an option through the same stable controller identifier used on disk.
+fn index(name: &str) -> usize {
+    SETTINGS_OPTIONS
+        .iter()
+        .position(|option| option.name == name)
+        .unwrap()
+}
+
+#[test]
+fn all_option_families_round_trip_and_reject_unknown_fields() {
+    let mut settings = SettingsOptions::default();
+    for (index, definition) in SETTINGS_OPTIONS.iter().enumerate() {
+        if matches!(definition.kind, SettingKind::Host) {
+            continue;
+        }
+        assert_eq!(settings.get(index), definition.default);
+        assert!(definition.min <= definition.default && definition.default <= definition.max);
+        settings.set(index, definition.min);
+    }
+    let bytes = serde_json::to_vec(&settings).unwrap();
+    assert_eq!(SettingsOptions::decode(&bytes).unwrap(), settings);
+    let loaded =
+        SettingsOptions::decode(br#"{"values":{"gamma":500,"field_of_view":-20,"unknown":100}}"#)
+            .unwrap();
+    assert_eq!(
+        loaded.value(SettingId::Gamma),
+        SETTINGS_OPTIONS[index("gamma")].max
+    );
+    assert_eq!(
+        loaded.value(SettingId::FieldOfView),
+        SETTINGS_OPTIONS[index("field_of_view")].min
+    );
+    assert!(!loaded.values.contains_key("unknown"));
+    assert!(SettingsOptions::decode(b"broken").is_none());
+}
+
+/// The FOV slider uses the shared maximum for video settings.
+#[test]
+fn field_of_view_slider_uses_the_shared_maximum() {
+    let slider = &SETTINGS_OPTIONS[index("field_of_view")];
+    assert_eq!(slider.max, ui::MAX_FOV_DEGREES);
+}
+
+/// Fresh user settings and the FOV slider must start from the same vanilla default.
+#[test]
+fn fresh_settings_use_the_field_of_view_slider_default() {
+    let slider = &SETTINGS_OPTIONS[index("field_of_view")];
+    assert_eq!(
+        ui::UserSettings::default().video.horizontal_fov_degrees,
+        slider.default as f32
+    );
+    assert_eq!(
+        SettingsOptions::default()
+            .user_settings()
+            .video
+            .horizontal_fov_degrees,
+        ui::UserSettings::default().video.horizontal_fov_degrees
+    );
+}
+
+#[test]
+fn remapped_keyboard_controls_reach_gameplay_and_survive_reload() {
+    let mut settings = SettingsOptions::default();
+    let index = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == "key.forward")
+        .unwrap();
+    let new_key = PhysicalControl::KeyboardUsage(0x0c);
+    assert!(settings.remap(index, new_key));
+    let restored = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(restored.key_control(index), Some(new_key));
+    let controls = restored.user_settings().controls;
+    assert!(controls.bindings().iter().any(|binding| binding.action
+        == semantic_input::Action::MoveForward
+        && binding.context == InputContext::Gameplay
+        && binding.chord.control == new_key));
+    assert!(settings.remap(index, PhysicalControl::KeyboardUsage(0x16)));
+    settings.reset_key(index);
+    assert_eq!(
+        settings.key_control(index),
+        SettingsOptions::default().key_control(index)
+    );
+}
+
+#[test]
+fn settings_file_replacement_round_trips() {
+    let directory = std::env::temp_dir().join(format!("cinnabar-settings-{}", std::process::id()));
+    let path = directory.join(SETTINGS_FILE);
+    let mut settings = SettingsOptions::default();
+    settings.set(index("gamma"), 80);
+    settings.save(&path).unwrap();
+    assert_eq!(SettingsOptions::load(&path), settings);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn reset_restores_a_shared_default_without_changing_other_actions() {
+    let mut settings = SettingsOptions::default();
+    let forward = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == "key.forward")
+        .unwrap();
+    let backward = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == "key.back")
+        .unwrap();
+    let default_forward = settings.key_control(forward).unwrap();
+    assert!(settings.remap(forward, PhysicalControl::KeyboardUsage(0x0c)));
+    assert!(settings.remap(backward, default_forward));
+    assert!(settings.reset_key(forward));
+    assert_eq!(settings.key_control(forward), Some(default_forward));
+    assert_eq!(settings.key_control(backward), Some(default_forward));
+}
+
+#[test]
+fn chat_settings_survive_reload_and_feed_the_chat_renderer() {
+    let mut settings = SettingsOptions::default();
+    for (name, value) in [
+        ("chat_font_size", 15),
+        ("chat_line_spacing", 25),
+        ("chat_color", 3),
+        ("chat_message_duration", 2),
+    ] {
+        settings.set(index(name), value);
+    }
+    let restored = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(restored.chat_font_scale(), 1.5);
+    assert_eq!(restored.chat_line_padding(), 2.501);
+    assert_eq!(restored.chat_color_code(), 'c');
+    assert_eq!(restored.chat_lifetime(), 30.0);
+}
+
+#[test]
+fn gamepad_remaps_reach_router_and_reset_independently() {
+    use super::{GAMEPAD_BINDINGS, GAMEPAD_OFFSET};
+    let mut settings = SettingsOptions::default();
+    let jump = GAMEPAD_OFFSET
+        + GAMEPAD_BINDINGS
+            .iter()
+            .position(|(_, name)| *name == "key.jump")
+            .unwrap();
+    assert!(settings.remap(jump, PhysicalControl::GamepadButton(3)));
+    assert!(!settings.remap(jump, PhysicalControl::KeyboardUsage(0x0c)));
+    let keyboard = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == "key.forward")
+        .unwrap();
+    assert!(settings.remap(keyboard, PhysicalControl::KeyboardUsage(0x0c)));
+    let mut restored = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(
+        restored
+            .user_settings()
+            .controls
+            .bindings()
+            .iter()
+            .any(|binding| binding.action == semantic_input::Action::Jump
+                && binding.context == InputContext::Gameplay
+                && binding.chord.control == PhysicalControl::GamepadButton(3))
+    );
+    restored.reset_bindings(false);
+    assert_eq!(
+        restored.key_control(jump),
+        Some(PhysicalControl::GamepadButton(3))
+    );
+    assert_eq!(
+        restored.key_control(keyboard),
+        SettingsOptions::default().key_control(keyboard)
+    );
+    restored.reset_bindings(true);
+    assert_eq!(
+        restored.key_control(jump),
+        SettingsOptions::default().key_control(jump)
+    );
+}
+
+#[test]
+fn resetting_a_ui_key_keeps_another_action_on_the_shared_default() {
+    use super::EXTRA_KEYS;
+    let mut settings = SettingsOptions::default();
+    let inventory = KEY_BINDINGS.len()
+        + EXTRA_KEYS
+            .iter()
+            .position(|(name, _)| *name == "key.inventory")
+            .unwrap();
+    let attack = KEY_BINDINGS
+        .iter()
+        .position(|(_, name)| *name == "key.attack")
+        .unwrap();
+    assert!(settings.remap(inventory, PhysicalControl::KeyboardUsage(0x0c)));
+    assert!(settings.remap(attack, PhysicalControl::KeyboardUsage(0x08)));
+    assert!(settings.reset_key(inventory));
+    assert_eq!(
+        settings.key_control(inventory),
+        Some(PhysicalControl::KeyboardUsage(0x08))
+    );
+    assert_eq!(
+        settings.key_control(attack),
+        settings.key_control(inventory)
+    );
+}
+
+#[test]
+fn every_supplemental_binding_survives_reload_and_individual_reset() {
+    use super::{EXTRA_GAMEPAD, EXTRA_KEYS, GAMEPAD_BINDINGS, GAMEPAD_OFFSET};
+    for (row, _) in EXTRA_KEYS.iter().enumerate() {
+        let mut settings = SettingsOptions::default();
+        let index = KEY_BINDINGS.len() + row;
+        let control = PhysicalControl::KeyboardUsage(0x45);
+        assert!(settings.remap(index, control));
+        let mut restored =
+            SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.key_control(index), Some(control));
+        assert!(restored.reset_key(index));
+        assert_eq!(
+            restored.key_control(index),
+            SettingsOptions::default().key_control(index)
+        );
+    }
+    for (row, _) in EXTRA_GAMEPAD.iter().enumerate() {
+        let mut settings = SettingsOptions::default();
+        let index = GAMEPAD_OFFSET + GAMEPAD_BINDINGS.len() + row;
+        let control = PhysicalControl::GamepadButton(9);
+        assert!(settings.remap(index, control));
+        let mut restored =
+            SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.key_control(index), Some(control));
+        assert!(restored.reset_key(index));
+        assert_eq!(
+            restored.key_control(index),
+            SettingsOptions::default().key_control(index)
+        );
+    }
+}
+
+#[test]
+fn untouched_and_legacy_options_keep_block_outline_selection() {
+    assert!(
+        SettingsOptions::default()
+            .user_settings()
+            .video
+            .outline_selection
+    );
+    for saved in [b"{}".as_slice(), br#"{"values":{"gamma":40}}"#.as_slice()] {
+        let restored = SettingsOptions::decode(saved).unwrap();
+        assert!(restored.user_settings().video.outline_selection);
+    }
+}
+
+#[test]
+fn outline_selection_reaches_render_settings_after_persistence() {
+    let mut settings = SettingsOptions::default();
+    for enabled in [true, false] {
+        settings.set(index("classic_box_selection"), i32::from(enabled));
+        let restored = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.user_settings().video.outline_selection, enabled);
+    }
+}
+
+#[test]
+fn loaded_supplemental_bindings_can_share_gameplay_controls() {
+    let loaded = SettingsOptions::decode(br#"{"keys":{"key.inventory":257}}"#).unwrap();
+    assert_eq!(
+        loaded.named_key_control(BindingId::Inventory),
+        Some(PhysicalControl::MouseButton(1))
+    );
+    assert_eq!(
+        loaded.named_key_control(BindingId::Attack),
+        loaded.named_key_control(BindingId::Inventory)
+    );
+}
+
+#[test]
+fn always_sprint_defaults_off_and_persists_into_runtime_settings() {
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.user_settings().gameplay.always_sprint);
+    settings.set(index("always_sprint"), 1);
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(loaded.user_settings().gameplay.always_sprint);
+    let legacy =
+        SettingsOptions::decode(br#"{"values":{"keyboard_mouse_sensitivity":75}}"#).unwrap();
+    assert!(!legacy.user_settings().gameplay.always_sprint);
+}
+
+#[test]
+fn vsync_defaults_and_saved_toggle_values_survive_loading() {
+    use render_api::VsyncMode;
+    assert_eq!(
+        SettingsOptions::default().user_settings().video.vsync,
+        VsyncMode::DEFAULT
+    );
+    let legacy = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    assert_eq!(legacy.user_settings().video.vsync, VsyncMode::DEFAULT);
+    for mode in VsyncMode::ALL {
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"values":{"vsync": mode as i32}})).unwrap();
+        let loaded = SettingsOptions::decode(&bytes).unwrap();
+        assert_eq!(loaded.user_settings().video.vsync, mode);
+        let saved = SettingsOptions::decode(&serde_json::to_vec(&loaded).unwrap()).unwrap();
+        assert_eq!(saved.user_settings().video.vsync, mode);
+    }
+}
+
+#[test]
+fn motion_blur_defaults_off_persists_every_preset_and_resets_with_video() {
+    let mut settings = SettingsOptions::default();
+    let index = index(MOTION_BLUR_OPTION.name);
+    assert_eq!(
+        settings.user_settings().video.motion_blur,
+        ui::MotionBlurQuality::Off
+    );
+    for preset in ui::MotionBlurQuality::ALL {
+        settings.set(index, preset.index());
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.user_settings().video.motion_blur, preset);
+        assert_eq!(
+            MOTION_BLUR_CHOICES[preset.index() as usize].label,
+            preset.label()
+        );
+    }
+    settings.reset_group(SettingsGroup::Audio);
+    assert_eq!(
+        settings.user_settings().video.motion_blur,
+        ui::MotionBlurQuality::High
+    );
+    settings.reset_group(SettingsGroup::Video);
+    assert_eq!(
+        settings.user_settings().video.motion_blur,
+        ui::MotionBlurQuality::Off
+    );
+    let legacy = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    assert_eq!(
+        legacy.user_settings().video.motion_blur,
+        ui::MotionBlurQuality::Off
+    );
+}
+
+#[test]
+fn exact_server_ping_is_optional_and_persists_with_settings() {
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.exact_server_ping());
+    settings.set(index(SHOW_EXACT_SERVER_PING), 1);
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(loaded.exact_server_ping());
+    let legacy = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    assert!(!legacy.exact_server_ping());
+}
+
+#[test]
+fn dark_mode_defaults_off_persists_and_resets_with_video_settings() {
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.oreui_dark_mode());
+    settings.set(index(OREUI_DARK_MODE), 1);
+    let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(loaded.oreui_dark_mode());
+    loaded.reset_group(SettingsGroup::Audio);
+    assert!(loaded.oreui_dark_mode());
+    loaded.reset_group(SettingsGroup::Video);
+    assert!(!loaded.oreui_dark_mode());
+    let legacy = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    assert!(!legacy.oreui_dark_mode());
+}
+
+#[test]
+fn diagnostics_settings_default_off_persist_and_survive_group_resets() {
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.verbose_logging());
+    assert!(!settings.record_network_session());
+    assert!(settings.set(SettingId::VerboseLogging.index(), 1));
+    assert!(settings.set(SettingId::RecordNetworkSession.index(), 1));
+    let encoded = serde_json::to_value(&settings).unwrap();
+    assert_eq!(encoded["values"]["verbose_logging"], 1);
+    assert_eq!(encoded["values"]["record_network_session"], 1);
+    let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(loaded.verbose_logging());
+    assert!(loaded.record_network_session());
+    for group in [
+        SettingsGroup::Video,
+        SettingsGroup::Audio,
+        SettingsGroup::Accessibility,
+        SettingsGroup::Chat,
+    ] {
+        loaded.reset_group(group);
+    }
+    assert!(loaded.verbose_logging() && loaded.record_network_session());
+    assert!(loaded.set(SettingId::RecordNetworkSession.index(), 0));
+    let loaded = SettingsOptions::decode(&serde_json::to_vec(&loaded).unwrap()).unwrap();
+    assert!(loaded.verbose_logging());
+    assert!(!loaded.record_network_session());
+}
+
+#[test]
+fn extra_large_ui_persists_and_resets() {
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.extra_large_ui());
+    assert!(settings.set(index(EXTRA_LARGE_UI), 1));
+    let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(loaded.extra_large_ui());
+    loaded.reset_group(SettingsGroup::Audio);
+    assert!(loaded.extra_large_ui());
+    loaded.reset_group(SettingsGroup::Video);
+    assert!(!loaded.extra_large_ui());
+    assert!(
+        !SettingsOptions::decode(br#"{"values":{}}"#)
+            .unwrap()
+            .extra_large_ui()
+    );
+}
+
+#[test]
+fn animations_default_to_bedrock_and_persist_both_choices() {
+    let mut settings = SettingsOptions::default();
+    let index = index("animations");
+    assert_eq!(settings.get(index), 1);
+    assert!(!settings.user_settings().video.java_animations);
+    for choice in [1, 0] {
+        settings.set(index, choice);
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.get(index), choice);
+        assert_eq!(loaded.user_settings().video.java_animations, choice == 0);
+    }
+    let untouched = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    assert!(!untouched.user_settings().video.java_animations);
+    settings.set(index, 0);
+    settings.reset_group(super::SettingsGroup::Video);
+    assert!(!settings.user_settings().video.java_animations);
+}
+
+/// Old toggle values retain their meaning, Minimal persists and Video reset restores Full.
+#[test]
+fn view_bobbing_preserves_toggle_values_and_persists_minimal() {
+    let mut settings = SettingsOptions::default();
+    let id = SettingId::ViewBobbing;
+    assert_eq!(
+        settings.user_settings().video.view_bobbing,
+        ui::ViewBobbing::Full
+    );
+    assert_eq!(VIEW_BOBBING_CHOICES.len(), ui::ViewBobbing::ALL.len());
+    for (value, mode) in ui::ViewBobbing::ALL.into_iter().enumerate() {
+        assert_eq!(mode as usize, value);
+        assert_eq!(VIEW_BOBBING_CHOICES[value].label, mode.label());
+        settings.set(id.index(), mode as i32);
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.value(id), mode as i32);
+        assert_eq!(loaded.user_settings().video.view_bobbing, mode);
+    }
+    for (toggle, expected) in [(0, ui::ViewBobbing::Off), (1, ui::ViewBobbing::Full)] {
+        let legacy = serde_json::json!({ "schema": 1, "values": { id.name(): toggle } });
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.user_settings().video.view_bobbing, expected);
+    }
+    settings.reset_group(SettingsGroup::Video);
+    assert_eq!(
+        settings.user_settings().video.view_bobbing,
+        ui::ViewBobbing::Full
+    );
+}
+
+#[test]
+fn animations_migrate_legacy_toggle_without_overriding_a_saved_selection() {
+    for (toggle, choice) in [(0, 1), (1, 0)] {
+        let legacy = serde_json::json!({ "values": { "java_animations": toggle } });
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.value(SettingId::Animations), choice);
+        assert_eq!(loaded.user_settings().video.java_animations, toggle != 0);
+        let saved = serde_json::to_value(&loaded).unwrap();
+        assert!(saved["values"].get("java_animations").is_none());
+        assert_eq!(saved["values"]["animations"], choice);
+        let selected = serde_json::json!({
+            "values": { "java_animations": toggle, "animations": toggle }
+        });
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&selected).unwrap()).unwrap();
+        assert_eq!(loaded.value(SettingId::Animations), toggle);
+    }
+}
+
+#[test]
+fn crosshair_preferences_persist_and_reset_without_changing_legacy_defaults() {
+    use super::{INVERT_CROSSHAIR_OPTION, SettingsGroup, THIRD_PERSON_CROSSHAIR_OPTION};
+    let mut options = SettingsOptions::decode(br#"{"values":{"gamma":40}}"#).unwrap();
+    for option in [THIRD_PERSON_CROSSHAIR_OPTION, INVERT_CROSSHAIR_OPTION] {
+        assert_eq!(options.value(option.id), option.default);
+        options.set(index(option.name), 1 - option.default);
+    }
+    let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&options).unwrap()).unwrap();
+    for option in [THIRD_PERSON_CROSSHAIR_OPTION, INVERT_CROSSHAIR_OPTION] {
+        assert_eq!(loaded.value(option.id), 1 - option.default);
+    }
+    loaded.reset_group(SettingsGroup::Video);
+    for option in [THIRD_PERSON_CROSSHAIR_OPTION, INVERT_CROSSHAIR_OPTION] {
+        assert_eq!(loaded.value(option.id), option.default);
+    }
+}
+
+/// Returns the frame-rate limit applied by the loaded settings.
+fn limit(settings: &SettingsOptions) -> render_api::FrameRateLimit {
+    settings.user_settings().video.frame_rate_limit
+}
+
+/// Missing and unsupported FPS values use the default without becoming a one-FPS cap.
+#[test]
+fn frame_rate_missing_and_invalid_values_are_unlimited() {
+    use render_api::FrameRateLimit::Unlimited;
+
+    assert_eq!(limit(&SettingsOptions::default()), Unlimited);
+    for schema in [None, Some(SETTINGS_SCHEMA)] {
+        for value in [None, Some(0), Some(-1), Some(i32::MIN), Some(i32::MAX)] {
+            let mut saved = serde_json::json!({ "values": {} });
+            if let Some(schema) = schema {
+                saved["schema"] = schema.into();
+            }
+            if let Some(value) = value {
+                saved["values"]["max_framerate"] = value.into();
+            }
+            let settings = SettingsOptions::decode(&serde_json::to_vec(&saved).unwrap()).unwrap();
+            assert_eq!(limit(&settings), Unlimited, "{saved}");
+            assert_eq!(
+                settings.value(SettingId::MaxFramerate),
+                FRAME_RATE_UNLIMITED,
+                "{saved}"
+            );
+            let reloaded =
+                SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+            assert_eq!(limit(&reloaded), Unlimited, "{saved}");
+        }
+    }
+}
+
+#[test]
+fn choosing_unlimited_survives_saves_and_video_reset_restores_unlimited() {
+    use render_api::FrameRateLimit;
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.set(SettingId::MaxFramerate.index(), FRAME_RATE_UNLIMITED));
+    assert!(settings.set(SettingId::MaxFramerate.index(), MIN_FIXED_FRAME_RATE));
+    assert!(settings.set(SettingId::MaxFramerate.index(), FRAME_RATE_UNLIMITED));
+    assert_eq!(limit(&settings), FrameRateLimit::Unlimited);
+    let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(limit(&loaded), FrameRateLimit::Unlimited);
+    loaded.set(SettingId::MaxFramerate.index(), MIN_FIXED_FRAME_RATE);
+    loaded.reset_group(SettingsGroup::Video);
+    assert_eq!(limit(&loaded), FrameRateLimit::Unlimited);
+}
+
+#[test]
+fn frame_rate_caption_names_caps_and_unlimited() {
+    let translate = |key: &str| format!("<{key}>");
+    assert_eq!(frame_rate_label(144, &translate), "144");
+    for value in [-1, 0, FRAME_RATE_UNLIMITED, i32::MAX] {
+        assert_eq!(
+            frame_rate_label(value, &translate),
+            "<options.framerateLimit.max>"
+        );
+    }
+}
+
+/// Every slider stop applies the selected limit and survives a settings round trip.
+#[test]
+fn frame_rate_slider_stops_cover_every_cap_and_unlimited() {
+    use render_api::FrameRateLimit::{Fixed, Unlimited};
+
+    let index = index("max_framerate");
+    let option = &SETTINGS_OPTIONS[index];
+    assert_eq!(option.min, MIN_FIXED_FRAME_RATE);
+    assert_eq!(frame_rate_limit(option.default), Unlimited);
+    assert_eq!(frame_rate_limit(option.max), Unlimited);
+    for fps in MIN_FIXED_FRAME_RATE..=FRAME_RATE_UNLIMITED {
+        let expected = if fps <= MAX_FIXED_FRAME_RATE {
+            Fixed(u16::try_from(fps).unwrap().try_into().unwrap())
+        } else {
+            Unlimited
+        };
+        let mut settings = SettingsOptions::default();
+        settings.set(index, fps);
+        assert_eq!(limit(&settings), expected);
+        let reloaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(limit(&reloaded), expected);
+        settings.reset_group(SettingsGroup::Video);
+        assert_eq!(limit(&settings), render_api::FrameRateLimit::default());
+    }
+}
+
+/// An unregistered standalone tearing key does not override the VSync choice.
+#[test]
+fn an_unknown_tearing_key_is_ignored() {
+    let settings =
+        SettingsOptions::decode(br#"{"schema":1,"values":{"allow_tearing":1,"vsync":0}}"#).unwrap();
+    assert!(!settings.user_settings().video.vsync.enabled());
+    let saved = String::from_utf8(serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(!saved.contains("allow_tearing"), "{saved}");
+}
+
+#[test]
+fn vrr_preference_persists_and_old_settings_remain_automatic() {
+    use render_api::VrrPreference;
+    assert_eq!(
+        SettingsOptions::default().user_settings().video.vrr,
+        VrrPreference::Automatic
+    );
+    assert_eq!(
+        SettingsOptions::decode(b"{}")
+            .unwrap()
+            .user_settings()
+            .video
+            .vrr,
+        VrrPreference::Automatic
+    );
+    for preference in [
+        VrrPreference::Automatic,
+        VrrPreference::On,
+        VrrPreference::Off,
+    ] {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": SETTINGS_SCHEMA, "values": { "vrr": preference as i32 }
+        }))
+        .unwrap();
+        let settings = SettingsOptions::decode(&bytes).unwrap();
+        assert_eq!(settings.user_settings().video.vrr, preference);
+        let mut loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.user_settings().video.vrr, preference);
+        loaded.reset_group(super::SettingsGroup::Video);
+        assert_eq!(loaded.user_settings().video.vrr, VrrPreference::Automatic);
+    }
+}
+/// Fresh installs preserve native sky placement, and opting out survives reloads.
+#[test]
+fn native_skybox_offset_defaults_on_and_persists_both_states() {
+    let mut settings = super::SettingsOptions::default();
+    assert_eq!(settings.value(super::NATIVE_SKYBOX_OFFSET_OPTION.id), 1);
+    assert!(settings.user_settings().video.native_skybox_offset);
+    assert!(
+        super::SettingsOptions::decode(b"{}")
+            .unwrap()
+            .user_settings()
+            .video
+            .native_skybox_offset
+    );
+    for enabled in [0, 1] {
+        let index = super::SETTINGS_OPTIONS
+            .iter()
+            .position(|option| option.name == super::NATIVE_SKYBOX_OFFSET_OPTION.name)
+            .unwrap();
+        settings.set(index, enabled);
+        let encoded = serde_json::to_vec(&settings).unwrap();
+        let mut loaded = super::SettingsOptions::decode(&encoded).unwrap();
+        assert_eq!(loaded.value(super::NATIVE_SKYBOX_OFFSET_OPTION.id), enabled);
+        assert_eq!(
+            loaded.user_settings().video.native_skybox_offset,
+            enabled != 0
+        );
+        loaded.reset_group(super::SettingsGroup::Video);
+        assert!(loaded.user_settings().video.native_skybox_offset);
+    }
+}
+
+/// Held-item models are enabled for new installs and the preference survives reloads and reset.
+#[test]
+fn custom_item_models_default_on_and_persist_both_states() {
+    let mut settings = SettingsOptions::default();
+    let id = SettingId::ShowCustomItemModels;
+    assert_eq!(
+        settings.value(id),
+        i32::from(ui::DEFAULT_SHOW_CUSTOM_ITEM_MODELS)
+    );
+    assert_eq!(
+        settings.user_settings().video.show_custom_item_models,
+        ui::DEFAULT_SHOW_CUSTOM_ITEM_MODELS
+    );
+    for enabled in [0, 1] {
+        settings.set(id.index(), enabled);
+        let loaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.value(id), enabled);
+        assert_eq!(
+            loaded.user_settings().video.show_custom_item_models,
+            enabled != 0
+        );
+    }
+    settings.set(id.index(), 0);
+    settings.reset_group(SettingsGroup::Video);
+    assert_eq!(
+        settings.user_settings().video.show_custom_item_models,
+        ui::DEFAULT_SHOW_CUSTOM_ITEM_MODELS
+    );
+}
+
+/// Far terrain stays off whatever an older build saved for it.
+#[test]
+fn saved_far_terrain_settings_do_not_enable_it() {
+    use render_api::far_terrain::FarTerrainMode;
+    for saved in [0, 1, 2] {
+        let bytes = format!(r#"{{"values":{{"far_terrain":{saved},"full_detail_distance":16}}}}"#);
+        let settings = super::SettingsOptions::decode(bytes.as_bytes()).unwrap();
+        let video = settings.user_settings().video;
+        assert_eq!(video.far_terrain, FarTerrainMode::Off);
+        assert!(
+            !video
+                .far_terrain
+                .enabled(64, render_api::far_terrain::DeviceTier::High)
+        );
+    }
+}
+
+#[test]
+fn automatic_update_opt_out_survives_save_and_reload() {
+    let mut settings = SettingsOptions::default();
+    assert!(settings.update_preferences().checks);
+    let index = SETTINGS_OPTIONS
+        .iter()
+        .position(|option| option.name == super::AUTO_UPDATE_OPTION.name)
+        .unwrap();
+    settings.set(index, 0);
+    let reloaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(!reloaded.update_preferences().checks);
+}
+
+#[test]
+fn mod_update_opt_out_persists_independently_of_app_updates() {
+    let mut settings = SettingsOptions::default();
+    assert_eq!(settings.value(SettingId::ModUpdateChecks), 1);
+    assert_eq!(settings.value(SettingId::ModAutoUpdate), 1);
+    settings.set(SettingId::ModAutoUpdate.index(), 0);
+    settings.set(SettingId::ModUpdateChecks.index(), 0);
+    let reloaded = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(reloaded.value(SettingId::ModUpdateChecks), 0);
+    assert_eq!(reloaded.value(SettingId::ModAutoUpdate), 0);
+    assert!(reloaded.update_preferences().checks);
+}
+
+#[test]
+fn install_on_quit_requires_an_opt_in_and_channel_preferences_round_trip() {
+    use update_manifest::channel::Channel;
+    let mut settings = SettingsOptions::default();
+    assert!(!settings.update_preferences().install_on_quit);
+    assert_eq!(settings.update_preferences().channel, Channel::Beta);
+    let index = |name| {
+        SETTINGS_OPTIONS
+            .iter()
+            .position(|option| option.name == name)
+            .unwrap()
+    };
+    settings.set(index(INSTALL_ON_QUIT_OPTION.name), 1);
+    settings.set(
+        index(UPDATE_CHANNEL_OPTION.name),
+        Channel::Nightly.index() as i32,
+    );
+    let saved = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert!(saved.update_preferences().install_on_quit);
+    assert_eq!(saved.update_preferences().channel, Channel::Nightly);
+}
+
+#[test]
+fn an_unpublished_saved_channel_falls_back_to_beta() {
+    use update_manifest::channel::Channel;
+    let mut settings = SettingsOptions::default();
+    let index = SETTINGS_OPTIONS
+        .iter()
+        .position(|option| option.name == UPDATE_CHANNEL_OPTION.name)
+        .unwrap();
+    settings.set(index, Channel::Stable.index() as i32);
+    let saved = SettingsOptions::decode(&serde_json::to_vec(&settings).unwrap()).unwrap();
+    assert_eq!(saved.update_preferences().channel, Channel::default());
+}

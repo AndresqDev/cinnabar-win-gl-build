@@ -1,0 +1,1012 @@
+//! Screen cancel mappings survive rendering only a form's content subtree.
+
+use super::*;
+use crate::ui_runtime::presentation::{
+    UiPresentationRuntime,
+    forms::{ServerUiPack, pack_harness, tests::mini_engine_presentation},
+};
+
+#[test]
+fn complete_large_menu_final_button_sends_its_original_wire_index() {
+    for count in [257usize, 300] {
+        let mut player_runtime = player_state::PlayerState::new(1);
+        let labels: Vec<_> = (0..count).map(|index| format!("Choice {index}")).collect();
+        let labels: Vec<_> = labels.iter().map(String::as_str).collect();
+        let mut runtime = pack_harness::action_form(&mut player_runtime, "Menu", &labels);
+        let mut presentation = mini_engine_presentation();
+        presentation
+            .build(
+                &player_runtime,
+                &runtime,
+                0,
+                [1280, 65_536],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+        let identity = runtime.server_forms().active().unwrap().identity;
+        let frame = presentation.form_engine_frame(identity).unwrap().clone();
+        assert_eq!(frame.hits.len(), count);
+        let last = frame
+            .hits
+            .iter()
+            .find(|hit| hit.collection_index == Some(count - 1))
+            .unwrap();
+        let cursor = UiPoint::new(
+            frame.origin[0] + (last.rect.x + 1.0) as f32 * frame.scale,
+            frame.origin[1] + (last.rect.y + 1.0) as f32 * frame.scale,
+        )
+        .unwrap();
+        assert!(last.contains(frame.to_virtual(cursor)));
+        for down in [true, false] {
+            drive(
+                &mut runtime,
+                &frame,
+                EngineInput {
+                    touch: false,
+                    cursor: Some(cursor),
+                    keys: &[],
+                    pointer: PointerButtons {
+                        pressed: down,
+                        released: !down,
+                        held: down,
+                    },
+                    pointer_edges: vec![down],
+                    wheel: Vec::new(),
+                    typed: Vec::new(),
+                    menu_cancel: None,
+                    now: if down { 0.0 } else { 0.01 },
+                    animator: None,
+                },
+            );
+        }
+        let mut sent = Vec::new();
+        assert!(
+            super::super::flush_form_response(
+                &mut runtime,
+                |_| false,
+                |packet| {
+                    sent.push(packet);
+                    Ok(())
+                }
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            sent,
+            vec![protocol::modal_form_submit_response(
+                identity.form_id,
+                protocol::ModalFormResponseSelection::ButtonIndex((count - 1) as u32)
+            )]
+        );
+    }
+}
+
+/// Supplies a synthetic screen-level cancel mapping above the rendered content subtree.
+/// The inherited screen and form buttons exercise the real JSON-UI presentation without assets.
+fn cancel_presentation() -> UiPresentationRuntime {
+    let mut presentation = mini_engine_presentation();
+    presentation.set_server_ui_pack(&ServerUiPack {
+        ui_layers: vec![vec![(
+            "ui/server_form.json".into(),
+            br#"{
+                "namespace": "server_form",
+                "cancel_screen": {
+                    "type": "screen",
+                    "button_mappings": [{
+                        "from_button_id": "button.menu_cancel",
+                        "to_button_id": "button.menu_exit",
+                        "mapping_type": "global"
+                    }]
+                },
+                "third_party_server_screen@server_form.cancel_screen": {
+                    "$screen_content": "server_form.main_screen_content"
+                }
+            }"#
+            .to_vec(),
+        )]],
+        ..Default::default()
+    });
+    presentation
+}
+
+#[test]
+fn review_escape_dispatches_the_vanilla_form_screen_cancel() {
+    let mut player_runtime = player_state::PlayerState::new(1);
+
+    let mut presentation = cancel_presentation();
+    let mut runtime = pack_harness::action_form(&mut player_runtime, "Shop", &["Buy"]);
+    presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    assert_eq!(frame.cancel_target.as_deref(), Some("button.menu_exit"));
+    let events = keyboard(&mut runtime, &frame, KeyboardKey::Escape, None, false, 0.0);
+    assert!(events.iter().any(|event| matches!(event,
+        ScreenEvent::Button(button) if mapped_action(&runtime.server_forms().active().unwrap().model, button) == Some(LocalFormAction::Dismiss)
+            && button.down && button.interacted
+    )), "{events:?}");
+}
+
+#[test]
+fn a_toggle_mapped_to_submit_answers_with_its_changed_value_on_release() {
+    toggle_submit(false);
+    toggle_submit(true);
+}
+
+/// Touch toggles defer changes until release, while mouse toggles retain their press behavior.
+fn toggle_submit(touch: bool) {
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        r#"{"type":"custom_form","content":[{"type":"toggle","text":"Open editor","default":false}]}"#,
+        false,
+    );
+    let mut presentation = mini_engine_presentation();
+    presentation.set_server_ui_pack(&ServerUiPack {
+        ui_layers: vec![vec![("ui/server_form.json".into(), br#"{
+            "namespace":"server_form",
+            "main_screen_content": {"controls":[{"server_form_factory": {
+                "type":"factory","control_ids":{"custom_form":"@server_form.main_custom_form_screen"}
+            }}]},
+            "main_custom_form_screen": {"type":"panel","size":[100,100],"controls":[{"trigger": {
+                "type":"toggle","size":[40,20],"collection_index":0,
+                "toggle_name":"custom_toggle","toggle_collection_name":"custom_form",
+                "button_mappings":[{"from_button_id":"button.menu_select","to_button_id":"button.submit_custom_form","mapping_type":"pressed"}]
+            }}]}
+        }"#.to_vec())]], ..Default::default()
+    });
+    presentation
+        .build(
+            &player,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let hit = frame
+        .hits
+        .iter()
+        .find(|hit| hit.kind == HitKind::Toggle)
+        .unwrap();
+    let cursor = UiPoint::new(
+        frame.origin[0] + (hit.rect.x + 1.0) as f32 * frame.scale,
+        frame.origin[1] + (hit.rect.y + 1.0) as f32 * frame.scale,
+    )
+    .unwrap();
+    for down in [true, false] {
+        drive(
+            &mut runtime,
+            &frame,
+            EngineInput {
+                touch,
+                cursor: Some(cursor),
+                keys: &[],
+                pointer: PointerButtons {
+                    pressed: down,
+                    released: !down,
+                    held: down,
+                },
+                pointer_edges: vec![down],
+                wheel: Vec::new(),
+                typed: Vec::new(),
+                menu_cancel: None,
+                now: if down { 0.0 } else { 0.01 },
+                animator: None,
+            },
+        );
+        if down && touch {
+            assert_eq!(
+                runtime.server_forms().engine().values,
+                [FormValue::Toggle(false)]
+            );
+        }
+    }
+    let mut sent = Vec::new();
+    assert!(
+        super::super::flush_form_response(
+            &mut runtime,
+            |_| true,
+            |packet| {
+                sent.push(packet);
+                Ok(())
+            }
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        sent,
+        vec![protocol::custom_form_submit_response(
+            identity.form_id,
+            &[protocol::CustomFormValue::Toggle(true)]
+        )]
+    );
+}
+
+#[test]
+fn screen_cancel_ignores_unmapped_any_events_but_respects_a_consuming_control() {
+    let mut player_runtime = player_state::PlayerState::new(1);
+
+    let mut presentation = cancel_presentation();
+    let mut runtime = pack_harness::action_form(&mut player_runtime, "Shop", &["Buy"]);
+    presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let mut frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let mut region = frame
+        .hits
+        .iter()
+        .find(|region| !region.input.mappings.is_empty())
+        .unwrap()
+        .clone();
+    let mut mapping = region.input.mappings[0].clone();
+    region.input.mappings.clear();
+    region.input.any = Some(json_ui::MappingScope::Global);
+    frame.hits = vec![region].into();
+    let events = keyboard(&mut runtime, &frame, KeyboardKey::Escape, None, false, 0.0);
+    assert!(events.iter().any(
+        |event| matches!(event, ScreenEvent::Button(button) if button.id == "button.menu_exit")
+    ));
+    mapping.from = "button.menu_cancel".into();
+    mapping.to = "button.dropdown_exit".into();
+    mapping.kind = json_ui::MappingType::Global;
+    mapping.consume_event = true;
+    let region = &mut std::sync::Arc::make_mut(&mut frame.hits)[0];
+    region.widget.consume = true;
+    region.input.mappings = vec![mapping];
+    let events = keyboard(&mut runtime, &frame, KeyboardKey::Escape, None, false, 1.0);
+    assert!(events.iter().any(|event| matches!(event, ScreenEvent::Button(button) if button.id == "button.dropdown_exit" && button.down)));
+    assert!(!events.iter().any(
+        |event| matches!(event, ScreenEvent::Button(button) if button.id == "button.menu_exit")
+    ));
+}
+
+#[test]
+fn idle_input_relays_pending_animation_end_events() {
+    let anims = std::sync::Arc::new(json_ui::ControlAnims {
+        key: "finished".into(),
+        graph: json_ui::AnimGraph {
+            heads: vec![0],
+            nodes: vec![json_ui::AnimNode {
+                kind: json_ui::AnimKind::Wait,
+                duration: 0.01,
+                easing: json_ui::Easing::Linear,
+                from: [0.0; 4],
+                to: [0.0; 4],
+                from_expr: serde_json::Value::Null,
+                to_expr: serde_json::Value::Null,
+                play_event: None,
+                reset_event: None,
+                end_event: Some("button.menu_exit".into()),
+                destroy_at_end: None,
+                wait_until_rendered: false,
+                resettable: false,
+                scale_from_starting_alpha: false,
+                fps: 1.0,
+                frame_count: 1,
+                reversible: false,
+                vertical: false,
+                looping: false,
+                next: None,
+            }],
+        },
+        rest_alpha: 1.0,
+        rest_offset: [0.0; 2],
+        rect: [0.0, 0.0, 10.0, 10.0],
+        anchor: [0.0; 2],
+        born: None,
+        clock: None,
+        disable_fast_forward: false,
+        reset_name: None,
+        has_sprite: false,
+    });
+    let mut animator = json_ui::Animator::starting_at(0.0);
+    animator.sample(&anims, 0.0, None);
+    animator.sample(&anims, 1.0, None);
+    let mut events = Vec::new();
+    animate(&mut animator, &mut events);
+    assert!(events.iter().any(
+        |event| matches!(event, ScreenEvent::Button(button) if button.id == "button.menu_exit")
+    ));
+}
+
+#[test]
+fn review_pointer_release_then_press_keeps_the_second_capture() {
+    let mut presentation = mini_engine_presentation();
+    let mut player_runtime = player_state::PlayerState::new(1);
+    let mut runtime = pack_harness::action_form(&mut player_runtime, "Shop", &["Buy"]);
+    presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let hit = &frame.hits[0];
+    let gui = [
+        frame.origin[0] + (hit.rect.x + 1.0) as f32 * frame.scale,
+        frame.origin[1] + (hit.rect.y + 1.0) as f32 * frame.scale,
+    ];
+    drive(
+        &mut runtime,
+        &frame,
+        EngineInput {
+            touch: false,
+            cursor: Some(UiPoint::new(gui[0], gui[1]).unwrap()),
+            keys: &[],
+            pointer: PointerButtons {
+                pressed: true,
+                released: true,
+                held: true,
+            },
+            pointer_edges: vec![false, true],
+            wheel: Vec::new(),
+            typed: Vec::new(),
+            menu_cancel: None,
+            now: 0.0,
+            animator: None,
+        },
+    );
+    assert!(runtime.server_forms().engine().view.pressed.is_some());
+}
+
+#[test]
+fn review_ui_release_applies_the_final_control_drag_position() {
+    let mut presentation = mini_engine_presentation();
+    let mut player_runtime = player_state::PlayerState::new(1);
+    let mut runtime = pack_harness::action_form(&mut player_runtime, "Drag", &["Move"]);
+    presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let mut frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let mut region = frame.hits[0].clone();
+    region.kind = HitKind::Draggable;
+    region.drag_axes = [true, false];
+    region.input.mappings.clear();
+    let key = region.key.clone();
+    let start = [region.rect.x + 1.0, region.rect.y + 1.0];
+    frame.hits = vec![region].into();
+    for (point, down) in [(start, true), ([start[0] + 20.0, start[1] + 10.0], false)] {
+        let cursor = UiPoint::new(
+            frame.origin[0] + point[0] as f32 * frame.scale,
+            frame.origin[1] + point[1] as f32 * frame.scale,
+        )
+        .unwrap();
+        drive(
+            &mut runtime,
+            &frame,
+            EngineInput {
+                touch: false,
+                cursor: Some(cursor),
+                keys: &[],
+                pointer: PointerButtons {
+                    pressed: down,
+                    released: !down,
+                    held: down,
+                },
+                pointer_edges: vec![down],
+                wheel: Vec::new(),
+                typed: Vec::new(),
+                menu_cancel: None,
+                now: 0.0,
+                animator: None,
+            },
+        );
+    }
+    let engine = runtime.server_forms().engine();
+    assert_eq!(engine.view.drags.get(&key), Some(&[20.0, 0.0]));
+    assert!(engine.drag.is_none());
+}
+
+#[test]
+fn review_ui_release_applies_the_final_scrollbar_position() {
+    let mut presentation = mini_engine_presentation();
+    let mut player_runtime = player_state::PlayerState::new(1);
+    let mut runtime = pack_harness::action_form(&mut player_runtime, "Scroll", &["Move"]);
+    presentation
+        .build(
+            &player_runtime,
+            &runtime,
+            0,
+            [1280, 720],
+            ui::DpiScale::new(1.0).unwrap(),
+        )
+        .unwrap();
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let mut frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let key = "scroll".to_owned();
+    frame.report.scrolls.insert(
+        key.clone(),
+        json_ui::ScrollMetrics {
+            offset: 10.0,
+            content: 200.0,
+            viewport: 50.0,
+            track: Some([0.0, 0.0, 10.0, 100.0]),
+            ..Default::default()
+        },
+    );
+    runtime.server_forms_mut().engine_mut().drag =
+        Some(crate::ui_runtime::forms::values::FormDrag::ScrollBox {
+            view: key.clone(),
+            last: 20.0,
+        });
+    drive(
+        &mut runtime,
+        &frame,
+        EngineInput {
+            touch: false,
+            cursor: Some(
+                UiPoint::new(frame.origin[0], frame.origin[1] + 30.0 * frame.scale).unwrap(),
+            ),
+            keys: &[],
+            pointer: PointerButtons {
+                released: true,
+                ..Default::default()
+            },
+            pointer_edges: vec![false],
+            wheel: Vec::new(),
+            typed: Vec::new(),
+            menu_cancel: None,
+            now: 0.0,
+            animator: None,
+        },
+    );
+    let engine = runtime.server_forms().engine();
+    assert_eq!(engine.view.scroll.get(&key), Some(&30.0));
+    assert!(engine.drag.is_none());
+}
+
+#[test]
+fn multiselect_edits_use_the_enclosing_form_and_normalize_option_order() {
+    let Some(mut presentation) = pack_harness::engine_presentation() else {
+        return;
+    };
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        r#"{"type":"custom_form","content":[
+            {"type":"multiselect","text":"First","options":["A","B","C"],"default":[2,0,2,-1]},
+            {"type":"multiselect","text":"Second","options":["D","E"],"default":[1]}
+        ]}"#,
+        false,
+    );
+    runtime
+        .server_forms_mut()
+        .engine_mut()
+        .open_multiselects
+        .extend([0, 1]);
+    assert_eq!(
+        runtime.server_forms().engine().submission()[0],
+        protocol::CustomFormValue::MultiSelect(vec![2, 0, 2, -1].into())
+    );
+    pack_harness::render(&mut presentation, &runtime, [1280, 1440], 1.0);
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    let option = frame
+        .hits
+        .iter()
+        .find(|hit| {
+            hit.control_name.as_deref() == Some("custom_multiselect_checkbox")
+                && hit.collections == [("custom_form".into(), 0), ("custom_multiselect".into(), 1)]
+        })
+        .expect("first form option B");
+    for checked in [true, false] {
+        assert_eq!(
+            controller(
+                &mut runtime,
+                &frame,
+                &model,
+                &ScreenEvent::Toggle {
+                    name: "custom_multiselect_checkbox".into(),
+                    key: option.key.clone(),
+                    index: Some(1),
+                    checked,
+                    by_click: true,
+                },
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            runtime.server_forms().engine().submission()[0],
+            protocol::CustomFormValue::MultiSelect(
+                if checked { vec![0, 1, 2] } else { vec![0, 2] }.into()
+            )
+        );
+        assert_eq!(
+            runtime.server_forms().engine().submission()[1],
+            protocol::CustomFormValue::MultiSelect(vec![1].into())
+        );
+        assert!(
+            runtime
+                .server_forms()
+                .engine()
+                .open_multiselects
+                .contains(&0)
+        );
+    }
+}
+
+#[test]
+fn directional_slider_edits_advance_when_the_fraction_stays_on_the_same_grid_point() {
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        crate::ui_runtime::presentation::forms::compatibility_tests::CONTROLS,
+        false,
+    );
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    assert_eq!(
+        set_slider(&mut runtime, &model, 4, 0.41, None, true),
+        Some(f64::from(0.6_f32))
+    );
+    assert_eq!(
+        runtime.server_forms().engine().values[4],
+        FormValue::Slider(6.0)
+    );
+}
+
+#[test]
+fn the_first_direction_after_pointer_tracking_only_snaps_the_value() {
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        crate::ui_runtime::presentation::forms::compatibility_tests::CONTROLS,
+        false,
+    );
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    for (pointer, expected) in [(true, 4.0), (false, 4.0), (false, 6.0)] {
+        let _ = set_slider(&mut runtime, &model, 4, 0.41, None, !pointer);
+        assert_eq!(
+            runtime.server_forms().engine().values[4],
+            FormValue::Slider(expected)
+        );
+    }
+}
+
+#[test]
+fn repeated_directional_input_uses_the_snapped_slider_position() {
+    let Some(mut presentation) = pack_harness::engine_presentation() else {
+        return;
+    };
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        crate::ui_runtime::presentation::forms::compatibility_tests::CONTROLS,
+        false,
+    );
+    pack_harness::render(&mut presentation, &runtime, [1280, 1440], 1.0);
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    let slider = frame
+        .hits
+        .iter()
+        .find(|hit| hit.kind == HitKind::Slider && hit.collection_index == Some(4))
+        .unwrap();
+    {
+        let engine = runtime.server_forms_mut().engine_mut();
+        engine.view.focused = Some(slider.key.clone());
+        let dispatch = engine.dispatcher.button(
+            &frame.hits,
+            &mut engine.view,
+            EngineButton {
+                id: "button.menu_ok",
+                down: true,
+                point: None,
+                mode: InputMode::Gamepad,
+                now: -0.1,
+            },
+        );
+        assert_eq!(
+            engine.view.components.selected(),
+            Some(slider.key.as_str()),
+            "dispatch: {dispatch:?}"
+        );
+    }
+    for (now, expected) in [(0.0, 6.0), (0.25, 8.0)] {
+        let events = {
+            let engine = runtime.server_forms_mut().engine_mut();
+            engine
+                .dispatcher
+                .direction(&frame.hits, &mut engine.view, [1.0, 0.0], now)
+                .events
+        };
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ScreenEvent::Slider {
+                directional: true,
+                ..
+            }
+        )));
+        for event in events {
+            controller(&mut runtime, &frame, &model, &event, None);
+        }
+        assert_eq!(
+            runtime.server_forms().engine().values[4],
+            FormValue::Slider(expected)
+        );
+    }
+}
+
+#[test]
+fn dropdown_edits_answer_and_close_only_the_enclosing_form_element() {
+    let Some(mut presentation) = pack_harness::engine_presentation() else {
+        return;
+    };
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        r#"{"type":"custom_form","content":[
+            {"type":"dropdown","text":"First","options":["A","B"],"default":0},
+            {"type":"dropdown","text":"Second","options":["C","D"],"default":1}
+        ]}"#,
+        false,
+    );
+    runtime
+        .server_forms_mut()
+        .engine_mut()
+        .open_dropdowns
+        .extend([0, 1]);
+    pack_harness::render(&mut presentation, &runtime, [1280, 1440], 1.0);
+    let identity = runtime.server_forms().active().unwrap().identity;
+    let frame = presentation.form_engine_frame(identity).unwrap().clone();
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    let option = frame
+        .hits
+        .iter()
+        .find(|hit| {
+            hit.widget.toggle.as_ref().is_some_and(|toggle| {
+                toggle.name.as_deref() == Some("custom_dropdown_radio_toggle")
+            }) && hit.collections == [("custom_form".into(), 0), ("custom_dropdown".into(), 1)]
+        })
+        .expect("first dropdown option B");
+    controller(
+        &mut runtime,
+        &frame,
+        &model,
+        &ScreenEvent::Toggle {
+            name: "custom_dropdown_radio_toggle".into(),
+            key: option.key.clone(),
+            index: Some(1),
+            checked: true,
+            by_click: true,
+        },
+        None,
+    );
+    assert_eq!(
+        runtime.server_forms().engine().submission().as_ref(),
+        [
+            protocol::CustomFormValue::Dropdown(1),
+            protocol::CustomFormValue::Dropdown(1)
+        ]
+    );
+    assert_eq!(
+        runtime
+            .server_forms()
+            .engine()
+            .open_dropdowns
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        [1]
+    );
+}
+
+#[test]
+fn unchecked_dropdown_options_leave_toggle_answers_unchanged() {
+    let mut player = player_state::PlayerState::new(1);
+    let mut runtime = crate::ui_runtime::presentation::forms::compatibility_tests::replay(
+        &mut player,
+        r#"{"type":"custom_form","content":[
+            {"type":"toggle","text":"Enabled","default":true},
+            {"type":"dropdown","text":"Mode","options":["A","B"],"default":1}
+        ]}"#,
+        false,
+    );
+    let model = runtime.server_forms().active().unwrap().model.clone();
+    let frame = EngineFrame {
+        hits: std::sync::Arc::from([]),
+        report: Default::default(),
+        cancel_target: None,
+        origin: [0.0; 2],
+        scale: 1.0,
+        panel: None,
+        edit_texts: Vec::new(),
+        top: Vec::new(),
+    };
+    controller(
+        &mut runtime,
+        &frame,
+        &model,
+        &ScreenEvent::Toggle {
+            name: "custom_dropdown_radio_toggle".into(),
+            key: "dropdown/option".into(),
+            index: Some(0),
+            checked: false,
+            by_click: false,
+        },
+        None,
+    );
+    assert_eq!(
+        runtime.server_forms().engine().submission().as_ref(),
+        [
+            protocol::CustomFormValue::Toggle(true),
+            protocol::CustomFormValue::Dropdown(1)
+        ]
+    );
+}
+
+#[test]
+fn a_completed_form_swipe_preserves_fling_and_overscroll_motion() {
+    for (offset, delta) in [(150.0, -5.0), (0.0, 5.0)] {
+        let mut player = player_state::PlayerState::new(1);
+        let mut runtime = pack_harness::action_form(&mut player, "Scrollable", &["Action"]);
+        let metrics = json_ui::ScrollMetrics {
+            offset,
+            content: 500.0,
+            viewport: 100.0,
+            gesture: true,
+            touch_mode: true,
+            ..Default::default()
+        };
+        let frame = EngineFrame {
+            hits: [].into(),
+            report: json_ui::LayoutReport {
+                scrolls: [("list".into(), metrics.clone())].into(),
+                ..Default::default()
+            },
+            cancel_target: None,
+            origin: [0.0, 0.0],
+            scale: 1.0,
+            panel: None,
+            edit_texts: Vec::new(),
+            top: Vec::new(),
+        };
+        let point = [50.0, 50.0 + delta * 20.0];
+        let engine = runtime.server_forms_mut().engine_mut();
+        engine.view.scroll.insert("list".into(), offset);
+        engine.view.begin_scroll_touch("list", &metrics);
+        for _ in 0..20 {
+            engine
+                .view
+                .scroll_touch_moved("list", &metrics, [0.0, delta]);
+            engine.view.step_scrolls(&frame.report, 1.0 / 60.0);
+        }
+        engine.scroll_touch = Some(("list".into(), point));
+        engine.view.pressed = Some("action".into());
+        drive(
+            &mut runtime,
+            &frame,
+            EngineInput {
+                touch: true,
+                cursor: Some(UiPoint::new(point[0] as f32, point[1] as f32).unwrap()),
+                keys: &[],
+                pointer: PointerButtons {
+                    released: true,
+                    ..Default::default()
+                },
+                pointer_edges: vec![false],
+                wheel: Vec::new(),
+                typed: Vec::new(),
+                menu_cancel: None,
+                now: 0.0,
+                animator: None,
+            },
+        );
+        assert!(runtime.server_forms().active().is_some());
+        let engine = runtime.server_forms_mut().engine_mut();
+        let motion = engine.view.scroll_state["list"].motion.as_ref().unwrap();
+        assert!(!motion.touching);
+        assert!(engine.scroll_clock.is_some());
+        assert!(engine.scroll_touch.is_none() && engine.view.pressed.is_none());
+        let released_offset = engine.view.scroll_offset("list");
+        if offset == 0.0 {
+            assert!(
+                released_offset < 0.0,
+                "overscroll must remain spring-driven"
+            );
+        }
+        engine.view.step_scrolls(&frame.report, 1.0 / 60.0);
+        assert_ne!(engine.view.scroll_offset("list"), released_offset);
+        engine.cancel_pointer_input();
+        assert!(engine.view.scroll_state["list"].motion.is_none());
+        assert!(engine.scroll_clock.is_none());
+    }
+}
+
+/// A Menu Cancel key bound to an editing key keeps typing, deletion and paste while an edit box
+/// owns typed keys, and acts as Escape only when none does.
+#[test]
+fn menu_cancel_key_yields_to_a_selected_edit_box() {
+    for key in [KeyboardKey::Backspace, KeyboardKey::KeyV, KeyboardKey::KeyX] {
+        assert_eq!(menu_cancel_as_escape(key, Some(key), true), key);
+        assert_eq!(
+            menu_cancel_as_escape(key, Some(key), false),
+            KeyboardKey::Escape
+        );
+    }
+    assert_eq!(
+        menu_cancel_as_escape(KeyboardKey::KeyX, Some(KeyboardKey::KeyV), false),
+        KeyboardKey::KeyX
+    );
+
+    // Through a server form whose selected edit box takes the keys.
+    for (key, text) in [
+        (KeyboardKey::KeyX, Some("x")),
+        (KeyboardKey::Backspace, None),
+    ] {
+        let mut player_runtime = player_state::PlayerState::new(1);
+        let mut presentation = mini_engine_presentation();
+        presentation.set_server_ui_pack(&ServerUiPack {
+            ui_layers: vec![vec![(
+                "ui/server_form.json".into(),
+                br#"{
+                    "namespace": "server_form",
+                    "cancel_screen": {
+                        "type": "screen",
+                        "button_mappings": [{
+                            "from_button_id": "button.menu_cancel",
+                            "to_button_id": "button.menu_exit",
+                            "mapping_type": "global"
+                        }]
+                    },
+                    "third_party_server_screen@server_form.cancel_screen": {
+                        "$screen_content": "server_form.main_screen_content"
+                    },
+                    "form_button": {
+                        "type": "edit_box", "size": [200, 30], "text_control": "display",
+                        "max_length": 50,
+                        "button_mappings": [{ "from_button_id": "button.menu_select",
+                            "to_button_id": "button.text_edit_box_selected",
+                            "mapping_type": "pressed", "handle_select": true,
+                            "handle_deselect": false }],
+                        "controls": [{ "display": { "type": "label", "text": "A",
+                            "size": [200, 30] } }]
+                    }
+                }"#
+                .to_vec(),
+            )]],
+            ..Default::default()
+        });
+        let mut runtime = pack_harness::action_form(&mut player_runtime, "Shop", &["A"]);
+        presentation
+            .build(
+                &player_runtime,
+                &runtime,
+                0,
+                [1280, 720],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+        let identity = runtime.server_forms().active().unwrap().identity;
+        let frame = presentation.form_engine_frame(identity).unwrap().clone();
+        let edit = frame
+            .hits
+            .iter()
+            .find(|hit| hit.kind == json_ui::HitKind::EditBox)
+            .unwrap()
+            .key
+            .clone();
+        {
+            let engine = runtime.server_forms_mut().engine_mut();
+            engine.view.focused = Some(edit.clone());
+            engine.dispatcher.button(
+                &frame.hits,
+                &mut engine.view,
+                json_ui::ButtonInput {
+                    id: "button.menu_select",
+                    down: true,
+                    point: None,
+                    mode: json_ui::InputMode::Gamepad,
+                    now: 0.0,
+                },
+            );
+        }
+        assert!(editing(&runtime, &frame), "{key:?}");
+        drive(
+            &mut runtime,
+            &frame,
+            EngineInput {
+                touch: false,
+                cursor: None,
+                keys: &[],
+                pointer: PointerButtons::default(),
+                pointer_edges: Vec::new(),
+                wheel: Vec::new(),
+                typed: vec![(key, text.map(Into::into), false)],
+                menu_cancel: Some(key),
+                now: 0.0,
+                animator: None,
+            },
+        );
+        assert!(editing(&runtime, &frame), "{key:?}");
+        let mut sent = Vec::new();
+        let _ = super::super::flush_form_response(
+            &mut runtime,
+            |_| false,
+            |packet| {
+                sent.push(packet);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(sent.is_empty(), "{key:?}");
+    }
+}
+
+/// With no edit box selected, the Menu Cancel key dismisses the form through its screen cancel.
+#[test]
+fn menu_cancel_key_dismisses_a_form_without_an_edit_box() {
+    for menu_cancel in [None, Some(KeyboardKey::KeyX)] {
+        let mut player_runtime = player_state::PlayerState::new(1);
+        let mut presentation = cancel_presentation();
+        let mut runtime = pack_harness::action_form(&mut player_runtime, "Shop", &["Buy"]);
+        presentation
+            .build(
+                &player_runtime,
+                &runtime,
+                0,
+                [1280, 720],
+                ui::DpiScale::new(1.0).unwrap(),
+            )
+            .unwrap();
+        let identity = runtime.server_forms().active().unwrap().identity;
+        let frame = presentation.form_engine_frame(identity).unwrap().clone();
+        drive(
+            &mut runtime,
+            &frame,
+            EngineInput {
+                touch: false,
+                cursor: None,
+                keys: &[],
+                pointer: PointerButtons::default(),
+                pointer_edges: Vec::new(),
+                wheel: Vec::new(),
+                typed: vec![(KeyboardKey::KeyX, Some("x".into()), false)],
+                menu_cancel,
+                now: 0.0,
+                animator: None,
+            },
+        );
+        let mut sent = Vec::new();
+        let _ = super::super::flush_form_response(
+            &mut runtime,
+            |_| false,
+            |packet| {
+                sent.push(packet);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sent.is_empty(), menu_cancel.is_none(), "{menu_cancel:?}");
+    }
+}

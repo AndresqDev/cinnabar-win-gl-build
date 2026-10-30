@@ -1,0 +1,68 @@
+use bedrock_protocol_1_26_60::types::SyncWorldClocksData;
+
+/// The vanilla clock behind the level time and the atmosphere renderer.
+///
+/// Vanilla constructs this exact name; the level time uses its hashed string.
+pub const OVERWORLD_CLOCK_NAME: &str = "minecraft:overworld";
+
+/// Vanilla's hashed key for the built-in daylight clock, assigned alongside
+/// OVERWORLD_CLOCK_NAME. It is pre-registered, and the level-time lookup
+/// searches that ID directly, not packet string names.
+pub const OVERWORLD_CLOCK_ID: u64 = 0x63d7_ede7_3c38_f916;
+
+/// One server-authored clock registration. Preserve the transmitted ID;
+/// a string name must not substitute for native hashed-ID lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldClockDefinition {
+    pub id: u64,
+    pub time: i32,
+    pub paused: bool,
+}
+
+/// One update addressed to an already registered server clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldClockState {
+    pub id: u64,
+    pub time: i32,
+    pub paused: bool,
+}
+
+/// The SyncWorldClocks payloads used by the client clock consumer.
+///
+/// Vanilla clock initialization upserts registrations; it does not
+/// clear clocks omitted by a later initialization payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldClockUpdateEvent {
+    Initialize(WorldClockDefinition),
+    Sync(WorldClockState),
+}
+
+pub(super) fn normalize_world_clocks(data: SyncWorldClocksData) -> Vec<WorldClockUpdateEvent> {
+    match data {
+        SyncWorldClocksData::InitializeRegistryData { clock_data } => clock_data
+            .into_iter()
+            .map(|clock| {
+                WorldClockUpdateEvent::Initialize(WorldClockDefinition {
+                    id: clock.id.0,
+                    time: clock.time.0,
+                    paused: clock.is_paused,
+                })
+            })
+            .collect(),
+        SyncWorldClocksData::SyncStateData { clock_data } => clock_data
+            .into_iter()
+            .map(|clock| {
+                WorldClockUpdateEvent::Sync(WorldClockState {
+                    id: clock.clock_id.0,
+                    time: clock.time.0,
+                    paused: clock.is_paused,
+                })
+            })
+            .collect(),
+        // Marker registration is decoded completely, but Cinnabar currently
+        // has no world-clock event/script consumer. It does not change time
+        // or pause state in the native handlers.
+        SyncWorldClocksData::AddTimeMarkerData { .. }
+        | SyncWorldClocksData::RemoveTimeMarkerData { .. } => Vec::new(),
+    }
+}
