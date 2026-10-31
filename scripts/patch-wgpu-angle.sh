@@ -17,23 +17,33 @@ mod=$(find "$checkout_root" -type f \
 adapter=$(find "$checkout_root" -type f \
     -path '*/wgpu-*/060bd0b/wgpu-hal/src/gles/adapter.rs' \
     -print -quit)
+device=$(find "$checkout_root" -type f \
+    -path '*/wgpu-*/060bd0b/wgpu-hal/src/gles/device.rs' \
+    -print -quit)
+fence=$(find "$checkout_root" -type f \
+    -path '*/wgpu-*/060bd0b/wgpu-hal/src/gles/fence.rs' \
+    -print -quit)
 
-if [ -z "$egl" ] || [ -z "$mod" ] || [ -z "$adapter" ]; then
+if [ -z "$egl" ] || [ -z "$mod" ] || [ -z "$adapter" ] || [ -z "$device" ] || [ -z "$fence" ]; then
     echo "error: pinned wgpu GLES sources not found under $checkout_root" >&2
     echo "run 'cargo fetch --locked' first and check the pinned wgpu revision" >&2
     exit 1
 fi
 
-python3 - "$egl" "$mod" "$adapter" <<'PY'
+python3 - "$egl" "$mod" "$adapter" "$device" "$fence" <<'PY'
 import pathlib
 import sys
 
 egl_path = pathlib.Path(sys.argv[1])
 mod_path = pathlib.Path(sys.argv[2])
 adapter_path = pathlib.Path(sys.argv[3])
+device_path = pathlib.Path(sys.argv[4])
+fence_path = pathlib.Path(sys.argv[5])
 egl = egl_path.read_text()
 mod = mod_path.read_text()
 adapter = adapter_path.read_text()
+device = device_path.read_text()
+fence = fence_path.read_text()
 
 # EGL's Wayland window type is Unix-only. Keep the EGL swapchain code compiling
 # on Windows by giving it an opaque placeholder type there. Replace the existing
@@ -197,9 +207,61 @@ if old_alignment not in adapter:
     raise SystemExit("error: expected buffer-alignment capability assignment not found in adapter.rs")
 adapter = adapter.replace(old_alignment, new_alignment, 1)
 
+# Under ANGLE the main thread can sit inside eglSwapBuffers while holding the
+# EGL context lock. The render thread polls the completion fence during that
+# window; AutoFinish fences only need the atomic counter, but wgpu still took
+# the adapter lock just to read it. That produced a deterministic 6-second
+# "Could not lock adapter context" panic after the menu presented.
+old_fence_get = """    pub fn get_latest(&self, gl: &glow::Context) -> crate::FenceValue {
+        let mut max_value = self.last_completed.load(Ordering::Acquire);
+"""
+new_fence_get = """    pub fn is_auto_finish(&self) -> bool {
+        self.fence_behavior.is_auto_finish()
+    }
+
+    /// Read the last completed value without touching the GL context.
+    ///
+    /// This is only sound for AutoFinish fences, where signal() updates the
+    /// atomic counter directly and get_latest() never queries a GL sync.
+    pub fn get_latest_without_gl(&self) -> crate::FenceValue {
+        self.last_completed.load(Ordering::Acquire)
+    }
+
+    pub fn get_latest(&self, gl: &glow::Context) -> crate::FenceValue {
+        let mut max_value = self.last_completed.load(Ordering::Acquire);
+"""
+if old_fence_get not in fence:
+    raise SystemExit("error: expected fence get_latest not found in fence.rs")
+fence = fence.replace(old_fence_get, new_fence_get, 1)
+
+old_device_get = """    unsafe fn get_fence_value(
+        &self,
+        fence: &super::Fence,
+    ) -> Result<crate::FenceValue, crate::DeviceError> {
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::needless_borrow))]
+        Ok(fence.get_latest(&self.shared.context.lock()))
+    }
+"""
+new_device_get = """    unsafe fn get_fence_value(
+        &self,
+        fence: &super::Fence,
+    ) -> Result<crate::FenceValue, crate::DeviceError> {
+        if fence.is_auto_finish() {
+            return Ok(fence.get_latest_without_gl());
+        }
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::needless_borrow))]
+        Ok(fence.get_latest(&self.shared.context.lock()))
+    }
+"""
+if old_device_get not in device:
+    raise SystemExit("error: expected get_fence_value implementation not found in device.rs")
+device = device.replace(old_device_get, new_device_get, 1)
+
 egl_path.write_text(egl)
 mod_path.write_text(mod)
 adapter_path.write_text(adapter)
+device_path.write_text(device)
+fence_path.write_text(fence)
 PY
 
 echo "Patched wgpu GLES to use EGL/ANGLE on Windows:"
