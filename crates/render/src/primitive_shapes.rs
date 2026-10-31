@@ -35,7 +35,7 @@ impl Plugin for PrimitiveShapesRenderPlugin {
         app.init_resource::<PrimitiveShapesScene>()
             .add_plugins(ExtractResourcePlugin::<PrimitiveShapesScene>::default());
         load_internal_asset!(app, SHADER, "primitive_shapes/shapes.wesl", shader);
-        crate::pipeline_warmup::register::<pipeline::ShapePipeline>(app);
+        crate::pipeline_warmup::register_background::<pipeline::ShapePipeline>(app);
         let Some(render) = app.get_sub_app_mut(RenderApp) else {
             return;
         };

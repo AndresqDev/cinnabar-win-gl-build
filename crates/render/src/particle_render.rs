@@ -91,7 +91,7 @@ impl Plugin for ParticleRenderPlugin {
             "particles.wesl",
             crate::shader_safety::from_wesl
         );
-        crate::pipeline_warmup::register::<ParticlePipeline>(app);
+        crate::pipeline_warmup::register_background::<ParticlePipeline>(app);
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };

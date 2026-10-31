@@ -174,6 +174,69 @@ fn unloaded_shaders_hold_loading() {
 }
 
 #[test]
+fn background_variants_never_hold_loading() {
+    let mut world = world(Handle::default());
+    world.insert_resource(WarmupOwner::<TwoModes>::new(WarmupTier::Background, 0));
+    let warm = world.register_system(prewarm_background_owner::<TwoModes>);
+    world.run_system(warm).unwrap();
+    let registry = world.resource::<WarmupRegistry>();
+    assert!(
+        registry.ids.is_empty(),
+        "background variants belong to the deferred set"
+    );
+    assert_eq!(registry.background_ids.len(), 2);
+    assert!(
+        ready(&mut world),
+        "queued background variants must not keep the loading screen up"
+    );
+    world.resource_mut::<PipelineCache>().process_queue();
+    assert!(ready(&mut world));
+}
+
+#[test]
+fn gl_background_waits_for_readiness_then_a_settle_interval() {
+    let mut background = BackgroundWarmup::default();
+    background.observe(false, true);
+    assert!(!background.ready);
+    background.observe(true, true);
+    assert!(
+        !background.ready,
+        "the first ready frame only arms the delay"
+    );
+    for _ in 0..GL_BACKGROUND_SETTLE_FRAMES {
+        background.observe(true, true);
+        assert!(!background.ready);
+    }
+    background.observe(true, true);
+    assert!(background.ready);
+    background.observe(false, true);
+    assert!(
+        !background.ready,
+        "closing the critical gate pauses background work"
+    );
+}
+
+#[test]
+fn native_background_keeps_the_eager_loading_behavior() {
+    let mut background = BackgroundWarmup::default();
+    background.observe(false, false);
+    assert!(background.ready);
+}
+
+#[test]
+fn a_view_change_restarts_the_background_cycle() {
+    let mut background = BackgroundWarmup {
+        cursor: 3,
+        active: Some(3),
+        ..default()
+    };
+    background.restart_cycle();
+    assert_eq!(background.cursor, 0);
+    assert_eq!(background.active, None);
+    assert_eq!(background.transition_frame, None);
+}
+
+#[test]
 fn no_view_never_releases_loading() {
     let cache = cache();
     assert!(!registered_pipelines_ready(

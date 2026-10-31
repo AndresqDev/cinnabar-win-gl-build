@@ -3,14 +3,14 @@
 use bevy::prelude::IntoScheduleConfigs;
 use render_scene::PipelineWarmupReadiness;
 
-use std::collections::HashSet;
+use std::{any::type_name, collections::HashSet, marker::PhantomData};
 
 #[cfg(test)]
 use bevy::prelude::{Handle, Mut, Shader, World, default};
 use bevy::{
     prelude::{
         App, BevyError, Has, Local, Msaa, Query, Res, ResMut, Resource, Result, SubApp, SystemSet,
-        error,
+        error, info, warn,
     },
     render::{
         Render, RenderApp, RenderSystems,
@@ -21,6 +21,9 @@ use bevy::{
     },
     shader::ShaderCacheError,
 };
+
+/// Render frames to wait after the critical gate opens before GL starts background batches.
+const GL_BACKGROUND_SETTLE_FRAMES: u32 = 2;
 
 /// The view properties our built-in pipeline keys depend on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +37,16 @@ pub(crate) struct WarmView {
 }
 
 pub(crate) type WarmupIds = Vec<CachedRenderPipelineId>;
+
+/// When an owner's variants must exist.
+///
+/// `Critical` owners gate world entry. `Background` owners may compile after the first
+/// world frame, so first-use of an uncommon effect can happen while gameplay continues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WarmupTier {
+    Critical,
+    Background,
+}
 
 /// Enumerates active coverage and Performance's single-sample path without duplicates.
 pub(crate) fn sample_modes(current: Msaa) -> impl Iterator<Item = Msaa> {
@@ -64,10 +77,78 @@ pub(crate) trait PendingPipelines: Resource {
 #[derive(Resource, Default)]
 struct WarmupRegistry {
     views: Vec<WarmView>,
+    /// Critical variants that hold loading until every one is usable.
     ids: WarmupIds,
+    /// Variants compiled once the view exists; readiness never waits for these.
+    background_ids: WarmupIds,
     failed: HashSet<CachedRenderPipelineId>,
     /// Owned compiles still running this frame.
     pending: bool,
+    /// Registration order for the one-owner-at-a-time GL background schedule.
+    background_owners: usize,
+    background: BackgroundWarmup,
+}
+
+/// Serializes GL background owners after the critical gate has been released.
+#[derive(Default)]
+struct BackgroundWarmup {
+    /// Incremented once per render frame by [`collect_views`].
+    frame: u64,
+    /// Registration slot of the next owner whose variants may be queued.
+    cursor: usize,
+    /// Slot waiting for its queued variants to finish compiling.
+    active: Option<usize>,
+    /// Frame of the last batch transition; prevents two owners starting in one frame.
+    transition_frame: Option<u64>,
+    /// Whether readiness has been observed since it last closed.
+    armed: bool,
+    countdown: u32,
+    /// Whether background batches may start this frame.
+    ready: bool,
+}
+
+impl BackgroundWarmup {
+    /// Opens background work only after the critical gate has stayed ready for a short settle.
+    ///
+    /// Native backends keep the existing eager behavior and are always allowed to queue.
+    fn observe(&mut self, critical_ready: bool, gl: bool) {
+        self.frame = self.frame.wrapping_add(1);
+        if !gl {
+            self.ready = true;
+            return;
+        }
+        if !critical_ready {
+            self.armed = false;
+            self.countdown = GL_BACKGROUND_SETTLE_FRAMES;
+            self.ready = false;
+            return;
+        }
+        if self.ready {
+            return;
+        }
+        if !self.armed {
+            self.armed = true;
+            self.countdown = GL_BACKGROUND_SETTLE_FRAMES;
+            return;
+        }
+        if self.countdown > 0 {
+            self.countdown -= 1;
+            return;
+        }
+        self.ready = true;
+    }
+
+    /// Revisits every background owner when the view keys change.
+    fn restart_cycle(&mut self) {
+        self.cursor = 0;
+        self.active = None;
+        self.transition_frame = None;
+    }
+
+    /// Whether this slot already had its turn in the current frame.
+    fn transitioned_this_frame(&self) -> bool {
+        self.transition_frame == Some(self.frame)
+    }
 }
 
 #[derive(SystemSet, Clone, Debug, PartialEq, Eq, Hash)]
@@ -77,22 +158,72 @@ enum WarmupSet {
 }
 
 #[derive(Resource)]
-struct WarmupOwner<T>(std::marker::PhantomData<T>);
+struct WarmupOwner<T> {
+    tier: WarmupTier,
+    slot: usize,
+    _marker: PhantomData<T>,
+}
 
-/// Idempotent, so plugins that install from both `build` and `finish` may call it twice.
+impl<T> WarmupOwner<T> {
+    fn new(tier: WarmupTier, slot: usize) -> Self {
+        Self {
+            tier,
+            slot,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Registers an owner whose variants must be ready before loading releases. Idempotent, so
+/// plugins that install from both `build` and `finish` may call it twice.
 pub(crate) fn register<T: PrewarmPipelines>(app: &mut App) {
+    register_tier::<T>(app, WarmupTier::Critical);
+}
+
+/// Registers an owner whose variants may compile after the world is visible. Idempotent.
+pub(crate) fn register_background<T: PrewarmPipelines>(app: &mut App) {
+    register_tier::<T>(app, WarmupTier::Background);
+}
+
+fn register_tier<T: PrewarmPipelines>(app: &mut App, tier: WarmupTier) {
     let Some(render_app) = install(app) else {
         return;
     };
-    if !render_app.world().contains_resource::<WarmupOwner<T>>() {
-        render_app
-            .insert_resource(WarmupOwner::<T>(std::marker::PhantomData))
-            .add_systems(
-                Render,
-                prewarm_owner::<T>
-                    .in_set(WarmupSet::Owners)
-                    .run_if(render_scene::startup_work::world_work_allowed),
+    if render_app.world().contains_resource::<WarmupOwner<T>>() {
+        let existing = render_app.world().resource::<WarmupOwner<T>>().tier;
+        if existing != tier {
+            warn!(
+                "pipeline warmup owner {}: already registered as {existing:?}; keeping that tier",
+                type_name::<T>()
             );
+        }
+        return;
+    }
+    let slot = match tier {
+        WarmupTier::Critical => usize::MAX,
+        WarmupTier::Background => {
+            let mut registry = render_app.world_mut().resource_mut::<WarmupRegistry>();
+            let slot = registry.background_owners;
+            registry.background_owners += 1;
+            slot
+        }
+    };
+    render_app.insert_resource(WarmupOwner::<T>::new(tier, slot));
+    info!("pipeline warmup owner {}: {tier:?}", type_name::<T>());
+    if tier == WarmupTier::Background {
+        render_app.add_systems(
+            Render,
+            prewarm_background_owner::<T>
+                .in_set(WarmupSet::Owners)
+                .run_if(render_scene::startup_work::world_work_allowed),
+        );
+    } else {
+        render_app.add_systems(
+            Render,
+            prewarm_owner::<T>
+                .in_set(WarmupSet::Owners)
+                .run_if(render_scene::startup_work::world_work_allowed),
+        );
     }
 }
 
@@ -103,7 +234,7 @@ pub(crate) fn register_pending<T: PendingPipelines>(app: &mut App) {
     };
     if !render_app.world().contains_resource::<WarmupOwner<T>>() {
         render_app
-            .insert_resource(WarmupOwner::<T>(std::marker::PhantomData))
+            .insert_resource(WarmupOwner::<T>::new(WarmupTier::Critical, usize::MAX))
             .add_systems(
                 Render,
                 owner_pending::<T>
@@ -159,6 +290,16 @@ fn install(app: &mut App) -> Option<&mut SubApp> {
             )
             .add_systems(Render, collect_views.in_set(WarmupSet::Views))
             .add_systems(Render, publish_readiness.in_set(RenderSystems::Cleanup));
+        info!(
+            "pipeline warmup: critical owners gate loading; background owners {}",
+            if !crate::gl_compat::enabled() {
+                "queue during loading too, without gating readiness"
+            } else if crate::gl_compat::compile_context_enabled() {
+                "are deferred until readiness on ANGLE's separate compile context"
+            } else {
+                "are deferred until readiness and compile synchronously in small batches"
+            }
+        );
     }
     Some(render_app)
 }
@@ -176,9 +317,13 @@ type ViewKeys<'w, 's> = Query<
     ),
 >;
 
-fn collect_views(views: ViewKeys, mut registry: ResMut<WarmupRegistry>) {
-    registry.views.clear();
-    registry.pending = false;
+fn collect_views(
+    views: ViewKeys,
+    shared: Res<PipelineWarmupReadiness>,
+    admission: Res<render_scene::startup_work::WorldWorkAdmission>,
+    mut registry: ResMut<WarmupRegistry>,
+) {
+    let mut collected = Vec::new();
     for (camera, msaa, target, enhanced, shader_pack) in &views {
         let key = WarmView {
             msaa: *msaa,
@@ -187,8 +332,42 @@ fn collect_views(views: ViewKeys, mut registry: ResMut<WarmupRegistry>) {
             shader_pack,
             output: target.and_then(ViewTarget::out_texture_view_format),
         };
-        if !registry.views.contains(&key) {
-            registry.views.push(key);
+        if !collected.contains(&key) {
+            collected.push(key);
+        }
+    }
+    if collected != registry.views {
+        registry.views = collected;
+        registry.background.restart_cycle();
+    }
+    registry.pending = false;
+    // Readiness may already be true from the menu before world work is admitted. Require
+    // admission too, so GL backgrounds cannot start on the menu's empty critical set.
+    registry.background.observe(
+        admission.is_admitted() && shared.is_ready(),
+        crate::gl_compat::enabled(),
+    );
+}
+
+/// Queues every not-yet-warmed variant of one owner for the current view keys.
+fn warm_owner_views<T: PrewarmPipelines>(
+    owner: &mut T,
+    cache: &PipelineCache,
+    views: &[WarmView],
+    warmed: &mut Vec<WarmView>,
+    ids: &mut WarmupIds,
+) {
+    for &view in views {
+        for msaa in sample_modes(view.msaa) {
+            let view = WarmView { msaa, ..view };
+            if warmed.contains(&view) {
+                continue;
+            }
+            // The draw path would fail the same way, so the error does not hold loading.
+            if let Err(error) = owner.prewarm(cache, view, ids) {
+                error!("pipeline prewarm {}: {error}", type_name::<T>());
+            }
+            warmed.push(view);
         }
     }
 }
@@ -199,38 +378,152 @@ fn prewarm_owner<T: PrewarmPipelines>(
     cache: Res<PipelineCache>,
     mut registry: ResMut<WarmupRegistry>,
     mut warmed: Local<Vec<WarmView>>,
+    mut skipped: Local<bool>,
+    mut reported: Local<bool>,
 ) {
     // An owner that never initialised has nothing it could draw.
     let Some(mut owner) = owner else {
+        if !*skipped {
+            info!(
+                "pipeline warmup owner {}: skipped, resource not installed",
+                type_name::<T>()
+            );
+            *skipped = true;
+        }
         return;
     };
-    // On GL/ANGLE every pipeline compile shares the one EGL context. Warming
-    // all world variants here lets D3DCompiler hold that context for seconds,
-    // starving the submit/present path and producing a false hang or an
-    // adapter-lock panic. Let the draw path request variants as they appear.
-    if crate::gl_compat::enabled() {
+    let WarmupRegistry { views, ids, .. } = &mut *registry;
+    let before = ids.len();
+    warm_owner_views(&mut owner, &cache, views, &mut warmed, ids);
+    if !*reported && !views.is_empty() {
+        info!(
+            "pipeline warmup owner {}: critical, queued {} variants",
+            type_name::<T>(),
+            ids.len() - before
+        );
+        *reported = true;
+    }
+}
+
+/// Background owners follow the backend policy instead of the loading gate.
+///
+/// Native backends queue them during loading exactly as before, but their IDs stay out of
+/// readiness. GL defers them until critical readiness and then allows one owner per frame.
+fn prewarm_background_owner<T: PrewarmPipelines>(
+    marker: Res<WarmupOwner<T>>,
+    owner: Option<ResMut<T>>,
+    cache: Res<PipelineCache>,
+    mut registry: ResMut<WarmupRegistry>,
+    mut warmed: Local<Vec<WarmView>>,
+    mut skipped: Local<bool>,
+    mut reported: Local<bool>,
+) {
+    let Some(mut owner) = owner else {
+        if !*skipped {
+            info!(
+                "pipeline warmup owner {}: background skipped, resource not installed",
+                type_name::<T>()
+            );
+            *skipped = true;
+        }
+        // A missing owner must not strand every later background slot on GL.
+        if crate::gl_compat::enabled() {
+            let WarmupRegistry {
+                background_ids,
+                failed,
+                background,
+                ..
+            } = &mut *registry;
+            if !background.ready || background.transitioned_this_frame() {
+                return;
+            }
+            if background.active == Some(marker.slot) {
+                if ids_ready(&cache, background_ids, failed) {
+                    background.active = None;
+                    background.cursor += 1;
+                    background.transition_frame = Some(background.frame);
+                }
+            } else if background.active.is_none() && background.cursor == marker.slot {
+                background.cursor += 1;
+                background.transition_frame = Some(background.frame);
+            }
+        }
+        return;
+    };
+    if !crate::gl_compat::enabled() {
+        let WarmupRegistry {
+            views,
+            background_ids,
+            ..
+        } = &mut *registry;
+        let before = background_ids.len();
+        warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
+        if !*reported && !views.is_empty() {
+            info!(
+                "pipeline warmup owner {}: background queued during loading; {} variants, readiness unaffected",
+                type_name::<T>(),
+                background_ids.len() - before
+            );
+            *reported = true;
+        }
         return;
     }
-    let WarmupRegistry { views, ids, .. } = &mut *registry;
-    for &view in views.iter() {
-        for msaa in sample_modes(view.msaa) {
-            let view = WarmView { msaa, ..view };
-            if warmed.contains(&view) {
-                continue;
-            }
-            // The draw path would fail the same way, so the error does not hold loading.
-            if let Err(error) = owner.prewarm(&cache, view, ids) {
-                error!("pipeline prewarm {}: {error}", std::any::type_name::<T>());
-            }
-            warmed.push(view);
-        }
+
+    let slot = marker.slot;
+    let WarmupRegistry {
+        views,
+        background_ids,
+        failed,
+        background,
+        ..
+    } = &mut *registry;
+    if !background.ready || background.transitioned_this_frame() {
+        return;
     }
+    if let Some(active) = background.active {
+        if active != slot {
+            return;
+        }
+        if !ids_ready(&cache, background_ids, failed) {
+            return;
+        }
+        background.active = None;
+        background.cursor += 1;
+        background.transition_frame = Some(background.frame);
+        info!(
+            "pipeline warmup owner {}: background batch finished",
+            type_name::<T>()
+        );
+        return;
+    }
+    if background.cursor != slot {
+        return;
+    }
+
+    let before = background_ids.len();
+    warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
+    let queued = background_ids.len() - before;
+    if queued == 0 {
+        background.cursor += 1;
+        background.transition_frame = Some(background.frame);
+        info!(
+            "pipeline warmup owner {}: background already warm; skipping batch",
+            type_name::<T>()
+        );
+        return;
+    }
+    background.active = Some(slot);
+    info!(
+        "pipeline warmup owner {}: queued background batch of {queued} variants",
+        type_name::<T>()
+    );
 }
 
 fn owner_pending<T: PendingPipelines>(owner: Option<Res<T>>, mut registry: ResMut<WarmupRegistry>) {
     registry.pending |= owner.is_some_and(|owner| owner.pending());
 }
 
+/// Publishes the critical gate only; background batches keep running after it opens.
 fn publish_readiness(
     cache: Res<PipelineCache>,
     mut registry: ResMut<WarmupRegistry>,
@@ -241,15 +534,29 @@ fn publish_readiness(
 }
 
 /// Shader loads keep loading held; terminal compile errors are logged once and stop blocking.
+///
+/// Background IDs are deliberately absent here: they must never hold world entry.
 fn registered_pipelines_ready(cache: &PipelineCache, registry: &mut WarmupRegistry) -> bool {
     let WarmupRegistry {
         views,
         ids,
         failed,
         pending,
+        ..
     } = registry;
     let mut ready = !views.is_empty() && !*pending;
-    for &id in ids.iter() {
+    ready &= ids_ready(cache, ids, failed);
+    ready
+}
+
+/// Whether every ID is usable, folding terminal errors into readiness exactly once.
+fn ids_ready(
+    cache: &PipelineCache,
+    ids: &[CachedRenderPipelineId],
+    failed: &mut HashSet<CachedRenderPipelineId>,
+) -> bool {
+    let mut ready = true;
+    for &id in ids {
         ready &= match cache.get_render_pipeline_state(id) {
             CachedPipelineState::Ok(_) => true,
             CachedPipelineState::Err(

@@ -69,7 +69,7 @@ struct Installed;
 /// Delayed render-app creation and headless app tests share the same registration path.
 fn install(app: &mut App) {
     app.init_resource::<AimAssistHighlightScene>();
-    crate::pipeline_warmup::register::<HighlightPipeline>(app);
+    crate::pipeline_warmup::register_background::<HighlightPipeline>(app);
     let Some(render_app) = app.get_sub_app(RenderApp) else {
         return;
     };

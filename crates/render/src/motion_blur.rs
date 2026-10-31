@@ -46,7 +46,7 @@ impl Plugin for CameraMotionBlurPlugin {
         load_internal_asset!(app, MSAA_SHADER, "motion_blur.wgsl", |source, path| {
             crate::shader_safety::from_wgsl(shader::source(source, true), path)
         });
-        crate::pipeline_warmup::register::<pipeline::BlurPipeline>(app);
+        crate::pipeline_warmup::register_background::<pipeline::BlurPipeline>(app);
         app.sub_app_mut(RenderApp)
             .add_systems(ExtractSchedule, extract_settings)
             .add_systems(RenderStartup, pipeline::init)

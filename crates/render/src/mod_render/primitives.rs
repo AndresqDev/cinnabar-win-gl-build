@@ -47,7 +47,7 @@ const FRAME_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
 pub(crate) const PRIMITIVE_DISTANCE: f32 = f32::MAX / 2.0;
 
 pub(super) fn install(app: &mut App) {
-    crate::pipeline_warmup::register::<PrimitivePipeline>(app);
+    crate::pipeline_warmup::register_background::<PrimitivePipeline>(app);
     load_internal_asset!(
         app,
         PRIMITIVE_SHADER,

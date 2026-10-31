@@ -67,7 +67,7 @@ impl Plugin for EntityShadowRenderPlugin {
             return;
         }
         crate::upload_staging::install(app);
-        crate::pipeline_warmup::register::<EntityShadowGpu>(app);
+        crate::pipeline_warmup::register_background::<EntityShadowGpu>(app);
         load_internal_asset!(
             app,
             SHADER,
