@@ -609,7 +609,6 @@ new_present = """        // The render thread submits the next frame while this 
             log::error!("swap_buffers failed: {e}");
             return Err(crate::SurfaceError::Lost);
         }
-        Ok(())
 """
 if old_present not in egl:
     raise SystemExit("error: expected surface present block not found in egl.rs")
