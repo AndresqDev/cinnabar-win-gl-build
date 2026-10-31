@@ -601,11 +601,23 @@ fn poll_join(
     }
 }
 
+/// Radius advertised during login, before the progressive ramp takes over. GL/ANGLE starts at the
+/// smallest valid ring; other backends keep the saved radius. Values below one clamp to one because
+/// the protocol rejects a zero `ChunkRadiusUpdated` while awaiting PlayerSpawn.
+fn login_view_distance_chunks(saved: i32, gl_compat: bool) -> u8 {
+    if gl_compat {
+        1
+    } else {
+        u8::try_from(saved.max(1)).unwrap_or(u8::MAX)
+    }
+}
+
 /// Captures the player's settings as the join starts, including a hidden-menu launch.
 pub(crate) fn login_settings(
     menu: &MenuRuntime,
     input: Option<&client_state::SemanticInputSnapshot>,
 ) -> protocol::LoginSettings {
+    let settings = menu.settings_snapshot().0;
     protocol::LoginSettings {
         server_address: String::new(),
         language_code: pack_runtime::pack_language::active_language_code(),
@@ -616,9 +628,12 @@ pub(crate) fn login_settings(
             }),
         gui_scale_offset: menu.gui_scale_offset(),
         memory_tier: protocol::login_memory_tier(launcher_host::memory::physical_bytes()),
-        graphics_mode: u8::from(menu.settings_snapshot().0.value(SettingId::GraphicsMode) != 0),
-        filter_profanity: menu.settings_snapshot().0.value(SettingId::FilterProfanity) != 0,
-        view_distance_chunks: menu.settings_snapshot().0.value(SettingId::RenderDistance) as u8,
+        graphics_mode: u8::from(settings.value(SettingId::GraphicsMode) != 0),
+        filter_profanity: settings.value(SettingId::FilterProfanity) != 0,
+        view_distance_chunks: login_view_distance_chunks(
+            settings.value(SettingId::RenderDistance),
+            render::gl_compat::enabled(),
+        ),
         resource_pack_cache_dir: Some(menu.layout().resource_pack_cache_dir()),
     }
 }
@@ -971,6 +986,22 @@ mod tests {
                 radius as u8
             );
         }
+    }
+
+    #[test]
+    fn login_view_distance_starts_at_one_on_gl_and_never_sends_zero() {
+        assert_eq!(
+            login_view_distance_chunks(35, true),
+            1,
+            "GL leaves growth to the progressive ramp"
+        );
+        assert_eq!(
+            login_view_distance_chunks(8, false),
+            8,
+            "native backends keep the saved radius"
+        );
+        assert_eq!(login_view_distance_chunks(0, false), 1);
+        assert_eq!(login_view_distance_chunks(-4, false), 1);
     }
 
     #[test]
