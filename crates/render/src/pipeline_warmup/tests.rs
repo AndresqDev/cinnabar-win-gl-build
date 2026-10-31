@@ -228,12 +228,65 @@ fn a_view_change_restarts_the_background_cycle() {
     let mut background = BackgroundWarmup {
         cursor: 3,
         active: Some(3),
+        transition_frame: Some(9),
+        armed: true,
+        countdown: 0,
+        ready: true,
         ..default()
     };
     background.restart_cycle();
     assert_eq!(background.cursor, 0);
     assert_eq!(background.active, None);
     assert_eq!(background.transition_frame, None);
+    assert!(!background.armed);
+    assert_eq!(background.countdown, GL_BACKGROUND_SETTLE_FRAMES);
+    assert!(
+        !background.ready,
+        "the new view must re-open the background gate after its critical set settles"
+    );
+}
+
+#[test]
+fn a_view_change_discards_old_background_ids_and_keeps_critical_failures() {
+    let critical = CachedRenderPipelineId::new(1);
+    let old_background = CachedRenderPipelineId::new(2);
+    let mut registry = WarmupRegistry {
+        views: vec![VIEW],
+        ids: vec![critical],
+        background_ids: vec![old_background],
+        failed: HashSet::from([critical, old_background]),
+        views_generation: 4,
+        background: BackgroundWarmup {
+            cursor: 2,
+            active: Some(2),
+            transition_frame: Some(9),
+            armed: true,
+            countdown: 0,
+            ready: true,
+            ..default()
+        },
+        ..default()
+    };
+    registry.restart_background();
+    assert!(registry.background_ids.is_empty());
+    assert_eq!(registry.failed, HashSet::from([critical]));
+    assert_eq!(registry.views_generation, 5);
+    assert_eq!(registry.background.cursor, 0);
+    assert_eq!(registry.background.active, None);
+    assert_eq!(registry.background.transition_frame, None);
+    assert!(!registry.background.armed);
+    assert!(!registry.background.ready);
+}
+
+#[test]
+fn background_warm_memo_is_discarded_for_a_new_view_generation() {
+    let mut warmed = WarmedViews::default();
+    warmed.for_generation(4).push(VIEW);
+    assert_eq!(warmed.for_generation(4).len(), 1);
+    assert!(
+        warmed.for_generation(5).is_empty(),
+        "view keys from the old generation must be queued again"
+    );
 }
 
 #[test]

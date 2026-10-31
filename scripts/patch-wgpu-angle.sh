@@ -61,6 +61,8 @@ if (
     and "get_latest_without_gl" in fence
     and "draw_elements_instanced_base_vertex_ext" in queue
     and "compile_context=created" in egl
+    and "has_compile_context" in egl
+    and "angle-compile-context-unavailable" in adapter
     and "lock_for_pipeline" in device
 ):
     print("wgpu GLES sources are already patched; nothing to do")
@@ -75,6 +77,16 @@ if "type WlEglWindow = core::ffi::c_void;" in egl and "compile_context=created" 
         "error: this wgpu checkout was patched by an older version of "
         "scripts/patch-wgpu-angle.sh and has no shared compile context; "
         "restore wgpu-hal/src/gles from the pinned revision and re-run"
+    )
+
+# A checkout patched by the shared-context version cannot expose whether that
+# context actually exists. Reject it instead of silently leaving the app with a
+# flag it can never trust.
+if "compile_context=created" in egl and "has_compile_context" not in egl:
+    raise SystemExit(
+        "error: this wgpu checkout was patched by an older compile-context "
+        "version of scripts/patch-wgpu-angle.sh that cannot report context "
+        "availability; restore wgpu-hal/src/gles from the pinned revision and re-run"
     )
 
 # ANGLE's Windows display needs an explicit D3D11 platform type. The constants
@@ -401,6 +413,11 @@ new_raw_context = """    pub fn raw_context(&self) -> *mut ffi::c_void {
         self.base_vertex_ext.is_some()
     }
 
+    /// Whether pipeline compilation has a dedicated shared EGL context.
+    pub fn has_compile_context(&self) -> bool {
+        self.compile.is_some()
+    }
+
     /// Issues `glDrawElementsInstancedBaseVertexEXT`.
     ///
     /// Returns `false` when the entry point is unavailable, so the caller can
@@ -536,13 +553,11 @@ new_adapter_lock_impl = """        AdapterContextLock { glow, egl }
     ///
     /// Uses the dedicated shared compile context when available and otherwise
     /// falls back to the main context. The returned guard unsets its EGL
-    /// context when dropped.
-    #[track_caller]
+    /// context when dropped. Waiting here is safe: the compile context is not
+    /// shared with presentation, so a long warmup only queues other compiles.
     pub fn lock_for_pipeline(&self) -> PipelineContextLock<'_> {
         if let Some(compile) = self.compile.as_ref() {
-            let guard = compile
-                .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-                .expect("Could not lock compile context. This is most-likely a deadlock.");
+            let guard = compile.lock();
             match guard.egl.make_current_checked() {
                 Ok(()) => {
                     log::debug!("compile_context=using target=compile");
@@ -803,6 +818,78 @@ new_base_vertex = """        let has_base_vertex = supported((3, 2), (3, 2))
 if old_base_vertex not in adapter:
     raise SystemExit("error: expected BASE_VERTEX capability assignment not found in adapter.rs")
 adapter = adapter.replace(old_base_vertex, new_base_vertex, 1)
+
+# AdapterInfo carries a stable marker so the app can tell whether wgpu really
+# created the shared compile context. The environment flag alone only requests
+# it; a failed eglCreateContext falls back to the main context and must keep
+# worker pipeline compilation synchronous.
+old_make_info = """    fn make_info(vendor_orig: String, renderer_orig: String, version: String) -> wgt::AdapterInfo {
+"""
+new_make_info = """    fn make_info(
+        vendor_orig: String,
+        renderer_orig: String,
+        version: String,
+        has_compile_context: bool,
+    ) -> wgt::AdapterInfo {
+"""
+if old_make_info not in adapter:
+    raise SystemExit("error: expected make_info signature not found in adapter.rs")
+adapter = adapter.replace(old_make_info, new_make_info, 1)
+
+old_driver_info = """            driver_info: version,
+"""
+new_driver_info = """            driver_info: format!(
+                "{version} {}",
+                if has_compile_context {
+                    "angle-compile-context"
+                } else {
+                    "angle-compile-context-unavailable"
+                }
+            ),
+"""
+if old_driver_info not in adapter:
+    raise SystemExit("error: expected driver_info assignment not found in adapter.rs")
+adapter = adapter.replace(old_driver_info, new_driver_info, 1)
+
+old_make_info_call = """            info: Self::make_info(vendor, renderer, version),
+"""
+new_make_info_call = """            info: Self::make_info(
+                vendor,
+                renderer,
+                version,
+                has_compile_context,
+            ),
+"""
+if old_make_info_call not in adapter:
+    raise SystemExit("error: expected make_info call not found in adapter.rs")
+adapter = adapter.replace(old_make_info_call, new_make_info_call, 1)
+
+old_expose_start = """    pub(super) unsafe fn expose(
+        context: super::AdapterContext,
+        backend_options: wgt::GlBackendOptions,
+    ) -> Option<crate::ExposedAdapter<super::Api>> {
+        let gl = context.lock();
+"""
+new_expose_start = """    pub(super) unsafe fn expose(
+        context: super::AdapterContext,
+        backend_options: wgt::GlBackendOptions,
+    ) -> Option<crate::ExposedAdapter<super::Api>> {
+        // Capture this before the context moves into AdapterShared.
+        let has_compile_context = {
+            #[cfg(not(webgl))]
+            {
+                context.has_compile_context()
+            }
+            #[cfg(webgl)]
+            {
+                false
+            }
+        };
+        let gl = context.lock();
+"""
+if old_expose_start not in adapter:
+    raise SystemExit("error: expected Adapter::expose start not found in adapter.rs")
+adapter = adapter.replace(old_expose_start, new_expose_start, 1)
 
 # Route non-zero base-vertex indexed draws through the EXT entry point when the
 # context loaded it. The core ES 3.2 name is a version error on ANGLE 3.1.
@@ -1126,4 +1213,6 @@ echo "wgpu GLES EGL/ANGLE patch state:"
 grep -nF 'mod egl;' "$mod" | head -5
 grep -nF 'type WlEglWindow' "$egl" | head -5
 grep -nF 'compile_context=created' "$egl" | head -5
+grep -nF 'has_compile_context' "$egl" | head -5
+grep -nF 'angle-compile-context' "$adapter" | head -5
 grep -nF 'lock_for_pipeline' "$device" | head -5
