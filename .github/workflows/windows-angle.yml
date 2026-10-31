@@ -1,0 +1,130 @@
+name: Windows ANGLE build
+
+# Experimental Windows GL build that uses ANGLE's EGL/GLES implementation over
+# Direct3D 11 instead of the native Intel OpenGL ICD.
+on:
+  push:
+    branches: [windows-angle]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CINNABAR_BUILD_COMMIT: ${{ github.sha }}
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_CACHE_SIZE: 8G
+  ELECTRON_VERSION: "45.2.1"
+
+jobs:
+  build:
+    name: Build Cinnabar with ANGLE
+    runs-on: windows-2025
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          go version
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache GHA backend
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # The pinned wgpu has an EGL/ANGLE Win32 path but only builds WGL on
+      # Windows. Enable the dormant EGL path in the CI checkout.
+      - name: Patch wgpu for ANGLE/EGL
+        shell: bash
+        run: |
+          cargo fetch --locked
+          bash scripts/patch-wgpu-angle.sh
+
+      - name: Build Rust client and tools
+        shell: bash
+        run: |
+          cargo build --profile play --locked --no-default-features \
+            -p cinnabar -p asset-compiler -p update-installer
+
+      - name: Build Go core and local server
+        shell: bash
+        run: |
+          go build -tags joinprofile \
+            -ldflags "$(bash packaging/common/core-ldflags.sh)" \
+            -o target/play/bedrock-core.exe ./core/cmd/bedrock-core
+          (
+            cd tools/localserver
+            GOWORK=off go build -o ../../target/play/bedrock-local-server.exe .
+          )
+
+      - name: Stage portable Windows payload
+        shell: pwsh
+        run: |
+          ./.github/scripts/stage-windows-payload.ps1 -Root "$PWD" -Out "$PWD/dist/Cinnabar-Windows-ANGLE"
+
+      - name: Download ANGLE runtime from Electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "electron-angle.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "electron-angle"
+          $url = "https://github.com/electron/electron/releases/download/v$env:ELECTRON_VERSION/electron-v$env:ELECTRON_VERSION-win32-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          $out = Join-Path $PWD "dist/Cinnabar-Windows-ANGLE"
+          foreach ($name in @("libEGL.dll", "libGLESv2.dll", "d3dcompiler_47.dll")) {
+            $source = Join-Path $dir $name
+            if (-not (Test-Path $source)) { throw "ANGLE runtime is missing $name" }
+            Copy-Item $source (Join-Path $out $name) -Force
+          }
+          Copy-Item (Join-Path $dir "LICENSE") (Join-Path $out "ANGLE-LICENSE.txt") -Force
+          Copy-Item "packaging/windows/run-angle.bat" $out -Force
+          Copy-Item "packaging/windows/ANGLE-README.txt" $out -Force
+
+      - name: Show ANGLE payload
+        shell: bash
+        run: |
+          ls -lh dist/Cinnabar-Windows-ANGLE/{cinnabar.exe,libEGL.dll,libGLESv2.dll,d3dcompiler_47.dll,run-angle.bat}
+          du -sh dist/Cinnabar-Windows-ANGLE
+
+      - name: Archive ANGLE payload
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/Cinnabar-Windows-ANGLE/*" `
+            -DestinationPath "dist/Cinnabar-Windows-ANGLE-${{ github.sha }}.zip" -CompressionLevel Optimal
+
+      - name: Show sccache statistics
+        if: always()
+        shell: bash
+        run: sccache --show-stats || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Cinnabar-Windows-ANGLE
+          path: |
+            dist/Cinnabar-Windows-ANGLE
+            dist/Cinnabar-Windows-ANGLE-*.zip
+          retention-days: 7
