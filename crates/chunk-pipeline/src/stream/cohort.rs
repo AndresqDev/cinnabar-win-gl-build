@@ -142,7 +142,7 @@ impl WorldStream {
         self.loaded_columns.len()
     }
 
-    fn player_column(&self) -> ChunkKey {
+    pub(super) fn player_column(&self) -> ChunkKey {
         self.column_at(self.authority.resolved_server_position().position)
     }
 

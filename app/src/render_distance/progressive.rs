@@ -8,23 +8,28 @@
 //! The first request is radius zero, which is literally the player's own column. If that column
 //! does not become ready within [`ZERO_RADIUS_PATIENCE`], the ramp falls back to radius one (the
 //! safe 3x3 spawn neighbourhood) instead of leaving startup stuck on a server that will not serve
-//! a one-column view.
+//! a one-column view. A requested ring that stays unready for [`RING_STAGNATION_TIMEOUT`] settles
+//! the ramp at the current radius; a later target or session change resumes it.
 
 use std::{fmt, time::Duration};
 
 /// A server that cannot serve the player's own column must not hold startup forever.
 const ZERO_RADIUS_PATIENCE: Duration = Duration::from_secs(3);
+/// A requested ring that never becomes ready stops the ramp at the current radius. This covers
+/// servers that grant a smaller radius than requested and rings with a lost column.
+const RING_STAGNATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// The first ring waits longest; each later ring adds less wait, so the outer view fills faster.
 const BASE_RING_DWELL: Duration = Duration::from_millis(500);
 const RING_DWELL_STEP: Duration = Duration::from_millis(100);
 const MIN_RING_DWELL: Duration = Duration::from_millis(100);
-/// A frame beyond this is too slow to grow the view.
-const ADVANCE_MAX_FRAME: Duration = Duration::from_millis(40);
-/// Consecutive frames beyond this trip the backoff.
-const SLOW_FRAME: Duration = Duration::from_millis(50);
+/// A frame beyond this is too slow to grow the view. This still admits sustained 20-30 FPS.
+const ADVANCE_MAX_FRAME: Duration = Duration::from_millis(66);
+/// Consecutive frames beyond this are a genuine stall, so only real spikes trip the backoff.
+const SLOW_FRAME: Duration = Duration::from_millis(100);
 const SLOW_FRAMES_FOR_BACKOFF: u8 = 3;
 const STRESSED_FRAMES_FOR_BACKOFF: u8 = 3;
-const STABLE_FRAMES_TO_RESUME: u8 = 5;
+/// A few ordinary frames are enough to resume after a spike; five would stall slow hardware.
+const STABLE_FRAMES_TO_RESUME: u8 = 3;
 const BACKOFF_BASE: Duration = Duration::from_millis(750);
 const BACKOFF_MAX: Duration = Duration::from_secs(8);
 const TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -96,10 +101,12 @@ impl fmt::Display for Phase {
     }
 }
 
-/// Why the ramp did not grow this frame. `None` only while a request is being sent or at target.
+/// Why the ramp did not grow this frame. `None` while a request is being sent or after the ramp
+/// settled at its target; a stalled ring records [`WaitReason::RingStalled`] while at target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WaitReason {
     RingIncomplete,
+    RingStalled,
     RingDwell,
     MeshBacklog,
     LightBacklog,
@@ -113,6 +120,7 @@ impl fmt::Display for WaitReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::RingIncomplete => "ring_incomplete",
+            Self::RingStalled => "ring_stalled",
             Self::RingDwell => "ring_dwell",
             Self::MeshBacklog => "mesh_backlog",
             Self::LightBacklog => "light_backlog",
@@ -148,6 +156,9 @@ pub(super) struct ProgressTelemetry {
 #[derive(Debug, Default)]
 pub(super) struct ProgressiveLoad {
     session: Option<u64>,
+    /// The radius the user asked for. A stalled ramp lowers `target_radius` without losing this,
+    /// so later frames do not mistake the effective target for a new user request.
+    desired_radius: i32,
     target_radius: i32,
     current_radius: i32,
     phase: Phase,
@@ -155,6 +166,7 @@ pub(super) struct ProgressiveLoad {
     sent_radius: Option<i32>,
     work: WorkCounts,
     zero_radius_started_at: Option<Duration>,
+    ring_wait_started_at: Option<Duration>,
     last_advance_at: Duration,
     backoff_until: Option<Duration>,
     backoff_rounds: u8,
@@ -188,7 +200,7 @@ impl ProgressiveLoad {
             .clamp(0, render_api::MAX_VIEW_RADIUS_CHUNKS);
         if self.session != Some(input.session) {
             self.begin(input.session, target, input.now);
-        } else if self.target_radius != target {
+        } else if self.desired_radius != target {
             self.retarget(target, input.now);
         }
         if self.current_radius > self.target_radius {
@@ -205,6 +217,7 @@ impl ProgressiveLoad {
                 if input.now.saturating_sub(started) >= ZERO_RADIUS_PATIENCE {
                     self.current_radius = 1;
                     self.zero_radius_started_at = None;
+                    self.ring_wait_started_at = None;
                     self.last_advance_at = input.now;
                     self.phase = Phase::Ramp;
                     self.wait_reason = None;
@@ -221,12 +234,17 @@ impl ProgressiveLoad {
             if self.sent_radius != Some(self.current_radius) {
                 self.phase = Phase::Waiting;
                 self.wait_reason = Some(WaitReason::SendBackpressure);
-            } else if ring_ready(self.current_radius) {
-                self.phase = Phase::AtTarget;
-                self.wait_reason = None;
-            } else {
-                self.phase = Phase::Waiting;
-                self.wait_reason = Some(WaitReason::RingIncomplete);
+            } else if self.phase != Phase::AtTarget {
+                // Check readiness only on the transition into the target. Once settled, repeating
+                // this O(r^2) scan every frame would be pure overhead; a target change resets the
+                // phase and checks again.
+                if ring_ready(self.current_radius) {
+                    self.phase = Phase::AtTarget;
+                    self.wait_reason = None;
+                    self.ring_wait_started_at = None;
+                } else {
+                    self.wait_for_ring(input.now, WaitReason::RingIncomplete);
+                }
             }
         } else if self.sent_radius != Some(self.current_radius) {
             self.phase = Phase::Waiting;
@@ -303,12 +321,14 @@ impl ProgressiveLoad {
 
     fn begin(&mut self, session: u64, target: i32, now: Duration) {
         self.session = Some(session);
+        self.desired_radius = target;
         self.target_radius = target;
         self.current_radius = 0;
         self.phase = Phase::Initial;
         self.wait_reason = None;
         self.sent_radius = None;
         self.zero_radius_started_at = Some(now);
+        self.ring_wait_started_at = None;
         self.last_advance_at = now;
         self.backoff_until = None;
         self.backoff_rounds = 0;
@@ -320,16 +340,18 @@ impl ProgressiveLoad {
     }
 
     fn retarget(&mut self, target: i32, now: Duration) {
+        self.desired_radius = target;
         self.target_radius = target;
+        self.ring_wait_started_at = None;
+        self.backoff_until = None;
+        self.backoff_rounds = 0;
+        self.phase = Phase::Ramp;
+        self.wait_reason = None;
         if self.current_radius > target {
             self.current_radius = target;
             self.last_advance_at = now;
-            self.zero_radius_started_at = (target == 0).then_some(now);
-            self.backoff_until = None;
-            self.backoff_rounds = 0;
-        } else if self.current_radius < target && self.phase == Phase::AtTarget {
-            self.phase = Phase::Ramp;
         }
+        self.zero_radius_started_at = (self.current_radius == 0 && target > 0).then_some(now);
     }
 
     fn observe_frame(&mut self, frame_delta: Duration) {
@@ -380,9 +402,13 @@ impl ProgressiveLoad {
             return;
         }
 
-        let reason = if !ring_ready(self.current_radius) {
-            Some(WaitReason::RingIncomplete)
-        } else if self.work.mesh() > ADVANCE_MAX_MESH_BACKLOG {
+        if !ring_ready(self.current_radius) {
+            self.wait_for_ring(input.now, WaitReason::RingIncomplete);
+            return;
+        }
+        self.ring_wait_started_at = None;
+
+        let reason = if self.work.mesh() > ADVANCE_MAX_MESH_BACKLOG {
             Some(WaitReason::MeshBacklog)
         } else if self.work.light() > ADVANCE_MAX_LIGHT_BACKLOG {
             Some(WaitReason::LightBacklog)
@@ -431,6 +457,32 @@ impl ProgressiveLoad {
             && self.work.mesh() <= RESUME_MAX_MESH_BACKLOG
             && self.work.light() <= RESUME_MAX_LIGHT_BACKLOG
             && self.work.decode <= RESUME_MAX_DECODE_BACKLOG
+    }
+
+    /// Waits for the current ring, but stops the ramp at this radius once the same ring has been
+    /// unready for [`RING_STAGNATION_TIMEOUT`]. Without this, a server that grants a smaller
+    /// radius (or loses one column) leaves the state machine waiting forever.
+    fn wait_for_ring(&mut self, now: Duration, reason: WaitReason) {
+        let started = *self.ring_wait_started_at.get_or_insert(now);
+        if now.saturating_sub(started) >= RING_STAGNATION_TIMEOUT {
+            self.stop_ramp_at_current(now);
+        } else {
+            self.phase = Phase::Waiting;
+            self.wait_reason = Some(reason);
+        }
+    }
+
+    /// Settles safely at the current radius. `desired_radius` keeps the user's request, so only a
+    /// real target change (or a new session) restarts the ramp.
+    fn stop_ramp_at_current(&mut self, now: Duration) {
+        self.target_radius = self.current_radius;
+        self.phase = Phase::AtTarget;
+        self.wait_reason = Some(WaitReason::RingStalled);
+        self.ring_wait_started_at = None;
+        self.backoff_until = None;
+        self.backoff_rounds = 0;
+        self.zero_radius_started_at = None;
+        self.last_advance_at = now;
     }
 
     fn begin_backoff(&mut self, now: Duration, reason: WaitReason) {
@@ -591,11 +643,90 @@ mod tests {
         load.confirm_sent(0);
 
         for now in [16, 32, 48] {
-            assert_eq!(load.update(input(1, 4, now, 60), |_| true), None);
+            assert_eq!(load.update(input(1, 4, now, 120), |_| true), None);
         }
         assert_eq!(load.current_radius(), 0);
         assert_eq!(load.phase(), Phase::Backoff);
         assert_eq!(load.wait_reason(), Some(WaitReason::SlowFrames));
+    }
+
+    #[test]
+    fn sustained_twenty_to_thirty_fps_frames_still_advance_the_ramp() {
+        let mut load = ProgressiveLoad::default();
+        assert_eq!(load.update(input(1, 4, 0, 16), |_| true), Some(0));
+        load.confirm_sent(0);
+
+        // 50 ms frames are 20 FPS: slow, but ordinary hardware pacing that must not freeze growth.
+        assert_eq!(load.update(input(1, 4, 500, 50), |_| true), Some(1));
+        load.confirm_sent(1);
+        assert_eq!(load.phase(), Phase::Ramp);
+
+        assert_eq!(load.update(input(1, 4, 900, 33), |_| true), Some(2));
+        load.confirm_sent(2);
+        assert_eq!(load.current_radius(), 2);
+        assert_eq!(load.phase(), Phase::Ramp);
+    }
+
+    #[test]
+    fn a_stalled_ring_stops_at_the_current_radius_and_resumes_on_retarget() {
+        let mut load = ProgressiveLoad::default();
+        assert_eq!(load.update(input(1, 4, 0, 16), |_| false), Some(0));
+        load.confirm_sent(0);
+
+        // Radius zero still falls back after its shorter patience.
+        assert_eq!(load.update(input(1, 4, 2_999, 16), |_| false), None);
+        assert_eq!(load.update(input(1, 4, 3_000, 16), |_| false), Some(1));
+        load.confirm_sent(1);
+
+        // Ring one never becomes ready: wait the full stagnation window, then settle at radius one.
+        assert_eq!(load.update(input(1, 4, 3_016, 16), |_| false), None);
+        assert_eq!(load.update(input(1, 4, 8_015, 16), |_| false), None);
+        assert_eq!(load.phase(), Phase::Waiting);
+        assert_eq!(load.update(input(1, 4, 8_016, 16), |_| false), None);
+        assert_eq!(load.current_radius(), 1);
+        assert_eq!(load.target_radius(), 1);
+        assert_eq!(load.phase(), Phase::AtTarget);
+        assert_eq!(load.wait_reason(), Some(WaitReason::RingStalled));
+
+        // The settled ramp does not rescan the unreachable ring on every frame.
+        let mut scans = 0;
+        assert_eq!(
+            load.update(input(1, 4, 20_000, 16), |_| {
+                scans += 1;
+                false
+            }),
+            None
+        );
+        assert_eq!(scans, 0);
+        assert_eq!(load.phase(), Phase::AtTarget);
+
+        // A real target change restarts the ramp from the current radius.
+        assert_eq!(load.update(input(1, 3, 20_100, 16), |_| true), Some(2));
+        assert_eq!(load.current_radius(), 2);
+        assert_eq!(load.target_radius(), 3);
+        assert_eq!(load.phase(), Phase::Ramp);
+    }
+
+    #[test]
+    fn an_at_target_ramp_does_not_scan_the_ring_every_frame() {
+        let mut load = ProgressiveLoad::default();
+        assert_eq!(load.update(input(1, 1, 0, 16), |_| true), Some(0));
+        load.confirm_sent(0);
+        assert_eq!(load.update(input(1, 1, 500, 16), |_| true), Some(1));
+        load.confirm_sent(1);
+        assert_eq!(load.update(input(1, 1, 516, 16), |_| true), None);
+        assert_eq!(load.phase(), Phase::AtTarget);
+
+        let mut scans = 0;
+        assert_eq!(
+            load.update(input(1, 1, 60_000, 16), |radius| {
+                scans += 1;
+                radius == 1
+            }),
+            None
+        );
+        assert_eq!(scans, 0);
+        assert_eq!(load.phase(), Phase::AtTarget);
     }
 
     #[test]

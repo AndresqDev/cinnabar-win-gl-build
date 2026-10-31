@@ -19,6 +19,27 @@ use client_shell::ui_resources::UiRuntimeResource;
 use client_state::RuntimeSettings;
 use progressive::{ProgressInput, ProgressiveLoad, WorkCounts};
 
+/// Suppresses the repeated `PacketSendError::Closed` warning a closing transport produces every
+/// frame. Recovery clears it, so a later closure in the same session is still reported.
+#[derive(Default)]
+struct ClosedSendLog {
+    session: Option<u64>,
+}
+
+impl ClosedSendLog {
+    fn record(&mut self, session: u64) -> bool {
+        if self.session == Some(session) {
+            return false;
+        }
+        self.session = Some(session);
+        true
+    }
+
+    fn reset(&mut self) {
+        self.session = None;
+    }
+}
+
 /// Sends the selected radius after joining and whenever it changes, ramping through rings while
 /// startup is still settling instead of requesting the whole target at once.
 pub(crate) fn apply_render_distance(
@@ -28,9 +49,11 @@ pub(crate) fn apply_render_distance(
     network: Option<Res<NetworkHandle<PackApplication>>>,
     time: Res<Time<Real>>,
     mut progressive: Local<ProgressiveLoad>,
+    mut closed_send_log: Local<ClosedSendLog>,
 ) {
     let (Some(ui), Some(mut world), Some(network)) = (ui, world, network) else {
         progressive.reset();
+        closed_send_log.reset();
         return;
     };
     let session = ui.session_id();
@@ -41,8 +64,15 @@ pub(crate) fn apply_render_distance(
             .video
             .render_distance_chunks,
     );
-    let Some(stream) = world.stream.as_mut().filter(|_| session != 0) else {
+    // Menus have no stream; checking the session before `as_mut` keeps `ClientWorld` unchanged.
+    if session == 0 {
         progressive.reset();
+        closed_send_log.reset();
+        return;
+    }
+    let Some(stream) = world.stream.as_mut() else {
+        progressive.reset();
+        closed_send_log.reset();
         return;
     };
 
@@ -79,17 +109,21 @@ pub(crate) fn apply_render_distance(
             Ok(()) => {
                 progressive.confirm_sent(radius);
                 stream.set_requested_radius(radius);
+                closed_send_log.reset();
             }
             Err(error) => {
                 progressive.send_failed();
                 if error.is_closed() {
-                    warn!(
-                        session,
-                        radius,
-                        error = %error,
-                        "progressive chunk radius send closed"
-                    );
+                    if closed_send_log.record(session) {
+                        warn!(
+                            session,
+                            radius,
+                            error = %error,
+                            "progressive chunk radius send closed"
+                        );
+                    }
                 } else {
+                    closed_send_log.reset();
                     debug!(
                         session,
                         radius,
@@ -142,5 +176,26 @@ pub(crate) fn apply_render_distance(
                 "progressive chunk radius wait"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClosedSendLog;
+
+    #[test]
+    fn closed_sends_are_reported_once_per_session_until_recovery() {
+        let mut log = ClosedSendLog::default();
+        assert!(log.record(7));
+        assert!(!log.record(7));
+        assert!(!log.record(7));
+
+        assert!(log.record(8), "a new session reports its own closure");
+
+        log.reset();
+        assert!(
+            log.record(8),
+            "recovery allows a later closure to be reported"
+        );
     }
 }
