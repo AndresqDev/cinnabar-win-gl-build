@@ -6,6 +6,8 @@ name: ANGLE EGL runtime probe
 # (GitHub's runners use the Microsoft D3D11 WARP adapter).
 on:
   workflow_dispatch:
+  push:
+    branches: [angle-egl-probe]
 
 permissions:
   contents: read
