@@ -401,6 +401,10 @@ pub struct WorldStream {
     view_forward: Option<[f32; 3]>,
     /// Orders the spawn columns and their light halo first until local terrain is ready.
     startup_priority: bool,
+    /// Radius the startup readiness gate requires while [`Self::startup_priority`] holds.
+    /// The app lowers it to zero for the first progressive ring; it never exceeds
+    /// [`cohort::STARTUP_RADIUS`].
+    startup_radius: i32,
     dimension_transfer_priority: Option<transfer_priority::DimensionTransferPriority>,
     admitted_mesh_jobs: Arc<AtomicUsize>,
     mesh_memory: meshing::memory::MeshMemoryBudget,

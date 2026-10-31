@@ -895,6 +895,7 @@ mod near_drawn;
 mod player_grid_interest;
 mod player_retention;
 mod prediction;
+mod progressive_startup;
 mod publication_metrics;
 mod publisher_epochs;
 mod publisher_scope;

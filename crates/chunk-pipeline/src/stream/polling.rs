@@ -10,6 +10,13 @@ impl WorldStream {
         self.startup_priority = enabled;
     }
 
+    /// Narrows startup readiness to the player's own column for the first progressive ring.
+    /// The value is clamped to the safe 3x3 radius and only applies while
+    /// [`Self::set_startup_priority`] is active; [`Self::finish_startup_priority`] restores 3x3.
+    pub fn set_startup_radius(&mut self, radius: i32) {
+        self.startup_radius = radius.clamp(0, cohort::STARTUP_RADIUS);
+    }
+
     /// Ends spawn priority once local terrain is ready; servers that stream only after
     /// initialization keep it until terrain arrives. Returns whether priority is off.
     pub fn finish_startup_priority(&mut self) -> bool {
@@ -17,6 +24,7 @@ impl WorldStream {
             return false;
         }
         self.startup_priority = false;
+        self.startup_radius = cohort::STARTUP_RADIUS;
         true
     }
 

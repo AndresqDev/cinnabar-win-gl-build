@@ -120,6 +120,7 @@ impl WorldStream {
             mesh_jobs: Default::default(),
             view_forward: None,
             startup_priority: false,
+            startup_radius: cohort::STARTUP_RADIUS,
             dimension_transfer_priority: None,
             admitted_mesh_jobs: Arc::new(AtomicUsize::new(0)),
             mesh_cancellations: HashMap::new(),
