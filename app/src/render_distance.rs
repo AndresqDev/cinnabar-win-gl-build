@@ -75,6 +75,12 @@ pub(crate) fn apply_render_distance(
         closed_send_log.reset();
         return;
     };
+    // The server's publisher can describe a much larger view than this client requested. On the
+    // GL compatibility path that would defeat the progressive ramp and recreate the join burst;
+    // cap admission and retention to the requested radius while the ramp grows it.
+    if render::gl_compat::enabled() {
+        stream.set_progressive_view(true);
+    }
 
     let stats = stream.stats();
     let work = WorkCounts {

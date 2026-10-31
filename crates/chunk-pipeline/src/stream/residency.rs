@@ -285,13 +285,30 @@ impl WorldStream {
         self.requested_radius
     }
 
+    /// Enables the progressive client view. Until this is set, the server's larger grant and
+    /// publisher scope are retained as before. With the progressive view, the client's requested
+    /// radius is the upper bound, so an eager server cannot flood the join with its whole view.
+    pub fn set_progressive_view(&mut self, enabled: bool) {
+        if self.progressive_view == enabled {
+            return;
+        }
+        self.progressive_view = enabled;
+        if enabled && self.requested_radius.is_none() {
+            self.requested_radius = Some(0);
+        }
+        self.request_chunk_retention();
+    }
+
     /// The radius retention keeps once the server confirms one: the wider of the server's and the
-    /// player's. A server granting less never shrinks the player's view of what it does send, and
-    /// one granting more keeps every column it still considers sent, so none goes missing.
+    /// player's normally, or the requested radius cap for the progressive client view.
     pub(super) fn retained_radius(&self) -> Option<i32> {
         self.chunk_radius.map(|server| {
-            self.requested_radius
-                .map_or(server, |player| server.max(player))
+            if self.progressive_view {
+                server.min(self.requested_radius.unwrap_or(0))
+            } else {
+                self.requested_radius
+                    .map_or(server, |player| server.max(player))
+            }
         })
     }
 
@@ -512,12 +529,17 @@ impl WorldStream {
         )
     }
     pub(super) fn active_radius_chunks(&self) -> i32 {
-        match (self.publisher.radius_chunks, self.chunk_radius) {
+        let radius = match (self.publisher.radius_chunks, self.chunk_radius) {
             (Some(publisher), Some(chunk)) => publisher.min(chunk),
             (Some(radius), None) | (None, Some(radius)) => radius,
             (None, None) => render_api::UNGRANTED_VIEW_RADIUS_CHUNKS,
-        }
-        .clamp(0, MAX_VIEW_RADIUS_CHUNKS)
+        };
+        let radius = if self.progressive_view {
+            radius.min(self.requested_radius.unwrap_or(0))
+        } else {
+            radius
+        };
+        radius.clamp(0, MAX_VIEW_RADIUS_CHUNKS)
     }
     pub(super) fn column_is_active(&self, key: ChunkKey) -> bool {
         if key.dimension != self.authority.current_dimension() {

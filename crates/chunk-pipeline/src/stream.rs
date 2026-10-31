@@ -475,6 +475,10 @@ pub struct WorldStream {
     chunk_radius: Option<i32>,
     /// The view radius the player asked the server for; it sets the render distance.
     requested_radius: Option<i32>,
+    /// When set, the server publisher and grant may not widen the client beyond the requested
+    /// radius. The progressive GL path uses this so a server-side publisher update cannot flood
+    /// the join with an entire view before the client has asked for it.
+    progressive_view: bool,
     last_retention_center: Option<ChunkKey>,
     last_retention_radius: Option<i32>,
     local_player_chunk: Option<ChunkKey>,
