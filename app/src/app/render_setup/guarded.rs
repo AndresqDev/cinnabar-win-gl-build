@@ -220,13 +220,11 @@ pub(super) fn render_plugin(
     }
     Ok(RenderPlugin {
         render_creation: creation,
-        // wgpu's GLES backend funnels every pipeline creation through one EGL context
-        // and one context lock. Worker compilation therefore cannot overlap the render
-        // thread; it only lets blit/tonemapping stay queued behind tasks that are waiting
-        // for that same lock. Compile on the render thread on GL so the output blit is
-        // ready in the first frame that needs it, while native backends keep background
-        // compilation.
-        synchronous_pipeline_compilation: gl_compat,
+        // Keep pipeline compilation off the render thread. ANGLE's D3DCompiler can
+        // spend more than the hang-monitor budget on the world shader variants;
+        // compiling synchronously here blocks the frame loop and reports the client
+        // as hung. Workers let the menu keep presenting while those pipelines finish.
+        synchronous_pipeline_compilation: false,
         ..Default::default()
     })
 }
