@@ -220,11 +220,12 @@ pub(super) fn render_plugin(
     }
     Ok(RenderPlugin {
         render_creation: creation,
-        // Keep pipeline compilation off the render thread. ANGLE's D3DCompiler can
-        // spend more than the hang-monitor budget on the world shader variants;
-        // compiling synchronously here blocks the frame loop and reports the client
-        // as hung. Workers let the menu keep presenting while those pipelines finish.
-        synchronous_pipeline_compilation: false,
+        // GL/ANGLE has one EGL context for frame submission and pipeline creation.
+        // Compiling world variants in workers holds that context while D3DCompiler
+        // runs, so the render thread times out on the next submit. Menu warmup is
+        // disabled for GL; serializing the remaining first-use compiles is the safe
+        // path until a separate compile context or precompiled cache exists.
+        synchronous_pipeline_compilation: gl_compat,
         ..Default::default()
     })
 }
