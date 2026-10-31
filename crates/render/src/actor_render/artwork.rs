@@ -82,7 +82,7 @@ impl GpuGlint {
         if !changed {
             return false;
         }
-        let Some(texture) = upload_or_reduce(
+        let Some(texture) = upload_single_or_reduce(
             device,
             queue,
             &page,
@@ -429,7 +429,8 @@ impl GpuArtwork {
     }
 }
 
-/// Uploads a glint whole, retrying fresh ones at half size until one texel remains.
+/// Uploads a padded array page whole, retrying fresh ones at half size until one texel remains.
+/// Kept for page fixtures; production pages stream through [`artwork_upload`].
 fn upload_or_reduce(
     device: &RenderDevice,
     queue: &RenderQueue,
@@ -438,11 +439,37 @@ fn upload_or_reduce(
     reduce: bool,
     raw_views: ArtworkRawViews,
 ) -> Option<Texture> {
+    upload_or_reduce_with_padding(device, queue, page, label, reduce, raw_views, true)
+}
+
+/// Uploads a single-layer D2 texture, retrying fresh ones at half size until one texel remains.
+fn upload_single_or_reduce(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    page: &render_model::ActorTexturePage,
+    label: &'static str,
+    reduce: bool,
+    raw_views: ArtworkRawViews,
+) -> Option<Texture> {
+    upload_or_reduce_with_padding(device, queue, page, label, reduce, raw_views, false)
+}
+
+fn upload_or_reduce_with_padding(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    page: &render_model::ActorTexturePage,
+    label: &'static str,
+    reduce: bool,
+    raw_views: ArtworkRawViews,
+    pad_layers: bool,
+) -> Option<Texture> {
     let mut fitted = page
         .fit_within(device.limits().max_texture_dimension_2d)
         .into_owned();
     loop {
-        if let Some(texture) = upload_page(device, queue, &fitted, label, raw_views) {
+        if let Some(texture) =
+            upload_page_with_padding(device, queue, &fitted, label, raw_views, pad_layers)
+        {
             return Some(texture);
         }
         let side = u32::from(fitted.width.max(fitted.height));
@@ -461,6 +488,19 @@ fn upload_page(
     label: &'static str,
     raw_views: ArtworkRawViews,
 ) -> Option<Texture> {
+    upload_page_with_padding(device, queue, page, label, raw_views, true)
+}
+
+/// Creates and fills a page. D2-only glints pass `pad_layers == false` so wgpu does not
+/// choose the D2Array storage target before the explicit D2 view is attached.
+fn upload_page_with_padding(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    page: &render_model::ActorTexturePage,
+    label: &'static str,
+    raw_views: ArtworkRawViews,
+    pad_layers: bool,
+) -> Option<Texture> {
     #[cfg(feature = "tracy")]
     let _span = bevy::log::info_span!(
         "actor.artwork_upload",
@@ -476,12 +516,19 @@ fn upload_page(
         height: u32::from(page.height),
         depth_or_array_layers: page.layers,
     };
+    let storage_layers = if pad_layers {
+        crate::gl_compat::array_storage_layers(page.width == page.height, page.layers)
+    } else {
+        page.layers
+    };
     let storage_size = Extent3d {
-        depth_or_array_layers: crate::gl_compat::array_storage_layers(
-            page.width == page.height,
-            page.layers,
-        ),
+        depth_or_array_layers: storage_layers,
         ..size
+    };
+    let pixels = if storage_layers == page.layers {
+        std::borrow::Cow::Borrowed(page.rgba8.as_ref())
+    } else {
+        crate::gl_compat::array_pixels(page.width == page.height, page.layers, page.rgba8.as_ref())
     };
     let texture = gpu_allocation::checked(device, label, page.rgba8.len() as u64, || {
         device.create_texture(&TextureDescriptor {
@@ -497,7 +544,7 @@ fn upload_page(
     })?;
     #[cfg(test)]
     work_tests::record_upload(page.rgba8.len());
-    gpu_allocation::checked(device, "actor page upload", page.rgba8.len() as u64, || {
+    gpu_allocation::checked(device, "actor page upload", pixels.len() as u64, || {
         queue.profiled_write_texture(
             TexelCopyTextureInfo {
                 texture: &texture,
@@ -505,13 +552,13 @@ fn upload_page(
                 origin: default(),
                 aspect: default(),
             },
-            &page.rgba8,
+            &pixels,
             TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(size.width * 4),
-                rows_per_image: Some(size.height),
+                bytes_per_row: Some(storage_size.width * 4),
+                rows_per_image: Some(storage_size.height),
             },
-            size,
+            storage_size,
         )
     })?;
     Some(texture)
