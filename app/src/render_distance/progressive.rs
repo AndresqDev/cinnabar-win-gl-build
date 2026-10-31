@@ -73,6 +73,10 @@ impl WorkCounts {
 pub(super) struct ProgressInput {
     pub(super) session: u64,
     pub(super) target_radius: i32,
+    /// True while the loading screen is still building the entry view. The ramp is held at the
+    /// one-column/3x3 startup neighbourhood until the world is presentable; otherwise a high
+    /// render-distance setting can flood the join before the first playable frame.
+    pub(super) loading: bool,
     pub(super) now: Duration,
     pub(super) frame_delta: Duration,
     pub(super) work: WorkCounts,
@@ -195,13 +199,31 @@ impl ProgressiveLoad {
         self.observe_frame(input.frame_delta);
         self.observe_backlog();
 
-        let target = input
+        let requested = input
             .target_radius
             .clamp(0, render_api::MAX_VIEW_RADIUS_CHUNKS);
+        // While the loading screen is still building the entry view, do not let the user's
+        // render distance grow the join. One safe neighbourhood is enough to become playable;
+        // the full target is restored after loading releases.
+        let target = if input.loading { requested.min(1) } else { requested };
         if self.session != Some(input.session) {
             self.begin(input.session, target, input.now);
-        } else if self.desired_radius != target {
-            self.retarget(target, input.now);
+            self.desired_radius = requested;
+        } else if self.desired_radius != requested {
+            self.retarget(requested, input.now);
+        }
+        if input.loading {
+            if self.target_radius > 1 {
+                self.target_radius = 1;
+                self.phase = Phase::Ramp;
+                self.wait_reason = None;
+                self.ring_wait_started_at = None;
+            }
+        } else if self.target_radius != self.desired_radius {
+            self.target_radius = self.desired_radius;
+            self.phase = Phase::Ramp;
+            self.wait_reason = None;
+            self.ring_wait_started_at = None;
         }
         if self.current_radius > self.target_radius {
             self.current_radius = self.target_radius;
@@ -518,6 +540,7 @@ mod tests {
         ProgressInput {
             session,
             target_radius,
+            loading: false,
             now: Duration::from_millis(now_millis),
             frame_delta: Duration::from_millis(frame_millis),
             work: WorkCounts::default(),
@@ -648,6 +671,30 @@ mod tests {
         assert_eq!(load.current_radius(), 0);
         assert_eq!(load.phase(), Phase::Backoff);
         assert_eq!(load.wait_reason(), Some(WaitReason::SlowFrames));
+    }
+
+    #[test]
+    fn the_loading_screen_caps_the_entry_view_before_the_world_is_playable() {
+        let mut load = ProgressiveLoad::default();
+        let mut first = input(1, 8, 0, 16);
+        first.loading = true;
+        assert_eq!(load.update(first, |_| true), Some(0));
+        load.confirm_sent(0);
+
+        let mut ring_one = input(1, 8, 500, 16);
+        ring_one.loading = true;
+        assert_eq!(load.update(ring_one, |_| true), Some(1));
+        load.confirm_sent(1);
+        assert_eq!(load.target_radius(), 1);
+
+        let mut still_loading = input(1, 8, 1_000, 16);
+        still_loading.loading = true;
+        assert_eq!(load.update(still_loading, |_| true), None);
+        assert_eq!(load.target_radius(), 1);
+
+        let release = input(1, 8, 1_000, 16);
+        assert_eq!(load.update(release, |_| true), Some(2));
+        assert_eq!(load.target_radius(), 8);
     }
 
     #[test]

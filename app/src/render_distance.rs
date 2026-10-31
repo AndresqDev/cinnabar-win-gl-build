@@ -91,6 +91,9 @@ pub(crate) fn apply_render_distance(
         ProgressInput {
             session,
             target_radius,
+            // The loading screen must finish with a small entry view; the full render distance
+            // only ramps after the world is playable.
+            loading: ui.loading_stage().is_some(),
             now,
             frame_delta: time.delta(),
             work,
