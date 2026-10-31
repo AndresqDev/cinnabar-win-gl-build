@@ -29,6 +29,19 @@ fn capabilities(
     }
 }
 
+/// Supplies the capabilities wgpu reports for ANGLE's GLES 3.1/D3D11 adapter.
+fn angle_capabilities(flags: wgpu::DownlevelFlags, storage_buffers: u32) -> AdapterCapabilities {
+    AdapterCapabilities {
+        backend: wgpu::Backend::Gl,
+        flags,
+        limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: storage_buffers,
+            ..Default::default()
+        },
+        angle: true,
+    }
+}
+
 #[test]
 fn adapters_must_support_every_renderer_capability_and_storage_limit() {
     let required = render::minimum_vertex_storage_buffers();
@@ -84,22 +97,27 @@ fn gl_still_requires_every_other_renderer_capability() {
 }
 
 #[test]
-fn angle_gl_does_not_require_wgl_only_capabilities() {
+fn angle_gl_does_not_require_sample_rate_shading() {
+    let required = render::minimum_vertex_storage_buffers();
+    let flags = REQUIRED_DOWNLEVEL_FLAGS
+        - wgpu::DownlevelFlags::VIEW_FORMATS
+        - wgpu::DownlevelFlags::MULTISAMPLED_SHADING;
+    assert!(meets_requirements(angle_capabilities(flags, required)).is_ok());
+}
+
+#[test]
+fn angle_gl_still_requires_sixteen_byte_binding_alignment() {
     let required = render::minimum_vertex_storage_buffers();
     let flags = REQUIRED_DOWNLEVEL_FLAGS
         - wgpu::DownlevelFlags::VIEW_FORMATS
         - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
         - wgpu::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED;
-    let angle = AdapterCapabilities {
-        backend: wgpu::Backend::Gl,
-        flags,
-        limits: wgpu::Limits {
-            max_storage_buffers_per_shader_stage: required,
-            ..Default::default()
-        },
-        angle: true,
-    };
-    assert!(meets_requirements(angle).is_ok());
+    let error = meets_requirements(angle_capabilities(flags, required)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED")
+    );
 }
 
 #[test]

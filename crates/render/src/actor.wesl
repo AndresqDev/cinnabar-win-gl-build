@@ -146,6 +146,59 @@ fn instance_row(base: u32, row: u32) -> vec4<f32> {
     );
 }
 
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads. Build the
+// records from their fields; each field read lowers to a supported load.
+fn span_record(index: u32) -> GeometrySpan {
+    return GeometrySpan(
+        geometry_spans[index].first_vertex,
+        geometry_spans[index].vertex_count,
+    );
+}
+
+fn previous_bone_record(index: u32) -> BoneMatrix {
+    return BoneMatrix(
+        previous_bones[index].row_0,
+        previous_bones[index].row_1,
+        previous_bones[index].row_2,
+    );
+}
+
+fn current_bone_record(index: u32) -> BoneMatrix {
+    @if(!COMPACT_BONES) {
+        return BoneMatrix(
+            current_bones[index].row_0,
+            current_bones[index].row_1,
+            current_bones[index].row_2,
+        );
+    }
+    @if(COMPACT_BONES) {
+        let at = ACTOR_COMPACT_CURRENT_BONE_BASE + index;
+        return BoneMatrix(
+            previous_bones[at].row_0,
+            previous_bones[at].row_1,
+            previous_bones[at].row_2,
+        );
+    }
+}
+
+@if(ACTOR_MOTION)
+fn motion_record(index: u32) -> MotionInstance {
+    return MotionInstance(
+        actor_motion[index].current_clip_from_actor,
+        actor_motion[index].previous_clip_from_actor,
+        actor_motion[index].pose,
+    );
+}
+
+@if(ACTOR_MOTION)
+fn rendered_bone_record(index: u32) -> BoneMatrix {
+    return BoneMatrix(
+        rendered_previous_bones[index].row_0,
+        rendered_previous_bones[index].row_1,
+        rendered_previous_bones[index].row_2,
+    );
+}
+
 @if(ACTOR_MASK)
 @group(2) @binding(0) var<uniform> mask_displacement: vec4<f32>;
 
@@ -161,7 +214,7 @@ fn actor_vertex(
     let texture_layer = instance_words[instance_base + 15u];
     let partial_tick = clamp(word_f32(instance_base + 16u), 0.0, 1.0);
     let overlay_rgba8 = instance_words[instance_base + 19u];
-    let span = geometry_spans[geometry_id];
+    let span = span_record(geometry_id);
 
     var out: VertexOutput;
     out.skin_info.x = texture_layer;
@@ -228,11 +281,8 @@ fn actor_vertex(
     out.back_uv = select(uv_offset + raw_back_uv * uv_scale, raw_back_uv, raw_back_uv.x < -1.0e8);
     let bone_index = vertex_words[vertex_base + 10u];
     out.material_parameters.y = vertex_words[vertex_base + 11u];
-    let previous_bone = previous_bones[previous_bone_base + bone_index];
-    @if(!COMPACT_BONES)
-    let current_bone = current_bones[current_bone_base + bone_index];
-    @if(COMPACT_BONES)
-    let current_bone = previous_bones[ACTOR_COMPACT_CURRENT_BONE_BASE + current_bone_base + bone_index];
+    let previous_bone = previous_bone_record(previous_bone_base + bone_index);
+    let current_bone = current_bone_record(current_bone_base + bone_index);
     let posed = posed_point(previous_bone, current_bone, local, partial_tick);
     let bone_normal = posed_normal(previous_bone, current_bone, local_normal, partial_tick);
     let placement = BoneMatrix(
@@ -246,11 +296,11 @@ fn actor_vertex(
     out.position = view.clip_from_world * world;
     @if(ACTOR_MOTION)
     {
-        let motion = actor_motion[instance_index];
+        let motion = motion_record(instance_index);
         out.current_clip = motion.current_clip_from_actor * vec4(posed, 1.0);
         out.previous_clip = out.current_clip;
         if (motion.pose.y != 0u) {
-            let previous_rendered = transform_point(rendered_previous_bones[motion.pose.x + bone_index], local);
+            let previous_rendered = transform_point(rendered_bone_record(motion.pose.x + bone_index), local);
             out.previous_clip = motion.previous_clip_from_actor * vec4(previous_rendered, 1.0);
         }
     }

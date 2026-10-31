@@ -8,7 +8,8 @@
 //! command lists, queue-write staging and indirect-validation buffers until the GPU finishes it.
 //! A presented window waits on its swap chain, but hidden clients render with none, so without
 //! this bound a join or another GPU-heavy process lets frames queue until the driver runs out of
-//! memory.
+//! memory. AutoFinish GL fences complete at submission, so they cannot provide this bound; the
+//! swap chain remains the pacing mechanism there.
 
 use bevy::{
     prelude::{IntoScheduleConfigs, Res, ResMut, Resource, SubApp, SystemSet, warn},
@@ -18,7 +19,7 @@ use bevy::{
         renderer::{RenderDevice, RenderQueue, render_system},
     },
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::OnceLock};
 
 #[cfg(test)]
 #[path = "device_poll_tests.rs"]
@@ -29,9 +30,19 @@ mod tests;
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// Submission markers of the frames that may still be on the GPU, oldest first. GL keeps a
-/// marker without reserving an empty submission for it.
+/// marker without reserving an empty submission only when its fences are AutoFinish.
 #[derive(Resource, Default)]
 pub(crate) struct FramesInFlight(VecDeque<Option<wgpu::SubmissionIndex>>);
+
+/// Whether GL fences short-circuit at submission instead of tracking GPU completion.
+fn auto_finish() -> bool {
+    static AUTO_FINISH: OnceLock<bool> = OnceLock::new();
+    *AUTO_FINISH.get_or_init(|| {
+        wgpu::wgt::GlFenceBehavior::from_env()
+            .unwrap_or_default()
+            .is_auto_finish()
+    })
+}
 
 impl FramesInFlight {
     /// Marks the end of this frame's submissions and polls the device once: without blocking
@@ -42,10 +53,9 @@ impl FramesInFlight {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<wgpu::PollStatus, wgpu::PollError> {
-        // The GL backend executes an empty submit under the context lock and signals a fence for
-        // it. Nothing needs that marker: a wait without an index waits for the latest real
-        // submission, and we already bound how many frames may be outstanding.
-        let marker = if crate::gl_compat::enabled() {
+        // AutoFinish fences complete at submission, so an empty submit marker buys nothing and
+        // takes the GL context lock. Normal fences need it to learn the oldest unfinished frame.
+        let marker = if crate::gl_compat::enabled() && auto_finish() {
             None
         } else {
             Some(queue.submit([]))
@@ -93,7 +103,8 @@ pub(crate) fn install(render_app: &mut SubApp) {
         );
 }
 
-/// Runs callback from a device poll after all submissions so far, including this frame, complete.
+/// Runs callback from a device poll after all submissions so far complete under the device's
+/// fence semantics. AutoFinish GL fences report submission-time completion, not GPU execution.
 /// Call after the resource's last submission. Before rendering, only retire storage that
 /// this frame no longer uses; FrameSubmissions systems may also retire this frame's storage.
 pub(crate) fn on_frame_complete(queue: &RenderQueue, callback: impl FnOnce() + Send + 'static) {

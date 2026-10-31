@@ -34,17 +34,17 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: false
+
       - name: Show toolchain versions
         shell: bash
         run: |
           rustc --version
           cargo --version
           go version
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: 'stable'
-          cache: false
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -104,14 +104,18 @@ jobs:
             if (-not (Test-Path $source)) { throw "ANGLE runtime is missing $name" }
             Copy-Item $source (Join-Path $out $name) -Force
           }
-          Copy-Item (Join-Path $dir "LICENSE") (Join-Path $out "ANGLE-LICENSE.txt") -Force
+          # Electron's LICENSE is MIT, not ANGLE's BSD license. The Chromium
+          # third-party notice file contains the ANGLE license text.
+          Copy-Item (Join-Path $dir "LICENSE") (Join-Path $out "Electron-LICENSE.txt") -Force
+          Copy-Item (Join-Path $dir "LICENSES.chromium.html") `
+            (Join-Path $out "THIRD_PARTY_LICENSES.chromium.html") -Force
           Copy-Item "packaging/windows/run-angle.bat" $out -Force
           Copy-Item "packaging/windows/ANGLE-README.txt" $out -Force
 
       - name: Show ANGLE payload
         shell: bash
         run: |
-          ls -lh dist/Cinnabar-Windows-ANGLE/{cinnabar.exe,libEGL.dll,libGLESv2.dll,d3dcompiler_47.dll,run-angle.bat}
+          ls -lh dist/Cinnabar-Windows-ANGLE/{cinnabar.exe,libEGL.dll,libGLESv2.dll,d3dcompiler_47.dll,run-angle.bat,ANGLE-README.txt,Electron-LICENSE.txt,THIRD_PARTY_LICENSES.chromium.html}
           du -sh dist/Cinnabar-Windows-ANGLE
 
       - name: Archive ANGLE payload
@@ -131,4 +135,5 @@ jobs:
           path: |
             dist/Cinnabar-Windows-ANGLE
             dist/Cinnabar-Windows-ANGLE-*.zip
+          if-no-files-found: error
           retention-days: 7

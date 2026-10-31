@@ -9,6 +9,32 @@ struct Instance { transform: mat4x4<f32>, tint: vec4<f32>, line: vec4<f32>, para
 const MITER_LIMIT: f32 = 4.0;
 struct Pair { a: vec4<f32>, b: vec4<f32>, ta: f32, tb: f32, valid: bool }
 
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+fn load_vertex(index: u32) -> Vertex {
+    return Vertex(
+        vertices[index].a,
+        vertices[index].b,
+        vertices[index].c,
+        vertices[index].color_a,
+        vertices[index].color_b,
+        vertices[index].uv,
+        vertices[index].data,
+        vertices[index].shape,
+    );
+}
+
+fn load_instance(index: u32) -> Instance {
+    var instance: Instance;
+    instance.transform = instances[index].transform;
+    instance.tint = instances[index].tint;
+    instance.line = instances[index].line;
+    instance.params[0] = instances[index].params[0];
+    instance.params[1] = instances[index].params[1];
+    instance.params[2] = instances[index].params[2];
+    instance.params[3] = instances[index].params[3];
+    return instance;
+}
+
 // Clip to WebGPU's near half-space before dividing by W, including orthographic views.
 fn clip_pair(a: vec4<f32>, b: vec4<f32>) -> Pair {
     let da = a.w - a.z; let db = b.w - b.z;
@@ -49,7 +75,7 @@ fn inner_miter(n0: vec2<f32>, n1: vec2<f32>, lengths: vec2<f32>, radius: f32) ->
 }
 @vertex
 fn vertex(@builtin(vertex_index) index: u32, @builtin(instance_index) instance_index: u32) -> MaterialInput {
-    let vertex = vertices[index]; let instance = instances[instance_index];
+    let vertex = load_vertex(index); let instance = load_instance(instance_index);
     var output: MaterialInput;
     output.position = clip_position(instance, vertex.a.xyz);
     output.color = vertex.color_a * instance.tint;

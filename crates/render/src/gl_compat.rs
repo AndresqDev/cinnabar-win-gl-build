@@ -1,4 +1,4 @@
-//! Compatibility policy for the native OpenGL backend.
+//! Compatibility policy for the OpenGL and ANGLE/GLES backends.
 //!
 //! wgpu's GL/GLES backend cannot create the alternate sRGB/linear texture views Cinnabar uses.
 //! The GL fallback therefore renders the main scene in one sRGB attachment and flattens every

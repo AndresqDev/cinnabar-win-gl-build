@@ -56,8 +56,14 @@ fn model_templates_length() -> u32 {
 @group(0) @binding(14) var<storage, read> transparent_refs_data: array<TransparentDrawRef>;
 
 // Reads the same typed record from either terrain layout.
+// Whole-struct SSBO loads are unsupported by ANGLE's D3D11 translator.
 fn transparent_refs(index: u32) -> TransparentDrawRef {
-    @if(!PACKED_TERRAIN) return transparent_refs_data[index];
+    @if(!PACKED_TERRAIN) {
+        return TransparentDrawRef(
+            transparent_refs_data[index].liquid_record_index,
+            transparent_refs_data[index].metadata_index,
+        );
+    }
     @if(PACKED_TERRAIN) {
         if (index >= transparent_refs_length()) { var empty: TransparentDrawRef; return empty; }
         let base = index * 2u;

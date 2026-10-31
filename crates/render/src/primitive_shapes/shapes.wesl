@@ -29,6 +29,27 @@ struct VertexOutput {
     @location(3) @interpolate(flat) backface: u32,
 }
 
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads. Read each
+// record through its fields, which lower to supported scalar/vector loads.
+fn shape_record(index: u32) -> Shape {
+    return Shape(
+        shapes[index].transform,
+        shapes[index].color,
+        shapes[index].data,
+        shapes[index].flags,
+        shapes[index].lifetime,
+    );
+}
+
+fn text_record(index: u32) -> TextRecord {
+    return TextRecord(
+        texts[index].rect,
+        texts[index].uv,
+        texts[index].color,
+        texts[index].flags,
+    );
+}
+
 // Attachments past the actor arena's binding limit stay hidden, like missing actors.
 fn attached(shape: Shape) -> bool {
     return shape.flags.z!=0xffffffffu;
@@ -59,7 +80,7 @@ fn visible(shape: Shape, origin: vec3<f32>) -> bool {
 // Unit meshes use packet-time transforms; actor offsets remain independently updateable.
 @vertex
 fn shape_vertex(@location(0) vertex: vec4<f32>, @builtin(instance_index) index: u32) -> VertexOutput {
-    let shape=shapes[index];
+    let shape=shape_record(index);
     let origin=anchor(shape);
     var point=vertex.xyz;
     if shape.flags.w==ARROW_KIND_VALUEu {
@@ -86,9 +107,9 @@ fn native_acos(value:f32) -> f32 {
 // Facing uses the unlifted anchor, while multiline lift remains independent of scale.
 @vertex
 fn text_vertex(@builtin(vertex_index) vertex:u32,@builtin(instance_index) index:u32) -> VertexOutput {
-    let record=texts[index];
+    let record=text_record(index);
     let in_arena=record.flags.x<arrayLength(&shapes);
-    let shape=shapes[min(record.flags.x,arrayLength(&shapes)-1u)];
+    let shape=shape_record(min(record.flags.x,arrayLength(&shapes)-1u));
     let origin=anchor(shape);
     let at=array<vec2<f32>,6>(vec2(0.0,0.0),vec2(1.0,0.0),vec2(1.0,1.0),vec2(0.0,0.0),vec2(1.0,1.0),vec2(0.0,1.0))[vertex];
     let local=mix(record.rect.xy,record.rect.zw,at);

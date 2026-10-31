@@ -49,7 +49,12 @@ fn far_vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) slot:
     let quad = quads[vertex / 6u];
     var triangles = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
     let corner = triangles[vertex % 6u];
-    let tile = tiles[slot];
+    let tile = FarTile(
+        tiles[slot].origin_x,
+        tiles[slot].origin_z,
+        tiles[slot].level,
+        tiles[slot].padding,
+    );
     let x = f32(quad.x & 127u);
     let z = f32((quad.x >> 7u) & 127u);
     let w = f32((quad.x >> 14u) & 127u);

@@ -81,7 +81,19 @@ fn weather_vertex(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOutput {
-    let layer = layers[instance_index];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let layer = Layer(
+        layers[instance_index].base_offset,
+        layers[instance_index].velocity,
+        layers[instance_index].uv_rect,
+        layers[instance_index].dimensions,
+        layers[instance_index].first_particle,
+        layers[instance_index].particle_count,
+        layers[instance_index].kind,
+        layers[instance_index]._pad0,
+        layers[instance_index]._pad1,
+        layers[instance_index]._pad2,
+    );
     let quad = vertex_index / 6u;
     var out: VertexOutput;
     if (quad >= layer.particle_count) {

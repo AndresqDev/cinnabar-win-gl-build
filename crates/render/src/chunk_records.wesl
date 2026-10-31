@@ -11,8 +11,14 @@ struct AnimationClockGpu { tick: u32, partial_tick: f32, reserved_a: u32, reserv
 @group(0) @binding(2) var<storage, read> chunk_origins_data: array<ChunkOrigin>;
 
 // Reads the same typed record from either terrain layout.
+// Whole-struct SSBO loads are unsupported by ANGLE's D3D11 translator.
 fn chunk_origins(index: u32) -> ChunkOrigin {
-    @if(!PACKED_TERRAIN) return chunk_origins_data[index];
+    @if(!PACKED_TERRAIN) {
+        return ChunkOrigin(
+            chunk_origins_data[index].value,
+            chunk_origins_data[index].stream_bases,
+        );
+    }
     @if(PACKED_TERRAIN) {
         if (index >= chunk_origins_length()) { var empty: ChunkOrigin; return empty; }
         let base = index * 8u;
@@ -29,8 +35,16 @@ fn chunk_origins_length() -> u32 {
 @group(0) @binding(9) var<storage, read> animations_data: array<AnimationGpu>;
 
 // Reads the same typed record from either terrain layout.
+// Whole-struct SSBO loads are unsupported by ANGLE's D3D11 translator.
 fn animations(index: u32) -> AnimationGpu {
-    @if(!PACKED_TERRAIN) return animations_data[index];
+    @if(!PACKED_TERRAIN) {
+        return AnimationGpu(
+            animations_data[index].frame_start,
+            animations_data[index].frame_count,
+            animations_data[index].ticks_per_frame,
+            animations_data[index].flags,
+        );
+    }
     @if(PACKED_TERRAIN) {
         if (index >= animations_length()) { var empty: AnimationGpu; return empty; }
         let base = index * 4u;

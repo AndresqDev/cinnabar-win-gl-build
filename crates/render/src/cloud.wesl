@@ -128,7 +128,12 @@ fn native_cloud_vertex_colour(record: ViewportCloudQuad, world_position: vec3<f3
 fn cloud_vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     let quad_index = vertex_index / 6u;
     let corner_index = vertex_index % 6u;
-    let record = cloud_records[quad_index];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let record = ViewportCloudQuad(
+        cloud_records[quad_index].cell,
+        cloud_records[quad_index].face,
+        cloud_records[quad_index].colour,
+    );
     let world_position = reconstruct_world_position(record, face_corner_uv(record.face, corner_index));
     return VertexOutput(
         view.clip_from_world * vec4(world_position, 1.0),

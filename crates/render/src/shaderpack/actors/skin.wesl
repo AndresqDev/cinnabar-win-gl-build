@@ -69,6 +69,44 @@ fn instance_row(base: u32, row: u32) -> vec4<f32> {
     return vec4(word_f32(offset), word_f32(offset + 1u), word_f32(offset + 2u), word_f32(offset + 3u));
 }
 
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads. Build each
+// record from its fields, which lower to supported scalar/vector loads.
+fn span_record(index: u32) -> GeometrySpan {
+    return GeometrySpan(
+        geometry_spans[index].first_vertex,
+        geometry_spans[index].vertex_count,
+    );
+}
+
+fn previous_bone_record(index: u32) -> BoneMatrix {
+    return BoneMatrix(
+        previous_bones[index].row_0,
+        previous_bones[index].row_1,
+        previous_bones[index].row_2,
+    );
+}
+
+fn current_bone_record(index: u32) -> BoneMatrix {
+    return BoneMatrix(
+        current_bones[index].row_0,
+        current_bones[index].row_1,
+        current_bones[index].row_2,
+    );
+}
+
+fn job_record(index: u32) -> SkinJob {
+    return SkinJob(
+        jobs[index].instance,
+        jobs[index].first_output,
+        jobs[index].vertex_count,
+        jobs[index].flags,
+        jobs[index].light,
+        jobs[index].colour,
+        jobs[index].block_id,
+        jobs[index].first_output_high,
+    );
+}
+
 fn rig_f32(index: u32) -> f32 {
     return bitcast<f32>(vertex_words[index]);
 }
@@ -78,14 +116,14 @@ fn skin_corner(job: SkinJob, vertex: u32) -> Corner {
     let instance_base = job.instance * ACTOR_GPU_INSTANCE_WORDS;
     let previous_bone_base = instance_words[instance_base + 12u];
     let current_bone_base = instance_words[instance_base + 13u];
-    let span = geometry_spans[instance_words[instance_base + 14u]];
+    let span = span_record(instance_words[instance_base + 14u]);
     let partial_tick = clamp(word_f32(instance_base + 16u), 0.0, 1.0);
     let base = (span.first_vertex + vertex) * ACTOR_RIG_VERTEX_WORDS;
     let local = vec3(rig_f32(base), rig_f32(base + 1u), rig_f32(base + 2u));
     let local_normal = vec3(rig_f32(base + 3u), rig_f32(base + 4u), rig_f32(base + 5u));
     let bone_index = vertex_words[base + 10u];
-    let previous_bone = previous_bones[previous_bone_base + bone_index];
-    let current_bone = current_bones[current_bone_base + bone_index];
+    let previous_bone = previous_bone_record(previous_bone_base + bone_index);
+    let current_bone = current_bone_record(current_bone_base + bone_index);
     let placement = BoneMatrix(
         instance_row(instance_base, 0u),
         instance_row(instance_base, 1u),
@@ -106,7 +144,7 @@ fn skin_corner(job: SkinJob, vertex: u32) -> Corner {
 // Quad matching needs local positions and texture coordinates without repeating bone skinning.
 fn skin_texture_corner(job: SkinJob, vertex: u32) -> Corner {
     let instance_base = job.instance * ACTOR_GPU_INSTANCE_WORDS;
-    let span = geometry_spans[instance_words[instance_base + 14u]];
+    let span = span_record(instance_words[instance_base + 14u]);
     let base = (span.first_vertex + vertex) * ACTOR_RIG_VERTEX_WORDS;
     let uv_offset = vec2(word_f32(instance_base + 20u), word_f32(instance_base + 21u));
     let uv_scale = vec2(word_f32(instance_base + 22u), word_f32(instance_base + 23u));
@@ -217,7 +255,7 @@ fn skin_rig(
     if (job_index >= params.counts.x) {
         return;
     }
-    let job = jobs[params.counts.y + job_index];
+    let job = job_record(params.counts.y + job_index);
     let vertex = id.x + (id.z % x_blocks) * groups.x * SKIN_WORKGROUP_SIZE;
     if (vertex >= job.vertex_count) {
         return;

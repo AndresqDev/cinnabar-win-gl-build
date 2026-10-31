@@ -42,7 +42,19 @@ fn corner(index: u32) -> vec2<f32> {
 
 @vertex
 fn nametag_vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    let record = records[vertex_index / 6u];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let index = vertex_index / 6u;
+    let record = Record(
+        records[index].anchor,
+        records[index].text,
+        records[index].rect,
+        records[index].uv,
+        records[index].color,
+        records[index].line_lift,
+        records[index].depth_tested,
+        records[index].padding1,
+        records[index].padding2,
+    );
     let at = corner(vertex_index % 6u);
     // Every tag shares the camera rotation, including at the edges of the view.
     let right = normalize(view.world_from_view[0].xyz);

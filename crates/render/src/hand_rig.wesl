@@ -39,13 +39,41 @@ struct HandMaterial {
 @group(0) @binding(5) var<storage, read> current_bones: array<BoneMatrix>;
 
 // The compact pose stores equal-sized previous and current endpoint arrays together.
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads; build each
+// record from its fields instead.
 fn current_bone(index: u32) -> BoneMatrix {
-    @if(!COMPACT_BONES) return current_bones[index];
+    @if(!COMPACT_BONES) {
+        return BoneMatrix(
+            current_bones[index].row_0,
+            current_bones[index].row_1,
+            current_bones[index].row_2,
+        );
+    }
     @if(COMPACT_BONES) {
         let count = arrayLength(&previous_bones) / 2u;
         if (index >= count) { var empty: BoneMatrix; return empty; }
-        return previous_bones[count + index];
+        let at = count + index;
+        return BoneMatrix(
+            previous_bones[at].row_0,
+            previous_bones[at].row_1,
+            previous_bones[at].row_2,
+        );
     }
+}
+
+fn previous_bone(index: u32) -> BoneMatrix {
+    return BoneMatrix(
+        previous_bones[index].row_0,
+        previous_bones[index].row_1,
+        previous_bones[index].row_2,
+    );
+}
+
+fn span_record(index: u32) -> GeometrySpan {
+    return GeometrySpan(
+        geometry_spans[index].first_vertex,
+        geometry_spans[index].vertex_count,
+    );
 }
 @group(0) @binding(6) var skins: texture_2d_array<f32>;
 @group(0) @binding(7) var skin_sampler: sampler;
@@ -123,7 +151,7 @@ fn hand_vertex(
     let geometry_id = instance_words[instance_base + 14u];
     let texture_layer = instance_words[instance_base + 15u];
     let partial_tick = clamp(word_f32(instance_base + 16u), 0.0, 1.0);
-    let span = geometry_spans[geometry_id];
+    let span = span_record(geometry_id);
 
     var out: VertexOutput;
     out.skin_layer = texture_layer;
@@ -159,12 +187,12 @@ fn hand_vertex(
         bitcast<f32>(vertex_words[vertex_base + 9u]),
     );
     let bone_index = vertex_words[vertex_base + 10u];
-    let posed = posed_point(previous_bones[previous_bone_base + bone_index], current_bone(current_bone_base + bone_index), local, partial_tick);
+    let posed = posed_point(previous_bone(previous_bone_base + bone_index), current_bone(current_bone_base + bone_index), local, partial_tick);
     let placement = BoneMatrix(instance_row(instance_base, 0u), instance_row(instance_base, 1u), instance_row(instance_base, 2u));
     let world = vec4(placed_point(placement, posed), 1.0);
     out.position = view.clip_from_hand * world;
     if (hand_light.java_lights[0].w != 0.0) {
-        let previous_matrix = previous_bones[previous_bone_base + bone_index];
+        let previous_matrix = previous_bone(previous_bone_base + bone_index);
         let current_matrix = current_bone(current_bone_base + bone_index);
         let bone = transpose(mat3x3(
             mix(previous_matrix.row_0.xyz, current_matrix.row_0.xyz, partial_tick),

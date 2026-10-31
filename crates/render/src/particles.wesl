@@ -32,7 +32,15 @@ fn particle_vertex(
         vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
         vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0),
     );
-    let particle = particles[instance_index];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let particle = Particle(
+        particles[instance_index].center_light,
+        particles[instance_index].axis_x,
+        particles[instance_index].axis_y,
+        particles[instance_index].uv,
+        particles[instance_index].texture_bounds,
+        particles[instance_index].color,
+    );
     let corner = corners[vertex_index];
     let world_position = particle.center_light.xyz
         + particle.axis_x.xyz * corner.x

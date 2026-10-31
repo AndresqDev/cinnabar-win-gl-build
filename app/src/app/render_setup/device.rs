@@ -121,7 +121,9 @@ pub(super) fn instance(
         backends: flags(backend),
         flags: settings.instance_flags,
         memory_budget_thresholds: settings.instance_memory_budget_thresholds,
-        backend_options: Default::default(),
+        // wgpu does not apply backend environment overrides itself; this keeps
+        // WGPU_GL_FENCE_BEHAVIOR (AutoFinish on the ANGLE launcher) effective.
+        backend_options: wgpu::BackendOptions::from_env_or_default(),
         display,
     };
     #[cfg(target_os = "macos")]
@@ -176,12 +178,81 @@ pub(super) fn force_fallback(settings: &WgpuSettings) -> bool {
     })
 }
 
+/// Opt-in one-time capability dump for adapter compatibility reports.
+fn diagnostics_requested() -> bool {
+    env_compat::var_os("CINNABAR_RENDER_DIAGNOSTICS").is_some_and(|value| value == "1")
+}
+
+/// Logs the exact capability matrix the renderer selected, before device creation can fail.
+fn log_adapter_capabilities(
+    adapter: &wgpu::Adapter,
+    features: &wgpu::Features,
+    limits: &wgpu::Limits,
+) {
+    if !diagnostics_requested() {
+        return;
+    }
+    let info = adapter.get_info();
+    let angle = is_angle(&info);
+    let downlevel = adapter.get_downlevel_capabilities();
+    log(format_args!(
+        "Renderer capabilities: name={:?} backend={:?} angle={} driver={:?} driver_info={:?} \
+         shader_model={:?} downlevel={:?} adapter_features={:?} requested_features={:?} \
+         limits={:?}",
+        info.name,
+        info.backend,
+        angle,
+        info.driver,
+        info.driver_info,
+        downlevel.shader_model,
+        downlevel.flags,
+        adapter.features(),
+        features,
+        limits,
+    ));
+    let formats = [
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Depth32Float,
+        wgpu::TextureFormat::Depth24PlusStencil8,
+    ];
+    let described: Vec<String> = formats
+        .into_iter()
+        .map(|format| {
+            let format_features = adapter.get_texture_format_features(format);
+            format!(
+                "{format:?}: usages={:?} flags={:?}",
+                format_features.allowed_usages, format_features.flags
+            )
+        })
+        .collect();
+    log(format_args!(
+        "Renderer format support: {}",
+        described.join("; ")
+    ));
+}
+
+/// Logs the GL environment controls that change device and fence behavior.
+fn log_render_settings(settings: &WgpuSettings) {
+    if !diagnostics_requested() {
+        return;
+    }
+    let fence = wgpu::wgt::GlFenceBehavior::from_env().unwrap_or_default();
+    log(format_args!(
+        "Renderer GL settings: gles_minor={:?} fence={fence:?}",
+        settings.gles3_minor_version
+    ));
+}
+
 /// Opens a device for a candidate that already passed renderer capability checks.
 pub(super) async fn request_device(
     adapter: &wgpu::Adapter,
     settings: &WgpuSettings,
 ) -> Result<(wgpu::Device, wgpu::Queue)> {
     let (features, limits) = device_requirements(adapter, settings);
+    log_adapter_capabilities(adapter, &features, &limits);
+    log_render_settings(settings);
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: settings.device_label.as_deref(),
@@ -205,14 +276,18 @@ const REQUIRED_DOWNLEVEL_FLAGS: wgpu::DownlevelFlags = wgpu::DownlevelFlags::BAS
     .union(wgpu::DownlevelFlags::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES)
     .union(wgpu::DownlevelFlags::MULTISAMPLED_SHADING);
 
+/// Whether an adapter is ANGLE's GLES translator rather than a native OpenGL driver.
+fn is_angle(info: &wgpu::AdapterInfo) -> bool {
+    info.driver_info.contains("ANGLE") || info.name.starts_with("ANGLE")
+}
+
 /// A candidate's capability snapshot, independent of native device creation.
 pub(super) struct AdapterCapabilities {
     backend: wgpu::Backend,
     flags: wgpu::DownlevelFlags,
     limits: wgpu::Limits,
     /// ANGLE exposes GLES rather than desktop GL. Its D3D11 translator reports
-    /// capabilities that do not match the native WGL path, notably missing
-    /// multisample shading and 16-byte buffer-binding alignment.
+    /// GLES 3.1 capabilities, notably without sample-rate shading.
     angle: bool,
 }
 
@@ -224,7 +299,7 @@ impl From<&wgpu::Adapter> for AdapterCapabilities {
             backend: info.backend,
             flags: adapter.get_downlevel_capabilities().flags,
             limits: adapter.limits(),
-            angle: info.driver_info.contains("ANGLE") || info.name.starts_with("ANGLE"),
+            angle: is_angle(&info),
         }
     }
 }
@@ -237,12 +312,11 @@ fn required_downlevel_flags(adapter: &AdapterCapabilities) -> wgpu::DownlevelFla
         REQUIRED_DOWNLEVEL_FLAGS
     };
     if adapter.angle {
-        // The GL compatibility path disables MSAA, and wgpu's ANGLE adapter
-        // intentionally clears the 16-byte alignment capability. Neither is
-        // used by the terrain or actor paths on this build.
-        required
-            - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
-            - wgpu::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED
+        // The GL compatibility path forces single-sample rendering and skips
+        // the two shaders that read sample_index. The 16-byte alignment flag is
+        // still required: wgpu rejects small uniform bindings without it, and
+        // the pinned ANGLE patch restores it for Windows.
+        required - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
     } else {
         required
     }

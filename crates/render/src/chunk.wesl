@@ -344,7 +344,11 @@ struct CubeQuad {
 
 /// Decodes packed quad `instance_index` of the section in origin slot `metadata_index`.
 fn cube_quad(instance_index: u32, metadata_index: u32) -> CubeQuad {
-    let quad = quads[instance_index];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let quad = PackedQuad(
+        quads[instance_index].geometry,
+        quads[instance_index].material_id,
+    );
     let geometry = quad.geometry;
     let local_origin = vec3<f32>(
         f32(geometry & 0x1fu),

@@ -26,9 +26,20 @@ struct VertexOutput {
 
 const TAU: f32 = 6.2831853;
 
+// ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+fn load_vertex(index: u32) -> ModVertex {
+    return ModVertex(
+        vertices[index].anchor,
+        vertices[index].shape,
+        vertices[index].color,
+        vertices[index].uv,
+        vertices[index].style,
+    );
+}
+
 @vertex
 fn mod_primitive_vertex(@builtin(vertex_index) index: u32) -> VertexOutput {
-    let v = vertices[index];
+    let v = load_vertex(index);
     let anchor = v.anchor.xyz;
     let kind = u32(v.anchor.w + 0.5);
     let to_eye = view.world_position - anchor;

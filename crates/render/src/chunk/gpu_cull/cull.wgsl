@@ -78,6 +78,29 @@ struct CullView {
 var<workgroup> sums: array<vec4<u32>, WORKGROUP>;
 var<workgroup> occluded_bits: array<atomic<u32>, OCCLUSION_WORDS>;
 
+// ANGLE's D3D11 translator cannot lower a whole-struct SSBO load. Load each
+// field (and array element) individually instead.
+fn load_record(index: u32) -> CullRecord {
+    var record: CullRecord;
+    record.origin_x = records[index].origin_x;
+    record.origin_y = records[index].origin_y;
+    record.origin_z = records[index].origin_z;
+    record.base_vertex = records[index].base_vertex;
+    record.bounds_min = records[index].bounds_min;
+    record.bounds_max = records[index].bounds_max;
+    record.cube_start = records[index].cube_start;
+    record.cube_end = records[index].cube_end;
+    record.solid_ends[0] = records[index].solid_ends[0];
+    record.solid_ends[1] = records[index].solid_ends[1];
+    record.solid_ends[2] = records[index].solid_ends[2];
+    record.model_start = records[index].model_start;
+    record.model_count = records[index].model_count;
+    record.liquid_start = records[index].liquid_start;
+    record.liquid_count = records[index].liquid_count;
+    record.live = records[index].live;
+    return record;
+}
+
 fn record_origin(record: CullRecord) -> vec3<i32> {
     return vec3(record.origin_x, record.origin_y, record.origin_z);
 }
@@ -283,7 +306,7 @@ fn unpack_draws(draws: u32) -> vec4<u32> {
 }
 
 fn record_decision(slot: u32) -> u32 {
-    let record = records[slot];
+    let record = load_record(slot);
     let late = view.params.z == PHASE_LATE;
     let visible = record.live != 0u && slot_enabled(slot) && in_frustum(record_origin(record));
     var draw = false;
@@ -392,7 +415,7 @@ fn cull_emit(
         return;
     }
     let offset = group_sums[wid.x] + sums[lid] - mine;
-    let record = records[ranked_slot(gid.x)];
+    let record = load_record(ranked_slot(gid.x));
     solid_runs(record, true, offset.x);
     if (mine.y != 0u) {
         let cutout = cutout_range(record);
@@ -418,7 +441,7 @@ fn cull_occlusion(
     }
     workgroupBarrier();
     if (gid.x < view.params.x) {
-        let record = records[gid.x];
+        let record = load_record(gid.x);
         if (record.live != 0u && !hiz_test(record, true)) {
             atomicOr(&occluded_bits[lid / 32u], 1u << (lid % 32u));
         }

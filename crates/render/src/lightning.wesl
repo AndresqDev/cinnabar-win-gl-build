@@ -32,7 +32,13 @@ fn corner_uv(corner_index: u32) -> vec2<f32> {
 
 @vertex
 fn lightning_vertex(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    let ribbon = ribbons[vertex_index / 6u];
+    // ANGLE's D3D11 translator cannot lower whole-struct SSBO loads.
+    let ribbon = Ribbon(
+        ribbons[vertex_index / 6u].start,
+        ribbons[vertex_index / 6u].half_width,
+        ribbons[vertex_index / 6u].end,
+        ribbons[vertex_index / 6u].intensity,
+    );
     let corner = corner_uv(vertex_index % 6u);
     let axis = ribbon.end - ribbon.start;
     let to_camera = view.world_position - (ribbon.start + ribbon.end) * 0.5;

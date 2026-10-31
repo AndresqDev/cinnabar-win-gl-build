@@ -15,8 +15,19 @@ struct MaterialGpu {
 @group(0) @binding(3) var<storage, read> materials_data: array<MaterialGpu>;
 
 // Reads the same typed record from either terrain layout.
+// ANGLE's D3D11 SSBO translator cannot lower a whole-struct load; construct the
+// record from its fields, which lowers to supported scalar SSBO loads.
 fn materials(index: u32) -> MaterialGpu {
-    @if(!PACKED_TERRAIN) return materials_data[index];
+    @if(!PACKED_TERRAIN) {
+        return MaterialGpu(
+            materials_data[index].texture,
+            materials_data[index].flags,
+            materials_data[index].animation,
+            materials_data[index].variation_start,
+            materials_data[index].variation_count,
+            materials_data[index].variation_weight,
+        );
+    }
     @if(PACKED_TERRAIN) {
         if (index >= materials_length()) { var empty: MaterialGpu; return empty; }
         let base = index * 6u;
