@@ -699,8 +699,8 @@ new_enumerate = """        let extensions = unsafe { gl.get_parameter_string(glo
         };
 
         let gl = ManuallyDrop::new(gl);
-        let compile = inner.create_compile_context().map(Mutex::new);
         inner.egl.unmake_current();
+        let compile = inner.create_compile_context().map(Mutex::new);
 
         unsafe {
             super::Adapter::expose(
