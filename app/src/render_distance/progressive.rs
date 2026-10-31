@@ -154,7 +154,7 @@ pub(super) struct ProgressTelemetry {
 /// Session-local progressive radius state. It never sends packets itself: the caller confirms a
 /// successful send so a failed send is retried without duplicating a request the server accepted.
 #[derive(Debug, Default)]
-pub(super) struct ProgressiveLoad {
+pub(crate) struct ProgressiveLoad {
     session: Option<u64>,
     /// The radius the user asked for. A stalled ramp lowers `target_radius` without losing this,
     /// so later frames do not mistake the effective target for a new user request.

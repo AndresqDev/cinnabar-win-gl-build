@@ -5,7 +5,7 @@
 //! sector request, so camera direction is expressed only through the stream's work ranking
 //! (`WorldStream::set_view_forward`), never through a fabricated packet.
 
-mod progressive;
+pub(crate) mod progressive;
 
 use crate::runtime::network::resource_packs::PackApplication;
 use crate::runtime::world::ClientWorld;
@@ -22,7 +22,7 @@ use progressive::{ProgressInput, ProgressiveLoad, WorkCounts};
 /// Suppresses the repeated `PacketSendError::Closed` warning a closing transport produces every
 /// frame. Recovery clears it, so a later closure in the same session is still reported.
 #[derive(Default)]
-struct ClosedSendLog {
+pub(crate) struct ClosedSendLog {
     session: Option<u64>,
 }
 
