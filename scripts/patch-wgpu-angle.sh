@@ -182,6 +182,21 @@ if old_base_vertex not in adapter:
     raise SystemExit("error: expected BASE_VERTEX capability assignment not found in adapter.rs")
 adapter = adapter.replace(old_base_vertex, new_base_vertex, 1)
 
+old_alignment = """        downlevel_flags.set(
+            wgt::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED,
+            !(cfg!(any(webgl, Emscripten)) || is_angle),
+        );"""
+new_alignment = """        // Windows ANGLE accepts the 4-byte uniform bindings Cinnabar uses.
+        // Keep the conservative WebGL restriction, but do not reject the
+        // native ANGLE/D3D11 path solely because it is ANGLE.
+        downlevel_flags.set(
+            wgt::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED,
+            !(cfg!(any(webgl, Emscripten)) || (is_angle && !cfg!(windows))),
+        );"""
+if old_alignment not in adapter:
+    raise SystemExit("error: expected buffer-alignment capability assignment not found in adapter.rs")
+adapter = adapter.replace(old_alignment, new_alignment, 1)
+
 egl_path.write_text(egl)
 mod_path.write_text(mod)
 adapter_path.write_text(adapter)
