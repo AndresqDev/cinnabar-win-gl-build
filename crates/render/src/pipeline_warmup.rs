@@ -394,7 +394,7 @@ fn prewarm_owner<T: PrewarmPipelines>(
     };
     let WarmupRegistry { views, ids, .. } = &mut *registry;
     let before = ids.len();
-    warm_owner_views(&mut owner, &cache, views, &mut warmed, ids);
+    warm_owner_views(&mut *owner, &cache, views, &mut warmed, ids);
     if !*reported && !views.is_empty() {
         info!(
             "pipeline warmup owner {}: critical, queued {} variants",
@@ -457,7 +457,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
             ..
         } = &mut *registry;
         let before = background_ids.len();
-        warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
+        warm_owner_views(&mut *owner, &cache, views, &mut warmed, background_ids);
         if !*reported && !views.is_empty() {
             info!(
                 "pipeline warmup owner {}: background queued during loading; {} variants, readiness unaffected",
@@ -501,7 +501,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
     }
 
     let before = background_ids.len();
-    warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
+    warm_owner_views(&mut *owner, &cache, views, &mut warmed, background_ids);
     let queued = background_ids.len() - before;
     if queued == 0 {
         background.cursor += 1;
