@@ -208,10 +208,24 @@ pub(super) fn render_plugin(
         summary(environment.as_deref(), video, chosen, fallback.as_ref())
     ));
     let gl_compat = chosen == Backend::Gl;
-    render::gl_compat::install(gl_compat);
+    // Read the opt-in once and record it for both the pipeline cache and warmup policy.
+    // A flagless launch, or any value other than 1, keeps the synchronous fallback. The
+    // separate-context patch is responsible for making the flag real at runtime.
+    let angle_compile_context = gl_compat && render::gl_compat::compile_context_from_env();
+    render::gl_compat::install_with_compile_context(gl_compat, angle_compile_context);
     if gl_compat {
         log(format_args!(
             "Renderer GL compatibility: single sRGB scene target, no HDR/Enhanced or shader packs"
+        ));
+        log(format_args!(
+            "Renderer pipeline compilation: {} ({}={})",
+            if angle_compile_context {
+                "asynchronous on ANGLE's separate EGL compile context"
+            } else {
+                "synchronous on the render thread; safe fallback"
+            },
+            render::gl_compat::COMPILE_CONTEXT_ENV,
+            if angle_compile_context { "1" } else { "unset" },
         ));
     }
     install_guard(app, guard);
@@ -220,12 +234,14 @@ pub(super) fn render_plugin(
     }
     Ok(RenderPlugin {
         render_creation: creation,
-        // GL/ANGLE has one EGL context for frame submission and pipeline creation.
-        // Compiling world variants in workers holds that context while D3DCompiler
-        // runs, so the render thread times out on the next submit. Menu warmup is
-        // disabled for GL; serializing the remaining first-use compiles is the safe
-        // path until a separate compile context or precompiled cache exists.
-        synchronous_pipeline_compilation: gl_compat,
+        // GL/ANGLE without a separate compile context shares one EGL context between
+        // frame submission and pipeline creation. Worker compiles hold it while
+        // D3DCompiler runs, so the render thread times out on the next submit. An
+        // explicitly enabled compile context keeps worker compilation safe; otherwise
+        // first-use and warmup compiles stay serialized on the render thread.
+        synchronous_pipeline_compilation: render::gl_compat::synchronous_pipeline_compilation(
+            gl_compat,
+        ),
         ..Default::default()
     })
 }

@@ -8,16 +8,53 @@
 use bevy::render::render_resource::TextureFormat;
 use std::sync::OnceLock;
 
+/// Opt-in switch for ANGLE's separate EGL compile context.
+pub const COMPILE_CONTEXT_ENV: &str = "CINNABAR_ANGLE_COMPILE_CONTEXT";
+
 static GL_COMPAT: OnceLock<bool> = OnceLock::new();
+static COMPILE_CONTEXT: OnceLock<bool> = OnceLock::new();
 
 /// Records the backend chosen for this process. Called once before renderer resources are built.
 pub fn install(gl: bool) {
+    install_with_compile_context(gl, gl && compile_context_from_env());
+}
+
+/// Records the backend and whether ANGLE may compile on its separate context.
+///
+/// The caller reads [`COMPILE_CONTEXT_ENV`] once so every later decision sees the same mode.
+pub fn install_with_compile_context(gl: bool, compile_context: bool) {
     let _ = GL_COMPAT.set(gl);
+    let _ = COMPILE_CONTEXT.set(gl && compile_context);
 }
 
 /// Whether the active renderer is the native OpenGL compatibility path.
 pub fn enabled() -> bool {
     *GL_COMPAT.get().unwrap_or(&false)
+}
+
+/// Whether GL runs pipeline compilation on ANGLE's separate EGL context.
+///
+/// Without it, worker compiles share the presentation context and can stall the render
+/// thread, so callers must keep pipeline compilation synchronous.
+pub fn compile_context_enabled() -> bool {
+    *COMPILE_CONTEXT.get().unwrap_or(&false)
+}
+
+/// Reads the opt-in exactly once; every value except `1` selects the synchronous fallback.
+pub fn compile_context_from_env() -> bool {
+    env_compat::var_os(COMPILE_CONTEXT_ENV).is_some_and(|value| value == "1")
+}
+
+/// Whether the selected backend must compile pipelines synchronously.
+///
+/// Only GL without its separate compile context needs serialization; other backends keep
+/// Bevy's worker compilation.
+pub fn synchronous_pipeline_compilation(gl: bool) -> bool {
+    synchronous_pipeline_compilation_for(gl, compile_context_enabled())
+}
+
+fn synchronous_pipeline_compilation_for(gl: bool, compile_context: bool) -> bool {
+    gl && !compile_context
 }
 
 /// Flattens alternate texture views to the base format on GL.
@@ -118,6 +155,14 @@ mod tests {
         assert_eq!(view_format_for(Some(RAW), false), Some(RAW));
         assert_eq!(scene_storage_format_for(ENCODED, false), RAW);
         assert_eq!(gamma_target_format_for(ENCODED, false), RAW);
+    }
+
+    #[test]
+    fn gl_compiles_synchronously_unless_the_compile_context_is_enabled() {
+        assert!(synchronous_pipeline_compilation_for(true, false));
+        assert!(!synchronous_pipeline_compilation_for(true, true));
+        assert!(!synchronous_pipeline_compilation_for(false, false));
+        assert!(!synchronous_pipeline_compilation_for(false, true));
     }
 
     #[test]

@@ -54,7 +54,7 @@ impl Plugin for DepthSmaaPlugin {
             "depth_smaa/edge.wesl",
             crate::shader_safety::from_wesl
         );
-        crate::pipeline_warmup::register::<DepthSmaaPipelines>(app);
+        crate::pipeline_warmup::register_background::<DepthSmaaPipelines>(app);
         if let Some(render) = app.get_sub_app_mut(RenderApp) {
             render
                 .add_systems(RenderStartup, pipelines::init)

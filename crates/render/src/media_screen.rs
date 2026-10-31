@@ -56,7 +56,7 @@ const RECORD_BYTES: u64 = 48;
 
 pub(crate) fn install_media_screen_render(app: &mut App) {
     crate::upload_staging::install(app);
-    crate::pipeline_warmup::register::<MediaScreenPipeline>(app);
+    crate::pipeline_warmup::register_background::<MediaScreenPipeline>(app);
     load_internal_asset!(
         app,
         MEDIA_SCREEN_SHADER_HANDLE,

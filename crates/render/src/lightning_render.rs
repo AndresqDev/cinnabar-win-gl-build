@@ -39,7 +39,7 @@ const RECORD_BYTES: usize = std::mem::size_of::<BoltRecord>();
 
 pub(crate) fn install_lightning_render(app: &mut App) {
     crate::upload_staging::install(app);
-    crate::pipeline_warmup::register::<LightningPipeline>(app);
+    crate::pipeline_warmup::register_background::<LightningPipeline>(app);
     load_internal_asset!(
         app,
         LIGHTNING_SHADER_HANDLE,

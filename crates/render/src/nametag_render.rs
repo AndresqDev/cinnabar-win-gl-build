@@ -111,7 +111,7 @@ fn phase_batch_range(index: usize) -> Range<u32> {
 
 pub(crate) fn install_nametag_render(app: &mut App) {
     crate::upload_staging::install(app);
-    crate::pipeline_warmup::register::<NametagPipeline>(app);
+    crate::pipeline_warmup::register_background::<NametagPipeline>(app);
     app.init_resource::<NametagSceneResource>()
         .add_plugins(ExtractResourcePlugin::<NametagSceneResource>::default());
     load_internal_asset!(
