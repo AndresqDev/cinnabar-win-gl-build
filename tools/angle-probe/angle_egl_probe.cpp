@@ -39,6 +39,7 @@ using EGLsizeiANDROID = int;
 using GLenum = unsigned int;
 using GLuint = unsigned int;
 using GLint = int;
+using GLfloat = float;
 using GLsizei = int;
 using GLboolean = unsigned char;
 using GLchar = char;
