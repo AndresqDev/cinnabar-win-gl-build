@@ -4,7 +4,7 @@ name: Windows ANGLE build
 # Direct3D 11 instead of the native Intel OpenGL ICD.
 on:
   push:
-    branches: [windows-angle]
+    branches: [windows-angle, angle-compile-context]
   workflow_dispatch:
 
 permissions:
@@ -63,6 +63,7 @@ jobs:
         run: |
           cargo fetch --locked
           bash scripts/patch-wgpu-angle.sh
+          bash scripts/patch-wgpu-angle-cache.sh
           bash scripts/patch-bevy-angle.sh
           bash scripts/patch-angle-shaders.sh
 
