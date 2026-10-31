@@ -204,6 +204,13 @@ fn prewarm_owner<T: PrewarmPipelines>(
     let Some(mut owner) = owner else {
         return;
     };
+    // On GL/ANGLE every pipeline compile shares the one EGL context. Warming
+    // all world variants here lets D3DCompiler hold that context for seconds,
+    // starving the submit/present path and producing a false hang or an
+    // adapter-lock panic. Let the draw path request variants as they appear.
+    if crate::gl_compat::enabled() {
+        return;
+    }
     let WarmupRegistry { views, ids, .. } = &mut *registry;
     for &view in views.iter() {
         for msaa in sample_modes(view.msaa) {
