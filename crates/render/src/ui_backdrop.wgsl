@@ -61,6 +61,11 @@ fn level_for(sigma: f32) -> f32 {
     return 0.5 * log2((sigma * sigma + 0.25) * 1.5);
 }
 
+// ANGLE's GLES 3.1 path rejects textureNumLevels(), so use the maximum level
+// representable by the largest supported texture. Sampling beyond the actual
+// pyramid levels is clamped by the texture unit to the last available level.
+const PYRAMID_LEVEL_LIMIT: f32 = 16.0;
+
 // The source at `pixel` blurred with a Gaussian-like kernel of standard deviation `sigma`.
 fn blurred(pixel: vec2<f32>, sigma: f32) -> vec4<f32> {
     let exact = textureLoad(scene, vec2<i32>(pixel), 0);
@@ -68,7 +73,7 @@ fn blurred(pixel: vec2<f32>, sigma: f32) -> vec4<f32> {
         return exact;
     }
     let size = vec2<f32>(textureDimensions(scene));
-    let level = clamp(level_for(sigma), 1.0, f32(textureNumLevels(pyramid)));
+    let level = clamp(level_for(sigma), 1.0, PYRAMID_LEVEL_LIMIT);
     let uv = pixel / size;
     let offset = 0.5 * exp2(level) / size;
     let lod = level - 1.0;
