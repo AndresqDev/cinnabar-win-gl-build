@@ -63,6 +63,7 @@ jobs:
         run: |
           cargo fetch --locked
           bash scripts/patch-wgpu-angle.sh
+          bash scripts/patch-bevy-angle.sh
 
       - name: Build Rust client and tools
         shell: bash
