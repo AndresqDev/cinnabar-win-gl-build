@@ -10,6 +10,12 @@ impl WorldStream {
         self.startup_priority = enabled;
     }
 
+    /// Whether startup priority still holds the stream at the entry neighbourhood.
+    #[must_use]
+    pub const fn startup_priority(&self) -> bool {
+        self.startup_priority
+    }
+
     /// Narrows startup readiness to the player's own column for the first progressive ring.
     /// The value is clamped to the safe 3x3 radius and only applies while
     /// [`Self::set_startup_priority`] is active; [`Self::finish_startup_priority`] restores 3x3.
