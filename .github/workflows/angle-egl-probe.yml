@@ -1,0 +1,66 @@
+name: ANGLE EGL runtime probe
+
+# Validation-only workflow. It does not build Cinnabar or Rust code.
+# It exercises shared EGL contexts and EGL_ANDROID_blob_cache using the exact
+# ANGLE DLLs from the pinned Electron version on a Windows D3D11 adapter
+# (GitHub's runners use the Microsoft D3D11 WARP adapter).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ELECTRON_VERSION: "35.7.5"
+  ANGLE_DEFAULT_PLATFORM: d3d11
+
+jobs:
+  probe:
+    name: Shared EGL context + blob cache
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download Electron ANGLE runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = Join-Path $env:RUNNER_TEMP "electron-angle.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "electron-angle"
+          $url = "https://github.com/electron/electron/releases/download/v$env:ELECTRON_VERSION/electron-v$env:ELECTRON_VERSION-win32-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          $out = Join-Path $PWD "dist/angle-probe"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($name in @("libEGL.dll", "libGLESv2.dll", "d3dcompiler_47.dll")) {
+            $source = Join-Path $dir $name
+            if (-not (Test-Path $source)) { throw "ANGLE runtime is missing $name" }
+            Copy-Item $source (Join-Path $out $name) -Force
+          }
+          Copy-Item "tools/angle-probe/angle_egl_probe.cpp" $out -Force
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Build probe with MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile probe
+        shell: cmd
+        working-directory: dist/angle-probe
+        run: |
+          cl /nologo /EHsc /std:c++17 /O2 /W4 angle_egl_probe.cpp /Fe:angle_egl_probe.exe
+          if errorlevel 1 exit /b 1
+
+      - name: Run probe
+        shell: cmd
+        working-directory: dist/angle-probe
+        run: |
+          angle_egl_probe.exe
+          set RC=%ERRORLEVEL%
+          echo probe_exit_code=%RC%
+          exit /b %RC%
