@@ -110,6 +110,11 @@ pub(super) fn build(
             "skipped malformed server block definitions"
         );
     }
+    // Establish the client cap before the bootstrap ingest can admit server publisher chunks.
+    // The per-frame render-distance system reasserts it, but this closes the first-frame window.
+    if render::gl_compat::enabled() {
+        stream.set_progressive_view(true);
+    }
     if bridge::latency_trace::active().is_some() {
         stream.observe_commits(super::world_ingress::trace_committed);
     }
