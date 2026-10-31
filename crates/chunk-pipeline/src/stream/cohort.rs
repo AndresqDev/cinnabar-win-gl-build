@@ -84,18 +84,37 @@ impl LocalResetEvidence {
 }
 
 impl WorldStream {
-    /// Startup needs the player's loaded 3×3 neighborhood, not a drained distant view.
+    /// Startup needs the player's loaded neighbourhood, not a drained distant view.
     /// Mesh acknowledgements additionally prevent exposing unpresented local terrain.
+    ///
+    /// While startup priority holds, [`Self::set_startup_radius`] can lower the gate to the
+    /// player's own column for the first progressive ring. Once priority ends this always
+    /// requires the ordinary 3x3 neighbourhood again.
     #[must_use]
     pub fn local_terrain_ready(&self) -> bool {
+        let radius = if self.startup_priority {
+            self.startup_radius
+        } else {
+            STARTUP_RADIUS
+        };
+        self.local_terrain_ready_within(radius)
+    }
+
+    /// Whether the square of `radius` columns around the player is loaded and every resident
+    /// section in it has current light and no dirty mesh work. Radius zero is exactly the
+    /// player's column; one is the ordinary 3x3 startup neighbourhood.
+    #[must_use]
+    pub fn local_terrain_ready_within(&self, radius: i32) -> bool {
         let center = self.player_column();
+        let radius = radius.clamp(0, render_api::MAX_VIEW_RADIUS_CHUNKS);
+        let radius_unsigned = radius as u32;
         let nearby = |column: ChunkKey| {
             column.dimension == center.dimension
-                && column.x.abs_diff(center.x) <= STARTUP_RADIUS as u32
-                && column.z.abs_diff(center.z) <= STARTUP_RADIUS as u32
+                && column.x.abs_diff(center.x) <= radius_unsigned
+                && column.z.abs_diff(center.z) <= radius_unsigned
         };
-        if !(-STARTUP_RADIUS..=STARTUP_RADIUS).all(|x| {
-            (-STARTUP_RADIUS..=STARTUP_RADIUS).all(|z| {
+        if !(-radius..=radius).all(|x| {
+            (-radius..=radius).all(|z| {
                 self.loaded_columns.contains(&ChunkKey::new(
                     center.dimension,
                     center.x.saturating_add(x),
