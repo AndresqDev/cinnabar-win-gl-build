@@ -72,6 +72,40 @@ if old_unconfigure not in egl:
     raise SystemExit("error: expected Wayland unconfigure block not found in egl.rs")
 egl = egl.replace(old_unconfigure, new_unconfigure, 1)
 
+# configure() also resizes the Wayland EGL window when a swapchain already
+# exists. That path is unreachable on Windows (wl_window is always None), but
+# the crate must still compile there.
+old_resize = """                if let Some(window) = wl_window {
+                    wayland_sys::ffi_dispatch!(
+                        wayland_sys::egl::wayland_egl_handle(),
+                        wl_egl_window_resize,
+                        window,
+                        config.extent.width as i32,
+                        config.extent.height as i32,
+                        0,
+                        0,
+                    );
+                }
+"""
+new_resize = """                if let Some(window) = wl_window {
+                    #[cfg(unix)]
+                    wayland_sys::ffi_dispatch!(
+                        wayland_sys::egl::wayland_egl_handle(),
+                        wl_egl_window_resize,
+                        window,
+                        config.extent.width as i32,
+                        config.extent.height as i32,
+                        0,
+                        0,
+                    );
+                    #[cfg(not(unix))]
+                    let _ = window;
+                }
+"""
+if old_resize not in egl:
+    raise SystemExit("error: expected Wayland resize block not found in egl.rs")
+egl = egl.replace(old_resize, new_resize, 1)
+
 # Select EGL on Windows too. The old WGL module is no longer compiled in this
 # experimental build. The other backends keep their existing selection.
 old_mod_imports = """#[cfg(not(any(windows, webgl)))]
