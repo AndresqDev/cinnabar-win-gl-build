@@ -17,6 +17,17 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
+
+# ANGLE's GLSL compiler rejects the `invariant` qualifier that naga emits for
+# @invariant position builtins. Cinnabar uses it for exact cross-pass position
+# matching; the reduced ANGLE build can skip that guarantee.
+for shader in pathlib.Path("crates/render/src").rglob("*"):
+    if shader.suffix not in {".wgsl", ".wesl"} or shader == path:
+        continue
+    source = shader.read_text()
+    if "@invariant" in source:
+        shader.write_text(source.replace("@invariant ", ""))
+        print(f"removed @invariant from {shader}")
 old = """    if (style_flags & UI_STYLE_MODEL_VERTEX) != 0u {
         let base = (texture_page >> UI_MODEL_LAYER_BITS) - 1u;
         let bone = ui_model_bones[base + u32(position.w) - 1u];
