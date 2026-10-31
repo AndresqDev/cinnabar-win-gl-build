@@ -334,7 +334,7 @@ fn install(app: &mut App) -> Option<&mut SubApp> {
             } else if crate::gl_compat::compile_context_enabled() {
                 "are deferred until readiness on ANGLE's separate compile context"
             } else {
-                "are deferred until readiness and compile synchronously in small batches"
+                "are disabled without a separate compile context; first use stays on the draw path"
             }
         );
     }
@@ -409,6 +409,15 @@ fn warm_owner_views<T: PrewarmPipelines>(
     }
 }
 
+/// Whether speculative pipeline work is safe without a separate compile context.
+///
+/// On GL/ANGLE, an absent compile context means pipeline creation shares the presentation
+/// context. Queuing the world's critical variants there makes Bevy compile them synchronously
+/// on the render thread, which freezes the menu before the draw path can request what it needs.
+fn prewarm_allowed() -> bool {
+    !crate::gl_compat::enabled() || crate::gl_compat::compile_context_enabled()
+}
+
 /// Specializes once per view configuration; later frames only compare keys.
 fn prewarm_owner<T: PrewarmPipelines>(
     owner: Option<ResMut<T>>,
@@ -418,6 +427,9 @@ fn prewarm_owner<T: PrewarmPipelines>(
     mut skipped: Local<bool>,
     mut reported: Local<bool>,
 ) {
+    if !prewarm_allowed() {
+        return;
+    }
     // An owner that never initialised has nothing it could draw.
     let Some(mut owner) = owner else {
         if !*skipped {
@@ -455,6 +467,9 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
     mut skipped: Local<bool>,
     mut reported: Local<bool>,
 ) {
+    if !prewarm_allowed() {
+        return;
+    }
     let Some(mut owner) = owner else {
         if !*skipped {
             info!(
