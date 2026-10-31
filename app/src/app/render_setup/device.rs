@@ -210,32 +210,48 @@ pub(super) struct AdapterCapabilities {
     backend: wgpu::Backend,
     flags: wgpu::DownlevelFlags,
     limits: wgpu::Limits,
+    /// ANGLE exposes GLES rather than desktop GL. Its D3D11 translator reports
+    /// capabilities that do not match the native WGL path, notably missing
+    /// multisample shading and 16-byte buffer-binding alignment.
+    angle: bool,
 }
 
 impl From<&wgpu::Adapter> for AdapterCapabilities {
     /// Reads the capabilities without opening a device.
     fn from(adapter: &wgpu::Adapter) -> Self {
+        let info = adapter.get_info();
         Self {
-            backend: adapter.get_info().backend,
+            backend: info.backend,
             flags: adapter.get_downlevel_capabilities().flags,
             limits: adapter.limits(),
+            angle: info.driver_info.contains("ANGLE") || info.name.starts_with("ANGLE"),
         }
     }
 }
 
 /// The GL fallback flattens alternate views, so it does not require VIEW_FORMATS.
-fn required_downlevel_flags(backend: wgpu::Backend) -> wgpu::DownlevelFlags {
-    if backend == wgpu::Backend::Gl {
+fn required_downlevel_flags(adapter: &AdapterCapabilities) -> wgpu::DownlevelFlags {
+    let required = if adapter.backend == wgpu::Backend::Gl {
         REQUIRED_DOWNLEVEL_FLAGS - wgpu::DownlevelFlags::VIEW_FORMATS
     } else {
         REQUIRED_DOWNLEVEL_FLAGS
+    };
+    if adapter.angle {
+        // The GL compatibility path disables MSAA, and wgpu's ANGLE adapter
+        // intentionally clears the 16-byte alignment capability. Neither is
+        // used by the terrain or actor paths on this build.
+        required
+            - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
+            - wgpu::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED
+    } else {
+        required
     }
 }
 
 /// Rejects candidates lacking the capabilities or limits used by the renderer.
 pub(super) fn meets_requirements(adapter: impl Into<AdapterCapabilities>) -> Result<()> {
     let adapter = adapter.into();
-    let missing = required_downlevel_flags(adapter.backend) - adapter.flags;
+    let missing = required_downlevel_flags(&adapter) - adapter.flags;
     anyhow::ensure!(
         missing.is_empty(),
         "GPU lacks renderer capabilities: {missing:?}"

@@ -14,21 +14,26 @@ egl=$(find "$checkout_root" -type f \
 mod=$(find "$checkout_root" -type f \
     -path '*/wgpu-*/060bd0b/wgpu-hal/src/gles/mod.rs' \
     -print -quit)
+adapter=$(find "$checkout_root" -type f \
+    -path '*/wgpu-*/060bd0b/wgpu-hal/src/gles/adapter.rs' \
+    -print -quit)
 
-if [ -z "$egl" ] || [ -z "$mod" ]; then
+if [ -z "$egl" ] || [ -z "$mod" ] || [ -z "$adapter" ]; then
     echo "error: pinned wgpu GLES sources not found under $checkout_root" >&2
     echo "run 'cargo fetch --locked' first and check the pinned wgpu revision" >&2
     exit 1
 fi
 
-python3 - "$egl" "$mod" <<'PY'
+python3 - "$egl" "$mod" "$adapter" <<'PY'
 import pathlib
 import sys
 
 egl_path = pathlib.Path(sys.argv[1])
 mod_path = pathlib.Path(sys.argv[2])
+adapter_path = pathlib.Path(sys.argv[3])
 egl = egl_path.read_text()
 mod = mod_path.read_text()
+adapter = adapter_path.read_text()
 
 # EGL's Wayland window type is Unix-only. Keep the EGL swapchain code compiling
 # on Windows by giving it an opaque placeholder type there. Replace the existing
@@ -159,8 +164,27 @@ if old_mod_exports not in mod:
     raise SystemExit("error: expected GLES exports not found in mod.rs")
 mod = mod.replace(old_mod_exports, new_mod_exports, 1)
 
+# ANGLE advertises GLES 3.1 plus the base-vertex extensions, but wgpu only
+# enables its BASE_VERTEX capability for core GLES 3.2. The draw entry points
+# are present in ANGLE under the core names, so expose the capability when an
+# extension is present.
+old_base_vertex = (
+    "        downlevel_flags.set("
+    "wgt::DownlevelFlags::BASE_VERTEX, supported((3, 2), (3, 2)));"
+)
+new_base_vertex = """        let has_base_vertex = supported((3, 2), (3, 2))
+            || extensions.contains("GL_OES_draw_elements_base_vertex")
+            || extensions.contains("GL_EXT_draw_elements_base_vertex")
+            || extensions.contains("GL_ANGLE_base_vertex_base_instance")
+            || extensions.contains("GL_ARB_draw_elements_base_vertex");
+        downlevel_flags.set(wgt::DownlevelFlags::BASE_VERTEX, has_base_vertex);"""
+if old_base_vertex not in adapter:
+    raise SystemExit("error: expected BASE_VERTEX capability assignment not found in adapter.rs")
+adapter = adapter.replace(old_base_vertex, new_base_vertex, 1)
+
 egl_path.write_text(egl)
 mod_path.write_text(mod)
+adapter_path.write_text(adapter)
 PY
 
 echo "Patched wgpu GLES to use EGL/ANGLE on Windows:"

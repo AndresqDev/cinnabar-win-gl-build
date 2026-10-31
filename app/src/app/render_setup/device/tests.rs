@@ -25,6 +25,7 @@ fn capabilities(
             max_storage_buffers_per_shader_stage: storage_buffers,
             ..Default::default()
         },
+        angle: false,
     }
 }
 
@@ -73,12 +74,32 @@ fn dx12_requires_alternate_texture_views_but_gl_flattens_them() {
 #[test]
 fn gl_still_requires_every_other_renderer_capability() {
     let required = render::minimum_vertex_storage_buffers();
-    let flags = required_downlevel_flags(wgpu::Backend::Gl);
+    let gl = capabilities(REQUIRED_DOWNLEVEL_FLAGS, required, wgpu::Backend::Gl);
+    let flags = required_downlevel_flags(&gl);
     for flag in flags.iter() {
         assert!(
             meets_requirements(capabilities(flags - flag, required, wgpu::Backend::Gl)).is_err()
         );
     }
+}
+
+#[test]
+fn angle_gl_does_not_require_wgl_only_capabilities() {
+    let required = render::minimum_vertex_storage_buffers();
+    let flags = REQUIRED_DOWNLEVEL_FLAGS
+        - wgpu::DownlevelFlags::VIEW_FORMATS
+        - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
+        - wgpu::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED;
+    let angle = AdapterCapabilities {
+        backend: wgpu::Backend::Gl,
+        flags,
+        limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: required,
+            ..Default::default()
+        },
+        angle: true,
+    };
+    assert!(meets_requirements(angle).is_ok());
 }
 
 #[test]
