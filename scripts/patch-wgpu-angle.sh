@@ -590,26 +590,26 @@ old_present = """        self.egl
                 crate::SurfaceError::Lost
             })?;
 """
-new_present = """        let swap_result = self.egl.instance.swap_buffers(self.egl.display, sc.surface);
-        // Always unbind the window surface, even when presentation fails.
-        // Leaving it current after the glow mutex is released lets a later
-        // lock() put the same EGL context current on another thread, which
-        // EGL forbids.
+new_present = """        // The render thread submits the next frame while this thread may be
+        // blocked in the driver's swap. Holding the glow context lock across
+        // swap_buffers makes that submit hit the six-second adapter-lock
+        // deadlock. Unbind the surface first, release the lock, then swap.
+        // EGL swap operates on the surface, not on the current context.
         let unset_result = self
             .egl
             .instance
             .make_current(self.egl.display, None, None, None);
-        if let Err(e) = swap_result {
-            log::error!("swap_buffers failed: {e}");
-            if let Err(e) = unset_result {
-                log::error!("make_current(null) failed: {e}");
-            }
+        drop(gl);
+        if let Err(e) = unset_result {
+            log::error!("make_current(null) failed: {e}");
             return Err(crate::SurfaceError::Lost);
         }
-        unset_result.map_err(|e| {
-            log::error!("make_current(null) failed: {e}");
-            crate::SurfaceError::Lost
-        })?;
+        let swap_result = self.egl.instance.swap_buffers(self.egl.display, sc.surface);
+        if let Err(e) = swap_result {
+            log::error!("swap_buffers failed: {e}");
+            return Err(crate::SurfaceError::Lost);
+        }
+        Ok(())
 """
 if old_present not in egl:
     raise SystemExit("error: expected surface present block not found in egl.rs")
