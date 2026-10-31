@@ -86,7 +86,22 @@ struct WarmupRegistry {
     pending: bool,
     /// Registration order for the one-owner-at-a-time GL background schedule.
     background_owners: usize,
+    /// Incremented on view changes so per-owner caches discard old view keys.
+    views_generation: u64,
     background: BackgroundWarmup,
+}
+
+impl WarmupRegistry {
+    /// Drops the old view's background queue before the next cycle can use its IDs.
+    fn restart_background(&mut self) {
+        self.background_ids.clear();
+        // Terminal errors are only logged once per ID. Keep critical errors to avoid repeating
+        // them every time the view changes, but forget background IDs that no longer matter.
+        let critical = &self.ids;
+        self.failed.retain(|id| critical.contains(id));
+        self.views_generation = self.views_generation.wrapping_add(1);
+        self.background.restart_cycle();
+    }
 }
 
 /// Serializes GL background owners after the critical gate has been released.
@@ -143,11 +158,33 @@ impl BackgroundWarmup {
         self.cursor = 0;
         self.active = None;
         self.transition_frame = None;
+        // The new critical set must settle before background work may start, and the old
+        // view's already-open gate must not leak into the new one.
+        self.armed = false;
+        self.countdown = GL_BACKGROUND_SETTLE_FRAMES;
+        self.ready = false;
     }
 
     /// Whether this slot already had its turn in the current frame.
     fn transitioned_this_frame(&self) -> bool {
         self.transition_frame == Some(self.frame)
+    }
+}
+
+/// Per-background-owner memo that is discarded whenever the view keys change.
+#[derive(Default)]
+struct WarmedViews {
+    generation: u64,
+    views: Vec<WarmView>,
+}
+
+impl WarmedViews {
+    fn for_generation(&mut self, generation: u64) -> &mut Vec<WarmView> {
+        if self.generation != generation {
+            self.generation = generation;
+            self.views.clear();
+        }
+        &mut self.views
     }
 }
 
@@ -338,7 +375,7 @@ fn collect_views(
     }
     if collected != registry.views {
         registry.views = collected;
-        registry.background.restart_cycle();
+        registry.restart_background();
     }
     registry.pending = false;
     // Readiness may already be true from the menu before world work is admitted. Require
@@ -414,7 +451,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
     owner: Option<ResMut<T>>,
     cache: Res<PipelineCache>,
     mut registry: ResMut<WarmupRegistry>,
-    mut warmed: Local<Vec<WarmView>>,
+    mut warmed: Local<WarmedViews>,
     mut skipped: Local<bool>,
     mut reported: Local<bool>,
 ) {
@@ -450,6 +487,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
         }
         return;
     };
+    let warmed = warmed.for_generation(registry.views_generation);
     if !crate::gl_compat::enabled() {
         let WarmupRegistry {
             views,
@@ -457,7 +495,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
             ..
         } = &mut *registry;
         let before = background_ids.len();
-        warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
+        warm_owner_views(&mut owner, &cache, views, warmed, background_ids);
         if !*reported && !views.is_empty() {
             info!(
                 "pipeline warmup owner {}: background queued during loading; {} variants, readiness unaffected",
@@ -500,9 +538,11 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
         return;
     }
 
-    let before = background_ids.len();
-    warm_owner_views(&mut owner, &cache, views, &mut warmed, background_ids);
-    let queued = background_ids.len() - before;
+    // Only this batch's IDs gate the next transition. Keeping IDs from earlier owners (or a
+    // previous view) would let one old `ShaderNotLoaded` entry block every later batch.
+    background_ids.clear();
+    warm_owner_views(&mut owner, &cache, views, warmed, background_ids);
+    let queued = background_ids.len();
     if queued == 0 {
         background.cursor += 1;
         background.transition_frame = Some(background.frame);

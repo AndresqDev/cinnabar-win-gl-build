@@ -96,7 +96,7 @@ pub(super) fn render_plugin(
     let software = force_fallback(&settings);
     let crashed = guard.recovery.crashed_choice();
     let automatic = candidates(defaults, &supported, None, None, &[]);
-    let ((creation, chosen), fallback) = with_video_fallback(
+    let ((creation, chosen, adapter_compile_context), fallback) = with_video_fallback(
         environment.is_some(),
         video,
         crashed,
@@ -188,7 +188,7 @@ pub(super) fn render_plugin(
                     let backend = candidate.backend;
                     let (instance, adapter) = candidate.native;
                     bevy::tasks::block_on(create_renderer(instance, adapter, &settings))
-                        .map(|creation| (creation, backend))
+                        .map(|(creation, compile_context)| (creation, backend, compile_context))
                 })
                 .with_context(|| {
                     if failures.is_empty() {
@@ -208,24 +208,42 @@ pub(super) fn render_plugin(
         summary(environment.as_deref(), video, chosen, fallback.as_ref())
     ));
     let gl_compat = chosen == Backend::Gl;
-    // Read the opt-in once and record it for both the pipeline cache and warmup policy.
-    // A flagless launch, or any value other than 1, keeps the synchronous fallback. The
-    // separate-context patch is responsible for making the flag real at runtime.
-    let angle_compile_context = gl_compat && render::gl_compat::compile_context_from_env();
+    // The environment only requests the separate context; wgpu's adapter marker proves it
+    // exists. Activating asynchronous compilation without that proof would let workers share
+    // the presentation context and stall the render thread. The env is read exactly as wgpu
+    // reads it, so the two cannot disagree about the legacy prefix.
+    let compile_context_requested = gl_compat && render::gl_compat::compile_context_from_env();
+    let angle_compile_context = render::gl_compat::compile_context_active(
+        gl_compat,
+        compile_context_requested,
+        adapter_compile_context,
+    );
     render::gl_compat::install_with_compile_context(gl_compat, angle_compile_context);
     if gl_compat {
         log(format_args!(
             "Renderer GL compatibility: single sRGB scene target, no HDR/Enhanced or shader packs"
         ));
+        if compile_context_requested && !adapter_compile_context {
+            log(format_args!(
+                "WARNING: Renderer requested {} but the GL adapter did not create ANGLE's separate compile context; keeping pipeline compilation synchronous on the render thread",
+                render::gl_compat::COMPILE_CONTEXT_ENV,
+            ));
+        }
         log(format_args!(
             "Renderer pipeline compilation: {} ({}={})",
             if angle_compile_context {
                 "asynchronous on ANGLE's separate EGL compile context"
+            } else if compile_context_requested {
+                "synchronous on the render thread; requested compile context unavailable"
             } else {
                 "synchronous on the render thread; safe fallback"
             },
             render::gl_compat::COMPILE_CONTEXT_ENV,
-            if angle_compile_context { "1" } else { "unset" },
+            if compile_context_requested {
+                "set"
+            } else {
+                "unset"
+            },
         ));
     }
     install_guard(app, guard);
@@ -309,13 +327,14 @@ fn cancel_on_exit(mut exits: MessageReader<AppExit>, mut guard: ResMut<RendererG
     }
 }
 
-/// Builds the renderer from a candidate already guarded by the selection loop.
+/// Builds the renderer and reports whether its adapter has a separate compile context.
 async fn create_renderer(
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     settings: &WgpuSettings,
-) -> Result<RenderCreation> {
+) -> Result<(RenderCreation, bool)> {
     let info = adapter.get_info();
+    let compile_context = render::gl_compat::compile_context_available(&info.driver_info);
     log(format_args!("Renderer creating device: {info:?}"));
     let started = std::time::Instant::now();
     let (device, queue) = request_device(&adapter, settings).await?;
@@ -325,12 +344,15 @@ async fn create_renderer(
     log(format_args!(
         "Renderer device ready; awaiting first presentation: {info:?}"
     ));
-    Ok(RenderCreation::manual(
-        RenderDevice::from(device),
-        RenderQueue::new(queue),
-        RenderAdapterInfo::new(info),
-        RenderAdapter::new(adapter),
-        RenderInstance::new(instance),
+    Ok((
+        RenderCreation::manual(
+            RenderDevice::from(device),
+            RenderQueue::new(queue),
+            RenderAdapterInfo::new(info),
+            RenderAdapter::new(adapter),
+            RenderInstance::new(instance),
+        ),
+        compile_context,
     ))
 }
 

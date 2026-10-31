@@ -11,12 +11,23 @@ use std::sync::OnceLock;
 /// Opt-in switch for ANGLE's separate EGL compile context.
 pub const COMPILE_CONTEXT_ENV: &str = "CINNABAR_ANGLE_COMPILE_CONTEXT";
 
+/// Marker wgpu's GLES adapter appends to `AdapterInfo::driver_info` when the shared
+/// compile context exists.
+pub const COMPILE_CONTEXT_MARKER: &str = "angle-compile-context";
+
+/// Marker wgpu's GLES adapter appends when no shared compile context was created.
+pub const COMPILE_CONTEXT_UNAVAILABLE_MARKER: &str = "angle-compile-context-unavailable";
+
 static GL_COMPAT: OnceLock<bool> = OnceLock::new();
 static COMPILE_CONTEXT: OnceLock<bool> = OnceLock::new();
 
 /// Records the backend chosen for this process. Called once before renderer resources are built.
+///
+/// Pipeline compilation stays synchronous because this entry point runs before an adapter
+/// exists and therefore cannot confirm that the separate compile context was created. Renderer
+/// startup uses [`install_with_compile_context`] once the adapter reports its marker.
 pub fn install(gl: bool) {
-    install_with_compile_context(gl, gl && compile_context_from_env());
+    install_with_compile_context(gl, false);
 }
 
 /// Records the backend and whether ANGLE may compile on its separate context.
@@ -40,9 +51,48 @@ pub fn compile_context_enabled() -> bool {
     *COMPILE_CONTEXT.get().unwrap_or(&false)
 }
 
-/// Reads the opt-in exactly once; every value except `1` selects the synchronous fallback.
+/// The stable `driver_info` marker for whether the adapter created a compile context.
+pub fn compile_context_marker(has_compile_context: bool) -> &'static str {
+    if has_compile_context {
+        COMPILE_CONTEXT_MARKER
+    } else {
+        COMPILE_CONTEXT_UNAVAILABLE_MARKER
+    }
+}
+
+/// Whether wgpu's GLES adapter reported a usable separate EGL compile context.
+///
+/// Markers are matched as whole tokens because `angle-compile-context` is a prefix
+/// of `angle-compile-context-unavailable` and driver strings contain arbitrary text.
+pub fn compile_context_available(driver_info: &str) -> bool {
+    let mut available = false;
+    for token in driver_info.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-') {
+        if token == COMPILE_CONTEXT_UNAVAILABLE_MARKER {
+            return false;
+        }
+        if token == COMPILE_CONTEXT_MARKER {
+            available = true;
+        }
+    }
+    available
+}
+
+/// Reads the opt-in exactly as wgpu's GLES patch does.
+///
+/// This deliberately uses `std::env::var` rather than `env_compat`: wgpu does not
+/// understand the legacy prefix, so accepting it here would enable worker
+/// compilation while wgpu keeps using the main context.
 pub fn compile_context_from_env() -> bool {
-    env_compat::var_os(COMPILE_CONTEXT_ENV).is_some_and(|value| value == "1")
+    compile_context_requested(std::env::var(COMPILE_CONTEXT_ENV).ok().as_deref())
+}
+
+fn compile_context_requested(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE"))
+}
+
+/// Whether worker compilation may use the separate context.
+pub fn compile_context_active(gl: bool, requested: bool, adapter_available: bool) -> bool {
+    gl && requested && adapter_available
 }
 
 /// Whether the selected backend must compile pipelines synchronously.
@@ -163,6 +213,42 @@ mod tests {
         assert!(!synchronous_pipeline_compilation_for(true, true));
         assert!(!synchronous_pipeline_compilation_for(false, false));
         assert!(!synchronous_pipeline_compilation_for(false, true));
+    }
+
+    #[test]
+    fn compile_context_marker_requires_the_whole_token() {
+        assert!(compile_context_available(compile_context_marker(true)));
+        assert!(!compile_context_available(compile_context_marker(false)));
+        assert!(compile_context_available(
+            "OpenGL ES 3.1; angle-compile-context; vendor"
+        ));
+        assert!(!compile_context_available(
+            "angle-compile-context-unavailable"
+        ));
+        assert!(!compile_context_available(
+            "angle-compile-context angle-compile-context-unavailable"
+        ));
+        assert!(!compile_context_available("OpenGL ES 3.1"));
+        assert!(!compile_context_available("not-angle-compile-context"));
+    }
+
+    #[test]
+    fn compile_context_env_matches_wgpu_exactly() {
+        for enabled in ["1", "true", "TRUE"] {
+            assert!(compile_context_requested(Some(enabled)), "{enabled}");
+        }
+        for disabled in ["", "0", "false", "FALSE", "True", "yes", "on", " 1"] {
+            assert!(!compile_context_requested(Some(disabled)), "{disabled}");
+        }
+        assert!(!compile_context_requested(None));
+    }
+
+    #[test]
+    fn compile_context_requires_backend_request_and_adapter_confirmation() {
+        assert!(compile_context_active(true, true, true));
+        assert!(!compile_context_active(false, true, true));
+        assert!(!compile_context_active(true, false, true));
+        assert!(!compile_context_active(true, true, false));
     }
 
     #[test]
