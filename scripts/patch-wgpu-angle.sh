@@ -60,9 +60,22 @@ if (
     and "get_latest_without_gl" in device
     and "get_latest_without_gl" in fence
     and "draw_elements_instanced_base_vertex_ext" in queue
+    and "compile_context=created" in egl
+    and "lock_for_pipeline" in device
 ):
     print("wgpu GLES sources are already patched; nothing to do")
     raise SystemExit(0)
+
+# The previous versions of this patch are not a suitable base for an in-place
+# upgrade: they are already past the text anchors below and they have no shared
+# compile context. Fail with an actionable message instead of a misleading
+# missing-anchor error.
+if "type WlEglWindow = core::ffi::c_void;" in egl and "compile_context=created" not in egl:
+    raise SystemExit(
+        "error: this wgpu checkout was patched by an older version of "
+        "scripts/patch-wgpu-angle.sh and has no shared compile context; "
+        "restore wgpu-hal/src/gles from the pinned revision and re-run"
+    )
 
 # ANGLE's Windows display needs an explicit D3D11 platform type. The constants
 # are not in khronos-egl, so declare the two values used below next to the
@@ -159,6 +172,153 @@ if old_resize not in egl:
     raise SystemExit("error: expected Wayland resize block not found in egl.rs")
 egl = egl.replace(old_resize, new_resize, 1)
 
+# Pipeline compilation needs an EGL context that can be made current without
+# blocking presentation on the main context. A second context in the same share
+# group can compile and link programs, while the program objects remain visible
+# to the main context. EglContext::clone only copies the raw handle, so the
+# compile context builds a distinct EGLContext and uses its own glow handle.
+old_egl_context_impl = """impl EglContext {
+    fn make_current(&self) {
+        self.instance
+            .make_current(self.display, self.pbuffer, self.pbuffer, Some(self.raw))
+            .unwrap();
+    }
+
+    fn unmake_current(&self) {
+        self.instance
+            .make_current(self.display, None, None, None)
+            .unwrap();
+    }
+}
+"""
+new_egl_context_impl = """impl EglContext {
+    fn make_current_checked(&self) -> Result<(), khronos_egl::Error> {
+        self.instance
+            .make_current(self.display, self.pbuffer, self.pbuffer, Some(self.raw))
+    }
+
+    fn make_current(&self) {
+        self.make_current_checked().unwrap();
+    }
+
+    fn unmake_current_checked(&self) -> Result<(), khronos_egl::Error> {
+        self.instance
+            .make_current(self.display, None, None, None)
+    }
+
+    fn unmake_current(&self) {
+        self.unmake_current_checked().unwrap();
+    }
+}
+
+/// A second EGL context in the main context's share group, used only for
+/// pipeline compilation. It never owns a window surface.
+#[derive(Debug)]
+struct CompileContext {
+    egl: EglContext,
+    glow: ManuallyDrop<glow::Context>,
+}
+
+impl CompileContext {
+    fn create(inner: &Inner) -> Result<Self, String> {
+        let main = &inner.egl;
+        main.instance
+            .bind_api(inner.egl_context_api)
+            .map_err(|e| format!("eglBindAPI failed: {e:?}"))?;
+        let raw = main
+            .instance
+            .create_context(
+                main.display,
+                inner.config,
+                Some(main.raw),
+                &inner.egl_context_attributes,
+            )
+            .map_err(|e| format!("eglCreateContext(shared) failed: {e:?}"))?;
+        let pbuffer = if main.pbuffer.is_some() {
+            let attributes = [
+                khronos_egl::WIDTH,
+                1,
+                khronos_egl::HEIGHT,
+                1,
+                khronos_egl::NONE,
+            ];
+            match main
+                .instance
+                .create_pbuffer_surface(main.display, inner.config, &attributes)
+            {
+                Ok(surface) => Some(surface),
+                Err(e) => {
+                    let _ = main.instance.destroy_context(main.display, raw);
+                    return Err(format!("eglCreatePbufferSurface(shared) failed: {e:?}"));
+                }
+            }
+        } else {
+            None
+        };
+
+        let egl = EglContext {
+            instance: main.instance.clone(),
+            version: main.version,
+            display: main.display,
+            raw,
+            pbuffer,
+        };
+
+        if let Err(e) = egl.make_current_checked() {
+            let _ = egl.instance.destroy_context(egl.display, egl.raw);
+            if let Some(pbuffer) = egl.pbuffer {
+                let _ = egl.instance.destroy_surface(egl.display, pbuffer);
+            }
+            return Err(format!("eglMakeCurrent(shared) failed: {e:?}"));
+        }
+
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| {
+                egl.instance
+                    .get_proc_address(name)
+                    .map_or(ptr::null(), |p| p as *const _)
+            })
+        };
+        if let Err(e) = egl.unmake_current_checked() {
+            log::warn!("compile_context=unavailable reason=unmake_current {e:?}");
+        }
+
+        Ok(Self {
+            egl,
+            glow: ManuallyDrop::new(gl),
+        })
+    }
+}
+
+impl Drop for CompileContext {
+    fn drop(&mut self) {
+        let egl = &self.egl;
+        if let Err(e) = egl.make_current_checked() {
+            log::error!("compile_context=destroy make_current failed: {e:?}");
+        } else {
+            // SAFETY: The EGL context is current and the glow handle is not used
+            // after this drop.
+            unsafe { ManuallyDrop::drop(&mut self.glow) };
+            if let Err(e) = egl.unmake_current_checked() {
+                log::error!("compile_context=destroy unmake_current failed: {e:?}");
+            }
+        }
+        if let Err(e) = egl.instance.destroy_context(egl.display, egl.raw) {
+            log::warn!("compile_context=destroy destroy_context failed: {e:?}");
+        }
+        if let Some(pbuffer) = egl.pbuffer {
+            if let Err(e) = egl.instance.destroy_surface(egl.display, pbuffer) {
+                log::warn!("compile_context=destroy destroy_surface failed: {e:?}");
+            }
+        }
+        log::debug!("compile_context=destroyed");
+    }
+}
+"""
+if old_egl_context_impl not in egl:
+    raise SystemExit("error: expected EglContext implementation not found in egl.rs")
+egl = egl.replace(old_egl_context_impl, new_egl_context_impl, 1)
+
 # Select ANGLE's D3D11 display explicitly on Windows. The default display also
 # picks D3D11 when ANGLE_DEFAULT_PLATFORM is unset, but relying on the
 # environment would silently follow any user override. EGL_DEFAULT_DISPLAY is
@@ -215,6 +375,7 @@ pub struct AdapterContext {
     glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
     base_vertex_ext: Option<DrawElementsInstancedBaseVertexExt>,
+    compile: Option<Mutex<CompileContext>>,
 }
 """
 if old_adapter_context not in egl:
@@ -274,6 +435,237 @@ if old_raw_context not in egl:
     raise SystemExit("error: expected AdapterContext raw_context not found in egl.rs")
 egl = egl.replace(old_raw_context, new_raw_context, 1)
 
+# Destroy the compile context before the main context. Dropping the Mutex runs
+# CompileContext::drop, which makes the compile context current while dropping
+# its glow handle. Inner::drop must only ever see the main EGL context.
+old_adapter_drop = """impl Drop for AdapterContext {
+    fn drop(&mut self) {
+        struct CurrentGuard<'a>(&'a EglContext);
+"""
+new_adapter_drop = """impl Drop for AdapterContext {
+    fn drop(&mut self) {
+        if let Some(compile) = self.compile.take() {
+            drop(compile);
+        }
+
+        struct CurrentGuard<'a>(&'a EglContext);
+"""
+if old_adapter_drop not in egl:
+    raise SystemExit("error: expected AdapterContext drop not found in egl.rs")
+egl = egl.replace(old_adapter_drop, new_adapter_drop, 1)
+
+old_lock_drop = """impl<'a> Drop for AdapterContextLock<'a> {
+    fn drop(&mut self) {
+        if let Some(egl) = self.egl.take() {
+            if let Err(err) = egl.instance.make_current(egl.display, None, None, None) {
+                log::error!("Failed to make EGL context current: {err:?}");
+            }
+        }
+    }
+}
+"""
+new_lock_drop = """impl<'a> Drop for AdapterContextLock<'a> {
+    fn drop(&mut self) {
+        if let Some(egl) = self.egl.take() {
+            if let Err(err) = egl.instance.make_current(egl.display, None, None, None) {
+                log::error!("Failed to make EGL context current: {err:?}");
+            }
+        }
+    }
+}
+
+enum PipelineContextLockInner<'a> {
+    Compile(MutexGuard<'a, CompileContext>),
+    Main(AdapterContextLock<'a>),
+}
+
+/// A guard that keeps the dedicated compile context, or the main context as a
+/// fallback, current for pipeline creation. The EGL context is unbound on drop.
+#[expect(missing_debug_implementations)]
+pub struct PipelineContextLock<'a> {
+    inner: PipelineContextLockInner<'a>,
+}
+
+impl<'a> core::ops::Deref for PipelineContextLock<'a> {
+    type Target = glow::Context;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.inner {
+            PipelineContextLockInner::Compile(guard) => &guard.glow,
+            PipelineContextLockInner::Main(guard) => guard,
+        }
+    }
+}
+
+impl<'a> Drop for PipelineContextLock<'a> {
+    fn drop(&mut self) {
+        if let PipelineContextLockInner::Compile(guard) = &self.inner {
+            if let Err(err) = guard.egl.unmake_current_checked() {
+                log::error!("Failed to release EGL compile context: {err:?}");
+            }
+        }
+    }
+}
+"""
+if old_lock_drop not in egl:
+    raise SystemExit("error: expected AdapterContextLock drop not found in egl.rs")
+egl = egl.replace(old_lock_drop, new_lock_drop, 1)
+
+# Pipeline creation must be able to use the shared compile context without
+# taking the main glow lock, so that the render thread can keep presenting.
+old_adapter_lock_impl = """        AdapterContextLock { glow, egl }
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Note: the context contains a dummy pbuffer (1x1).
+    /// Required for `eglMakeCurrent` on platforms that doesn't supports `EGL_KHR_surfaceless_context`.
+    egl: EglContext,
+    version: (i32, i32),
+    supports_native_window: bool,
+    config: khronos_egl::Config,
+    /// Method by which the framebuffer should support srgb
+    srgb_kind: SrgbFrameBufferKind,
+}
+"""
+new_adapter_lock_impl = """        AdapterContextLock { glow, egl }
+    }
+
+    /// Obtains a context for pipeline compilation.
+    ///
+    /// Uses the dedicated shared compile context when available and otherwise
+    /// falls back to the main context. The returned guard unsets its EGL
+    /// context when dropped.
+    #[track_caller]
+    pub fn lock_for_pipeline(&self) -> PipelineContextLock<'_> {
+        if let Some(compile) = self.compile.as_ref() {
+            let guard = compile
+                .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
+                .expect("Could not lock compile context. This is most-likely a deadlock.");
+            match guard.egl.make_current_checked() {
+                Ok(()) => {
+                    log::debug!("compile_context=using target=compile");
+                    return PipelineContextLock {
+                        inner: PipelineContextLockInner::Compile(guard),
+                    };
+                }
+                Err(err) => {
+                    log::error!("compile_context=unavailable reason=make_current {err:?}");
+                    drop(guard);
+                }
+            }
+        }
+
+        log::debug!("compile_context=using target=main");
+        PipelineContextLock {
+            inner: PipelineContextLockInner::Main(self.lock()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Note: the context contains a dummy pbuffer (1x1).
+    /// Required for `eglMakeCurrent` on platforms that doesn't supports `EGL_KHR_surfaceless_context`.
+    egl: EglContext,
+    version: (i32, i32),
+    supports_native_window: bool,
+    config: khronos_egl::Config,
+    /// Method by which the framebuffer should support srgb
+    srgb_kind: SrgbFrameBufferKind,
+    egl_context_api: khronos_egl::Enum,
+    egl_context_attributes: Vec<khronos_egl::Int>,
+}
+"""
+if old_adapter_lock_impl not in egl:
+    raise SystemExit("error: expected AdapterContext lock implementation not found in egl.rs")
+egl = egl.replace(old_adapter_lock_impl, new_adapter_lock_impl, 1)
+
+# Remember the API and the exact attribute list that successfully created the
+# main context. The compile context must be created with the same values so the
+# two contexts can share objects.
+old_context_create = """        let context = {
+            #[derive(Copy, Clone)]
+            enum Robustness {
+"""
+new_context_create = """        let (context, context_api, context_attributes) = {
+            #[derive(Copy, Clone)]
+            enum Robustness {
+"""
+if old_context_create not in egl:
+    raise SystemExit("error: expected EGL context creation block not found in egl.rs")
+egl = egl.replace(old_context_create, new_context_create, 1)
+
+old_context_return = """                            return Ok(context);
+"""
+new_context_return = """                            return Ok((context, api, context_attributes));
+"""
+if old_context_return not in egl:
+    raise SystemExit("error: expected EGL context creation return not found in egl.rs")
+egl = egl.replace(old_context_return, new_context_return, 1)
+
+old_inner_init = """            version,
+            supports_native_window,
+            config,
+            srgb_kind,
+        })
+"""
+new_inner_init = """            version,
+            supports_native_window,
+            config,
+            srgb_kind,
+            egl_context_api: context_api,
+            egl_context_attributes: context_attributes,
+        })
+"""
+if old_inner_init not in egl:
+    raise SystemExit("error: expected Inner initializer not found in egl.rs")
+egl = egl.replace(old_inner_init, new_inner_init, 1)
+
+# The compile context is opt-in. Without the environment flag every pipeline
+# keeps using the main context exactly as before. Creation failures are logged
+# and degrade to the main context rather than failing adapter enumeration.
+old_window_kind = """#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowKind {
+"""
+new_window_kind = """impl Inner {
+    fn create_compile_context(&self) -> Option<CompileContext> {
+        if !cfg!(windows) {
+            log::info!("compile_context=disabled reason=platform");
+            return None;
+        }
+        if !compile_context_requested() {
+            log::info!("compile_context=disabled reason=env");
+            return None;
+        }
+        match CompileContext::create(self) {
+            Ok(context) => {
+                log::info!("compile_context=created");
+                Some(context)
+            }
+            Err(err) => {
+                log::error!("compile_context=unavailable reason={err}");
+                None
+            }
+        }
+    }
+}
+
+fn compile_context_requested() -> bool {
+    matches!(
+        std::env::var("CINNABAR_ANGLE_COMPILE_CONTEXT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowKind {
+"""
+if old_window_kind not in egl:
+    raise SystemExit("error: expected WindowKind definition not found in egl.rs")
+egl = egl.replace(old_window_kind, new_window_kind, 1)
+
 # Load the extension entry point while the freshly created context is current.
 old_enumerate = """        let gl = ManuallyDrop::new(gl);
         inner.egl.unmake_current();
@@ -307,6 +699,7 @@ new_enumerate = """        let extensions = unsafe { gl.get_parameter_string(glo
         };
 
         let gl = ManuallyDrop::new(gl);
+        let compile = inner.create_compile_context().map(Mutex::new);
         inner.egl.unmake_current();
 
         unsafe {
@@ -316,6 +709,7 @@ new_enumerate = """        let extensions = unsafe { gl.get_parameter_string(glo
                     // ERROR: Copying owned reference handles here, be careful to not drop them!
                     egl: Some(inner.egl.clone()),
                     base_vertex_ext,
+                    compile,
                 },
                 self.options.clone(),
             )
@@ -334,6 +728,7 @@ new_external = """                AdapterContext {
                     glow: Mutex::new(ManuallyDrop::new(context)),
                     egl: None,
                     base_vertex_ext: None,
+                    compile: None,
                 },
 """
 if old_external not in egl:
@@ -380,7 +775,7 @@ use self::wgl::AdapterContext;
 pub use self::wgl::{Instance, Surface};
 """
 new_mod_exports = """#[cfg(not(webgl))]
-pub use self::egl::{AdapterContext, AdapterContextLock};
+pub use self::egl::{AdapterContext, AdapterContextLock, PipelineContextLock};
 #[cfg(not(webgl))]
 pub use self::egl::{Instance, Surface};
 
@@ -686,6 +1081,39 @@ if old_destroy_fence not in device:
     raise SystemExit("error: expected destroy_fence implementation not found in device.rs")
 device = device.replace(old_destroy_fence, new_destroy_fence, 1)
 
+# Pipeline creation uses the dedicated compile context when the EGL backend
+# provides one. WebGL keeps its existing lock because its AdapterContext has no
+# separate context. destroy_* intentionally keeps using the main lock.
+old_render_pipeline_lock = """        let gl = &self.shared.context.lock();
+        let mut shaders = ArrayVec::new();
+        shaders.push((naga::ShaderStage::Vertex, vertex_stage));
+"""
+new_render_pipeline_lock = """        #[cfg(not(webgl))]
+        let gl = &self.shared.context.lock_for_pipeline();
+        #[cfg(webgl)]
+        let gl = &self.shared.context.lock();
+        let mut shaders = ArrayVec::new();
+        shaders.push((naga::ShaderStage::Vertex, vertex_stage));
+"""
+if old_render_pipeline_lock not in device:
+    raise SystemExit("error: expected render pipeline context lock not found in device.rs")
+device = device.replace(old_render_pipeline_lock, new_render_pipeline_lock, 1)
+
+old_compute_pipeline_lock = """        let gl = &self.shared.context.lock();
+        let mut shaders = ArrayVec::new();
+        shaders.push((naga::ShaderStage::Compute, &desc.stage));
+"""
+new_compute_pipeline_lock = """        #[cfg(not(webgl))]
+        let gl = &self.shared.context.lock_for_pipeline();
+        #[cfg(webgl)]
+        let gl = &self.shared.context.lock();
+        let mut shaders = ArrayVec::new();
+        shaders.push((naga::ShaderStage::Compute, &desc.stage));
+"""
+if old_compute_pipeline_lock not in device:
+    raise SystemExit("error: expected compute pipeline context lock not found in device.rs")
+device = device.replace(old_compute_pipeline_lock, new_compute_pipeline_lock, 1)
+
 egl_path.write_text(egl)
 mod_path.write_text(mod)
 adapter_path.write_text(adapter)
@@ -697,3 +1125,5 @@ PY
 echo "wgpu GLES EGL/ANGLE patch state:"
 grep -nF 'mod egl;' "$mod" | head -5
 grep -nF 'type WlEglWindow' "$egl" | head -5
+grep -nF 'compile_context=created' "$egl" | head -5
+grep -nF 'lock_for_pipeline' "$device" | head -5
