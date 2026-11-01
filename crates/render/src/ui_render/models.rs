@@ -12,6 +12,14 @@ pub(super) struct UiModels {
     resident: bool,
 }
 
+fn palette_usage() -> BufferUsages {
+    if crate::gl_compat::dx11() {
+        BufferUsages::COPY_DST
+    } else {
+        BufferUsages::STORAGE | BufferUsages::COPY_DST
+    }
+}
+
 impl UiModels {
     /// Includes the shared palette arena in retained GPU memory accounting.
     pub(super) fn bytes(&self) -> usize {
@@ -23,7 +31,7 @@ impl UiModels {
             buffer: device.create_buffer(&BufferDescriptor {
                 label: Some("retained UI model bone palette"),
                 size: size_of::<UiModelBone>() as u64,
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: palette_usage(),
                 mapped_at_creation: false,
             }),
             capacity: 1,
@@ -58,7 +66,7 @@ impl UiModels {
                 &BufferDescriptor {
                     label: Some("retained UI model bone palette"),
                     size: bytes,
-                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    usage: palette_usage(),
                     mapped_at_creation: false,
                 },
             )

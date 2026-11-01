@@ -81,7 +81,7 @@ fn backend_attachment_support(
     depth: TextureFormatFeatures,
     stencil: TextureFormatFeatures,
 ) -> ui::AntiAliasingSupport {
-    if backend == wgpu::Backend::Gl {
+    if matches!(backend, wgpu::Backend::Gl | wgpu::Backend::Dx11) {
         return ui::AntiAliasingSupport::from_counts([1]);
     }
     attachment_support(colors, depth, stencil)

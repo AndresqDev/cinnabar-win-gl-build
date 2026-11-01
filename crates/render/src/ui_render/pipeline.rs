@@ -22,9 +22,7 @@ impl FromWorld for UiPipeline {
 
 /// Declares the shared viewport, texture-page and sampler bindings.
 pub(crate) fn ui_bind_group_layout() -> BindGroupLayoutDescriptor {
-    BindGroupLayoutDescriptor::new(
-        "shared UI bind group layout",
-        &[
+    let mut entries = vec![
             BindGroupLayoutEntry {
                 binding: 0,
                 // The fragment stage reads the glint clock.
@@ -94,8 +92,14 @@ pub(crate) fn ui_bind_group_layout() -> BindGroupLayoutDescriptor {
                 },
                 count: None,
             },
-        ],
-    )
+    ];
+
+    // D3D11 has no storage buffers; the model bone palette binding is omitted.
+    if crate::gl_compat::dx11() {
+        entries.pop();
+    }
+
+    BindGroupLayoutDescriptor::new("shared UI bind group layout", &entries)
 }
 
 /// The premultiplied-alpha blend state shared by every UI quad except the

@@ -570,43 +570,46 @@ pub(super) fn prepare_ui_bind_group(
         if bucket.bind_group.is_some() && !changed {
             continue;
         }
+        let mut entries = vec![
+            BindGroupEntry {
+                binding: 0,
+                resource: viewport.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(&bucket.view),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::Sampler(sampler),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::Sampler(linear_sampler),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: bucket.format_uniform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: BindingResource::TextureView(glint_view),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: BindingResource::Sampler(glint_sampler),
+            },
+        ];
+        if !crate::gl_compat::dx11() {
+            entries.push(BindGroupEntry {
+                binding: 7,
+                resource: models.buffer.as_entire_binding(),
+            });
+        }
         bucket.bind_group = Some(render_device.create_bind_group(
             "shared retained UI bind group",
             &pipeline_cache.get_bind_group_layout(&pipeline.bind_group_layout),
-            &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: viewport.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&bucket.view),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: BindingResource::Sampler(sampler),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Sampler(linear_sampler),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: bucket.format_uniform.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 5,
-                    resource: BindingResource::TextureView(glint_view),
-                },
-                BindGroupEntry {
-                    binding: 6,
-                    resource: BindingResource::Sampler(glint_sampler),
-                },
-                BindGroupEntry {
-                    binding: 7,
-                    resource: models.buffer.as_entire_binding(),
-                },
-            ],
+            &entries,
         ));
     }
 }

@@ -138,5 +138,35 @@ pub(crate) fn source(raw: &str) -> String {
 }
 
 pub(super) fn from_wgsl(raw: &str, path: impl Into<String>) -> Shader {
-    crate::shader_safety::from_wgsl(source(raw), path)
+    let source = if crate::gl_compat::dx11() {
+        source_dx11(raw)
+    } else {
+        source(raw)
+    };
+    crate::shader_safety::from_wgsl(source, path)
+}
+
+/// D3D11 has no storage buffers. The retained UI model palette is the only
+/// storage binding in `ui.wgsl`; without it the menu and regular UI can still
+/// render, while in-game model overlays are unavailable on this backend.
+fn source_dx11(raw: &str) -> String {
+    let mut text = source(raw);
+
+    if let (Some(struct_start), Some(binding_start)) = (
+        text.find("struct UiModelBone {"),
+        text.find("@group(0) @binding(7) var<storage, read> ui_model_bones"),
+    ) {
+        if let Some(newline) = text[binding_start..].find('\n') {
+            text.replace_range(struct_start..binding_start + newline + 1, "");
+        }
+    }
+
+    if let (Some(branch_start), Some(branch_end)) = (
+        text.find("    if (style_flags & UI_STYLE_MODEL_VERTEX) != 0u {"),
+        text.find("    let ndc = vec2<f32>("),
+    ) {
+        text.replace_range(branch_start..branch_end, "");
+    }
+
+    text
 }
