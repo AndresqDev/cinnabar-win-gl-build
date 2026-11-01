@@ -69,11 +69,18 @@ impl Gpu {
                 ..Default::default()
             }))
             .context("find a graphics adapter")?;
+        // D3D11 advertises conservative per-stage limits. The WebGL2 defaults
+        // include values (notably the aggregate buffer limit) that are higher
+        // than the DX11 adapter contract and would make request_device fail.
+        let required_limits = if adapter.get_info().backend == wgpu::Backend::Dx11 {
+            adapter.limits()
+        } else {
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+        };
         let (device, queue) = runtime
             .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("bootstrap window"),
-                required_limits:
-                    wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                required_limits,
                 ..Default::default()
             }))
             .context("open the graphics device")?;
