@@ -25,13 +25,35 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Resolve DX11 artifact run
+        id: artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $runId = "${{ inputs.run_id }}"
+          if ([string]::IsNullOrWhiteSpace($runId)) {
+            $runId = gh run list `
+              --repo "${{ github.repository }}" `
+              --workflow windows-dx11.yml `
+              --branch "${{ github.ref_name }}" `
+              --status success `
+              --limit 1 `
+              --json databaseId `
+              --jq ".[0].databaseId"
+          }
+          if ([string]::IsNullOrWhiteSpace($runId)) {
+            throw "no successful Windows DX11 build was found for this branch"
+          }
+          "run_id=$runId" >> $env:GITHUB_OUTPUT
+
       - name: Download DX11 artifact
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          gh run download "${{ inputs.run_id || '41340842062' }}" `
+          gh run download "${{ steps.artifact.outputs.run_id }}" `
             --repo "${{ github.repository }}" `
             --name Cinnabar-Windows-DX11 `
             --dir dist
@@ -84,7 +106,7 @@ jobs:
           }
 
           $errors = Get-Content $stderr -ErrorAction SilentlyContinue |
-            Select-String -Pattern "panic|device removed|DXGI_ERROR|wgpu error|Validation Error" -SimpleMatch:$false
+            Select-String -Pattern "first-run window unavailable|open the graphics device|panic|device removed|DXGI_ERROR|wgpu error|Validation Error" -SimpleMatch:$false
           if ($errors) {
             throw "menu smoke found runtime errors in stderr"
           }
