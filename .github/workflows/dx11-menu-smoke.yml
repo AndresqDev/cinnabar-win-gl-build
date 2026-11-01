@@ -81,14 +81,9 @@ jobs:
           $env:CINNABAR_RENDER_DIAGNOSTICS = "1"
           $env:WGPU_VALIDATION_INDIRECT_CALL = "0"
 
-          # An explicit asset path skips first-run preparation. The client
-          # falls back to diagnostic assets when the blob is absent, which is
-          # enough to exercise the menu render path on CI.
-          $assetPath = Join-Path $dir "resources\assets\dx11-smoke.mcbea"
-
           $p = Start-Process -FilePath $exe.FullName `
             -WorkingDirectory $dir `
-            -ArgumentList "--frame-cap", "30", "--assets", $assetPath `
+            -ArgumentList "--frame-cap", "30" `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr
@@ -110,13 +105,18 @@ jobs:
             throw "menu process exited during startup with code $code"
           }
 
-          $errors = Get-Content $stderr -ErrorAction SilentlyContinue |
+          $stderrText = Get-Content $stderr -ErrorAction SilentlyContinue
+          $errors = $stderrText |
             Select-String -Pattern "first-run window unavailable|open the graphics device|panic|device removed|DXGI_ERROR|wgpu error|Validation Error" -SimpleMatch:$false
           if ($errors) {
             throw "menu smoke found runtime errors in stderr"
           }
 
-          Write-Host "menu startup smoke completed: process remained alive for 15 seconds"
+          if (-not ($stderrText | Select-String -SimpleMatch "first-run window ready")) {
+            throw "menu smoke did not report a ready first-run window"
+          }
+
+          Write-Host "first-run bootstrap smoke completed: GPU window and pipelines ready"
 
       - name: Upload smoke evidence
         if: always()

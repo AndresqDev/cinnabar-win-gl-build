@@ -236,7 +236,10 @@ impl ApplicationHandler for SetupApp {
             return;
         };
         match gpu::Gpu::new(Arc::clone(&window), &faces) {
-            Ok(gpu) => self.gpu = Some(gpu),
+            Ok(gpu) => {
+                self.gpu = Some(gpu);
+                eprintln!("first-run window ready");
+            }
             Err(error) => {
                 eprintln!("first-run window unavailable: {error:#}");
                 self.finish(EXIT_UNAVAILABLE, event_loop);
