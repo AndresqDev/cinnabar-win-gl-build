@@ -42,6 +42,21 @@ fn angle_capabilities(flags: wgpu::DownlevelFlags, storage_buffers: u32) -> Adap
     }
 }
 
+/// Supplies the exact contract-row capabilities the D3D11 backend advertises.
+fn dx11_capabilities(flags: wgpu::DownlevelFlags) -> AdapterCapabilities {
+    AdapterCapabilities {
+        backend: wgpu::Backend::Dx11,
+        flags,
+        limits: wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 0,
+            max_uniform_buffers_per_shader_stage: 7,
+            max_samplers_per_shader_stage: 8,
+            ..Default::default()
+        },
+        angle: false,
+    }
+}
+
 #[test]
 fn adapters_must_support_every_renderer_capability_and_storage_limit() {
     let required = render::minimum_vertex_storage_buffers();
@@ -118,6 +133,73 @@ fn angle_gl_still_requires_sixteen_byte_binding_alignment() {
             .to_string()
             .contains("BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED")
     );
+}
+
+#[test]
+fn dx11_accepts_the_contract_flags_without_storage_views_or_msaa() {
+    let required = DX11_REQUIRED_DOWNLEVEL_FLAGS;
+    assert!(meets_requirements(dx11_capabilities(required)).is_ok());
+
+    // The shared profile's storage, view-format, MSAA and 16-byte-alignment requirements do
+    // not apply to the D3D11 contract.
+    for absent in [
+        wgpu::DownlevelFlags::VERTEX_STORAGE,
+        wgpu::DownlevelFlags::FRAGMENT_STORAGE,
+        wgpu::DownlevelFlags::VIEW_FORMATS,
+        wgpu::DownlevelFlags::MULTISAMPLED_SHADING,
+        wgpu::DownlevelFlags::BUFFER_BINDINGS_NOT_16_BYTE_ALIGNED,
+    ] {
+        assert!(!required.contains(absent), "{absent:?}");
+    }
+    // Storage is zero in the D3D11 contract; the native terrain storage minimum must not
+    // reject the only adapter the legacy profile can use.
+    assert_eq!(
+        dx11_capabilities(required)
+            .limits
+            .max_storage_buffers_per_shader_stage,
+        0
+    );
+    assert!(meets_requirements(dx11_capabilities(required)).is_ok());
+}
+
+#[test]
+fn dx11_requires_each_contract_flag() {
+    let required = DX11_REQUIRED_DOWNLEVEL_FLAGS;
+    for flag in required.iter() {
+        let error = meets_requirements(dx11_capabilities(required - flag)).unwrap_err();
+        assert!(error.to_string().contains(&format!("{flag:?}")), "{error}");
+    }
+}
+
+#[test]
+fn dx11_device_requirements_use_adapter_values_and_never_raise_storage() {
+    let mut settings = WgpuSettings::default();
+    settings.priority = WgpuSettingsPriority::WebGL2;
+    settings.limits.max_storage_buffers_per_shader_stage = 4;
+    settings.limits.max_uniform_buffers_per_shader_stage = 12;
+    settings.limits.max_samplers_per_shader_stage = 16;
+    settings.limits.max_texture_dimension_2d = 8192;
+
+    let adapter_limits = wgpu::Limits {
+        max_storage_buffers_per_shader_stage: 0,
+        max_uniform_buffers_per_shader_stage: 7,
+        max_samplers_per_shader_stage: 8,
+        max_texture_dimension_2d: 16384,
+        ..wgpu::Limits::default()
+    };
+    let adapter_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    let (features, limits) = device_requirements_for(
+        wgpu::Backend::Dx11,
+        adapter_features,
+        &adapter_limits,
+        wgpu::DeviceType::IntegratedGpu,
+        &settings,
+    );
+    assert_eq!(features, adapter_features);
+    assert_eq!(limits.max_storage_buffers_per_shader_stage, 0);
+    assert_eq!(limits.max_uniform_buffers_per_shader_stage, 7);
+    assert_eq!(limits.max_samplers_per_shader_stage, 8);
+    assert_eq!(limits.max_texture_dimension_2d, 16384);
 }
 
 #[test]

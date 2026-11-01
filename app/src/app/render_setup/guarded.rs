@@ -6,8 +6,8 @@ use std::{
 };
 
 use super::device::{
-    backends, dxc_failed, flags, force_fallback, identity, instance, log, meets_requirements,
-    request_device, requested_adapter_name,
+    backends, dxc_failed, flags, force_fallback, identity, instance, log, log_dx11_identity,
+    meets_requirements, request_device, requested_adapter_name,
 };
 use super::selection::{
     Candidate, VideoFallback, eligible, probe_backend, rank, summary, try_candidates,
@@ -348,6 +348,7 @@ async fn create_renderer(
 ) -> Result<(RenderCreation, bool)> {
     let info = adapter.get_info();
     let compile_context = render::gl_compat::compile_context_available(&info.driver_info);
+    log_dx11_identity(&adapter);
     log(format_args!("Renderer creating device: {info:?}"));
     let started = std::time::Instant::now();
     let (device, queue) = request_device(&adapter, settings).await?;

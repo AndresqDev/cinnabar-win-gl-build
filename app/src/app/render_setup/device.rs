@@ -77,19 +77,44 @@ fn device_requirements(
     adapter: &wgpu::Adapter,
     settings: &WgpuSettings,
 ) -> (wgpu::Features, wgpu::Limits) {
+    let info = adapter.get_info();
+    device_requirements_for(
+        info.backend,
+        adapter.features(),
+        &adapter.limits(),
+        info.device_type,
+        settings,
+    )
+}
+
+/// Selects the requested features and limits for one adapter.
+///
+/// D3D11 always takes the adapter's own limits and features. Its contract advertises zero
+/// storage buffers and exactly the uniform/sampler slots the HAL implements, so requesting
+/// Cinnabar's native storage minimum would make `request_device` fail before the legacy
+/// profile can run. The other backends keep Bevy's priority rules and storage minimum.
+fn device_requirements_for(
+    backend: wgpu::Backend,
+    adapter_features: wgpu::Features,
+    adapter_limits: &wgpu::Limits,
+    device_type: wgpu::DeviceType,
+    settings: &WgpuSettings,
+) -> (wgpu::Features, wgpu::Limits) {
     let mut features = wgpu::Features::empty();
     let mut limits = settings.limits.clone();
-    if matches!(settings.priority, WgpuSettingsPriority::Functionality) {
-        features = adapter.features();
-        limits = adapter.limits();
-        if adapter.get_info().device_type == wgpu::DeviceType::DiscreteGpu {
+    if backend == wgpu::Backend::Dx11
+        || matches!(settings.priority, WgpuSettingsPriority::Functionality)
+    {
+        features = adapter_features;
+        limits = adapter_limits.clone();
+        if device_type == wgpu::DeviceType::DiscreteGpu {
             features.remove(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
         }
     }
-    raise_window_texture_limits(&mut limits, &adapter.limits());
+    raise_window_texture_limits(&mut limits, adapter_limits);
     limits.max_storage_buffers_per_shader_stage = limits
         .max_storage_buffers_per_shader_stage
-        .min(adapter.limits().max_storage_buffers_per_shader_stage);
+        .min(adapter_limits.max_storage_buffers_per_shader_stage);
     if let Some(disabled) = settings.disabled_features {
         features.remove(disabled);
     }
@@ -234,6 +259,30 @@ fn log_adapter_capabilities(
     ));
 }
 
+/// Logs the D3D11 backend, adapter and the HAL's real feature level.
+///
+/// `AdapterInfo` has no feature-level field, so the value comes from the native HAL adapter
+/// instead of being synthesized from the shader model or the adapter name.
+pub(super) fn log_dx11_identity(adapter: &wgpu::Adapter) {
+    let info = adapter.get_info();
+    if info.backend != wgpu::Backend::Dx11 {
+        return;
+    }
+    #[cfg(windows)]
+    let feature_level = {
+        // SAFETY: This read-only query borrows the live adapter; the native adapter is not
+        // retained or used to create resources.
+        unsafe { adapter.as_hal::<wgpu::hal::api::Dx11>() }
+            .map_or("unknown", |native| native.feature_level_name())
+    };
+    #[cfg(not(windows))]
+    let feature_level = "unavailable";
+    log(format_args!(
+        "Renderer DX11 backend: adapter={:?} vendor={:#06x} device={:#06x} feature_level={feature_level}",
+        info.name, info.vendor, info.device
+    ));
+}
+
 /// Logs the GL environment controls that change device and fence behavior.
 fn log_render_settings(settings: &WgpuSettings) {
     if !diagnostics_requested() {
@@ -277,6 +326,20 @@ const REQUIRED_DOWNLEVEL_FLAGS: wgpu::DownlevelFlags = wgpu::DownlevelFlags::BAS
     .union(wgpu::DownlevelFlags::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES)
     .union(wgpu::DownlevelFlags::MULTISAMPLED_SHADING);
 
+/// Capabilities the D3D11 contract actually advertises.
+///
+/// D3D11 has no vertex/fragment storage, alternate texture views or MSAA in this backend, and
+/// its downlevel flags do not include the 16-byte binding-alignment workaround. The legacy
+/// profile therefore requires only these real capabilities; the shared flags above stay in
+/// force for native and GL/ANGLE adapters.
+const DX11_REQUIRED_DOWNLEVEL_FLAGS: wgpu::DownlevelFlags = wgpu::DownlevelFlags::BASE_VERTEX
+    .union(wgpu::DownlevelFlags::NON_POWER_OF_TWO_MIPMAPPED_TEXTURES)
+    .union(wgpu::DownlevelFlags::CUBE_ARRAY_TEXTURES)
+    .union(wgpu::DownlevelFlags::COMPARISON_SAMPLERS)
+    .union(wgpu::DownlevelFlags::INDEPENDENT_BLEND)
+    .union(wgpu::DownlevelFlags::FULL_DRAW_INDEX_UINT32)
+    .union(wgpu::DownlevelFlags::DEPTH_BIAS_CLAMP);
+
 /// Whether an adapter is ANGLE's GLES translator rather than a native OpenGL driver.
 fn is_angle(info: &wgpu::AdapterInfo) -> bool {
     info.driver_info.contains("ANGLE") || info.name.starts_with("ANGLE")
@@ -305,14 +368,18 @@ impl From<&wgpu::Adapter> for AdapterCapabilities {
     }
 }
 
-/// The GL fallback flattens alternate views, so it does not require VIEW_FORMATS.
+/// The D3D11 profile uses only the capabilities the contract advertises; GL flattens alternate
+/// views, so it does not require VIEW_FORMATS either.
 fn required_downlevel_flags(adapter: &AdapterCapabilities) -> wgpu::DownlevelFlags {
-    let required = if matches!(adapter.backend, wgpu::Backend::Gl | wgpu::Backend::Dx11) {
+    if adapter.backend == wgpu::Backend::Dx11 {
+        return DX11_REQUIRED_DOWNLEVEL_FLAGS;
+    }
+    let required = if adapter.backend == wgpu::Backend::Gl {
         REQUIRED_DOWNLEVEL_FLAGS - wgpu::DownlevelFlags::VIEW_FORMATS
     } else {
         REQUIRED_DOWNLEVEL_FLAGS
     };
-    let required = if matches!(adapter.backend, wgpu::Backend::Gl | wgpu::Backend::Dx11) {
+    let required = if adapter.backend == wgpu::Backend::Gl {
         // The legacy compatibility path forces single-sample rendering.
         required - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
     } else {
@@ -337,6 +404,9 @@ pub(super) fn meets_requirements(adapter: impl Into<AdapterCapabilities>) -> Res
         missing.is_empty(),
         "GPU lacks renderer capabilities: {missing:?}"
     );
+    if adapter.backend == wgpu::Backend::Dx11 {
+        return Ok(());
+    }
     anyhow::ensure!(
         adapter.limits.max_storage_buffers_per_shader_stage
             >= render::minimum_vertex_storage_buffers(),

@@ -21,20 +21,100 @@ pub enum CompatBackend {
     Dx11,
 }
 
+/// Explicit capability table for the legacy renderer profiles.
+///
+/// The plan names the D3D11 row `Dx11Legacy`; [`DX11_LEGACY`] is that row. Each row records
+/// which capability group applies, instead of leaving the decisions spread across backend
+/// checks:
+///
+/// - `legacy_common`: single encoded scene target, no HDR/Enhanced, MSAA or alternate views;
+/// - `gl_only`: padded arrays, `GL_COMPAT`, the ANGLE compile context and GL fences;
+/// - `dx11_only`: no depth pyramid, compute, storage textures, timestamps or pipeline cache;
+/// - `native_only`: advanced features the legacy path must not request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Dx11Legacy {
+    /// Adaptations shared by GL/ANGLE and D3D11.
+    pub legacy_common: bool,
+    /// Adaptations that are valid only for GL/ANGLE.
+    pub gl_only: bool,
+    /// Restrictions that are valid only for D3D11.
+    pub dx11_only: bool,
+    /// Native-only capabilities.
+    pub native_only: bool,
+}
+
+impl Dx11Legacy {
+    /// The GL/ANGLE row: shared legacy adaptations plus GL-only workarounds.
+    pub const GL: Self = Self {
+        legacy_common: true,
+        gl_only: true,
+        dx11_only: false,
+        native_only: false,
+    };
+
+    /// The D3D11 row: shared legacy adaptations plus D3D11-only restrictions.
+    pub const DX11: Self = Self {
+        legacy_common: true,
+        gl_only: false,
+        dx11_only: true,
+        native_only: false,
+    };
+
+    /// The native row: no legacy adaptations and advanced capabilities enabled.
+    pub const NATIVE: Self = Self {
+        legacy_common: false,
+        gl_only: false,
+        dx11_only: false,
+        native_only: true,
+    };
+
+    /// Whether the backend shares the legacy scene, view and gamma adaptations.
+    pub const fn enabled(self) -> bool {
+        self.legacy_common
+    }
+
+    /// Whether the backend is GL/ANGLE.
+    pub const fn gl(self) -> bool {
+        self.gl_only
+    }
+
+    /// Whether the backend is D3D11.
+    pub const fn dx11(self) -> bool {
+        self.dx11_only
+    }
+
+    /// Whether the backend has native-only capabilities enabled.
+    pub const fn native(self) -> bool {
+        self.native_only
+    }
+}
+
+/// The explicit D3D11 legacy row.
+pub const DX11_LEGACY: Dx11Legacy = Dx11Legacy::DX11;
+
 impl CompatBackend {
+    /// Selects the capability-table row for this backend.
+    pub const fn profile(self) -> Dx11Legacy {
+        match self {
+            Self::None => Dx11Legacy::NATIVE,
+            Self::Gl => Dx11Legacy::GL,
+            Self::Dx11 => Dx11Legacy::DX11,
+        }
+    }
+
     /// Whether the backend shares the legacy scene, view and gamma adaptations.
     fn enabled(self) -> bool {
-        matches!(self, Self::Gl | Self::Dx11)
+        self.profile().enabled()
     }
 
     /// Whether the backend is GL/ANGLE.
     fn gl(self) -> bool {
-        matches!(self, Self::Gl)
+        self.profile().gl()
     }
 
     /// Whether the backend is D3D11.
     fn dx11(self) -> bool {
-        matches!(self, Self::Dx11)
+        self.profile().dx11()
     }
 }
 
@@ -94,12 +174,20 @@ fn backend() -> CompatBackend {
     *BACKEND.get().unwrap_or(&CompatBackend::None)
 }
 
+/// The installed capability-table row.
+///
+/// Backend-specific code should ask this table instead of testing individual backends, so the
+/// shared legacy adaptations cannot leak into a GL-only or D3D11-only decision.
+pub fn profile() -> Dx11Legacy {
+    backend().profile()
+}
+
 /// Whether the active backend needs the shared legacy compatibility adaptations.
 ///
 /// True for GL and D3D11. Those backends flatten alternate texture views and keep the encoded
 /// scene/gamma formats; backend-specific workarounds must use [`gl`] or [`dx11`] instead.
 pub fn enabled() -> bool {
-    backend().enabled()
+    profile().enabled()
 }
 
 /// Whether the active backend is GL/ANGLE.
@@ -107,12 +195,12 @@ pub fn enabled() -> bool {
 /// GL-only workarounds include the single-context scheduling, the `GL_COMPAT` shader def and
 /// the padded array layouts.
 pub fn gl() -> bool {
-    backend().gl()
+    profile().gl()
 }
 
 /// Whether the active backend is D3D11.
 pub fn dx11() -> bool {
-    backend().dx11()
+    profile().dx11()
 }
 
 /// Whether GL runs pipeline compilation on ANGLE's separate EGL context.
@@ -289,6 +377,44 @@ mod tests {
         assert!(CompatBackend::Dx11.enabled());
         assert!(!CompatBackend::Dx11.gl());
         assert!(CompatBackend::Dx11.dx11());
+    }
+
+    #[test]
+    fn dx11_legacy_row_is_explicit_and_has_no_gl_or_native_capabilities() {
+        assert_eq!(
+            DX11_LEGACY,
+            Dx11Legacy {
+                legacy_common: true,
+                gl_only: false,
+                dx11_only: true,
+                native_only: false,
+            }
+        );
+        assert_eq!(CompatBackend::Dx11.profile(), DX11_LEGACY);
+        assert!(DX11_LEGACY.enabled());
+        assert!(!DX11_LEGACY.gl());
+        assert!(DX11_LEGACY.dx11());
+        assert!(!DX11_LEGACY.native());
+    }
+
+    #[test]
+    fn gl_legacy_row_keeps_shared_and_gl_only_workarounds() {
+        let profile = CompatBackend::Gl.profile();
+        assert_eq!(profile, Dx11Legacy::GL);
+        assert!(profile.enabled());
+        assert!(profile.gl());
+        assert!(!profile.dx11());
+        assert!(!profile.native());
+    }
+
+    #[test]
+    fn native_row_has_no_legacy_adaptations() {
+        let profile = CompatBackend::None.profile();
+        assert_eq!(profile, Dx11Legacy::NATIVE);
+        assert!(!profile.enabled());
+        assert!(!profile.gl());
+        assert!(!profile.dx11());
+        assert!(profile.native());
     }
 
     #[test]
