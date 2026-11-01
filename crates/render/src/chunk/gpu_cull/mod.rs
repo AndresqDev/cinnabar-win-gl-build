@@ -66,7 +66,7 @@ fn gpu_cull_unstable(vendor: u32) -> bool {
 fn cpu_culling_required(vendor: u32, forced_cpu: bool, limits: &wgpu::Limits) -> bool {
     // GL cannot read depth textures in compute shaders, and the direct path also builds a
     // depth pyramid. Keep terrain on CPU visibility instead of compiling unusable kernels.
-    crate::gl_compat::gl()
+    crate::gl_compat::enabled()
         || gpu_cull_unstable(vendor)
         || forced_cpu
         || limits.max_storage_buffers_per_shader_stage < required_vertex_storage_buffers()

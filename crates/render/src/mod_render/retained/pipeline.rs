@@ -293,7 +293,7 @@ impl crate::pipeline_warmup::PrewarmPipelines for Pipeline {
                 }
             }
         }
-        if !crate::gl_compat::gl() {
+        if !crate::gl_compat::enabled() {
             ids.push(self.masks.specialize(
                 cache,
                 Key {
