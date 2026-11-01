@@ -292,7 +292,7 @@ void LogAdapter(ID3D11Device* device) {
     std::ostringstream details;
     details << "[info] adapter: vendor=" << HexFixed(desc.VendorId, 4)
             << " device=" << HexFixed(desc.DeviceId, 4)
-            << " subsystem=" << HexFixed(desc.SubSystemId, 8)
+            << " subsystem=" << HexFixed(desc.SubSysId, 8)
             << " revision=" << HexFixed(desc.Revision, 4)
             << " dedicated_video="
             << (static_cast<std::uint64_t>(desc.DedicatedVideoMemory) /
