@@ -56,6 +56,12 @@ jobs:
             core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
             core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
+      - name: Patch Bevy for DX11 compatibility
+        shell: bash
+        run: |
+          cargo fetch --locked
+          bash scripts/patch-bevy-dx11.sh
+
       - name: Build Rust client and tools
         shell: bash
         run: |
