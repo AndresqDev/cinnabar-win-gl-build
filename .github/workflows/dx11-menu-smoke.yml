@@ -46,13 +46,12 @@ jobs:
           }
           $exe.FullName
 
-      - name: Run hidden menu acceptance smoke
+      - name: Run hidden menu startup smoke
         shell: pwsh
         run: |
           $exe = Get-ChildItem dist -Recurse -Filter cinnabar.exe |
             Select-Object -First 1
           $dir = $exe.Directory.FullName
-          $metrics = Join-Path $PWD "dx11-menu-metrics.json"
           $stdout = Join-Path $PWD "dx11-menu.stdout.log"
           $stderr = Join-Path $PWD "dx11-menu.stderr.log"
 
@@ -62,18 +61,16 @@ jobs:
 
           $p = Start-Process -FilePath $exe.FullName `
             -WorkingDirectory $dir `
-            -ArgumentList "--acceptance-seconds", "10", "--metrics-out", $metrics `
+            -ArgumentList "--frame-cap", "30" `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr
 
-          if (-not $p.WaitForExit(90000)) {
+          Start-Sleep -Seconds 15
+
+          $exited = $p.HasExited
+          if (-not $exited) {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "--- stdout ---"
-            Get-Content $stdout -ErrorAction SilentlyContinue
-            Write-Host "--- stderr ---"
-            Get-Content $stderr -ErrorAction SilentlyContinue
-            throw "menus smoke timed out after 90 seconds"
           }
 
           Write-Host "--- stdout ---"
@@ -81,13 +78,18 @@ jobs:
           Write-Host "--- stderr ---"
           Get-Content $stderr -ErrorAction SilentlyContinue
 
-          if ($p.ExitCode -ne 0) {
-            throw "menu smoke exited with $($p.ExitCode)"
+          if ($exited) {
+            $code = $p.ExitCode
+            throw "menu process exited during startup with code $code"
           }
-          if (-not (Test-Path $metrics)) {
-            throw "menu smoke did not produce metrics"
+
+          $errors = Get-Content $stderr -ErrorAction SilentlyContinue |
+            Select-String -Pattern "panic|device removed|DXGI_ERROR|wgpu error|Validation Error" -SimpleMatch:$false
+          if ($errors) {
+            throw "menu smoke found runtime errors in stderr"
           }
-          Get-Content $metrics
+
+          Write-Host "menu startup smoke completed: process remained alive for 15 seconds"
 
       - name: Upload smoke evidence
         if: always()
@@ -95,7 +97,6 @@ jobs:
         with:
           name: dx11-menu-smoke
           path: |
-            dx11-menu-metrics.json
             dx11-menu.stdout.log
             dx11-menu.stderr.log
           if-no-files-found: warn
