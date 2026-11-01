@@ -109,6 +109,7 @@ use render_model::{
 use render_model::UiRenderScene;
 
 const UI_SHADER_HANDLE: Handle<Shader> = uuid_handle!("7cfb904c-c8cf-4dd2-9214-7d208ce454e7");
+const UI_SHADER_HANDLE_DX11: Handle<Shader> = uuid_handle!("a7c5a4a5-0f99-4a7c-9e67-08bfa19d7f03");
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UiRenderPlugin;
@@ -150,6 +151,7 @@ fn install_ui_render(app: &mut App) {
     ));
     upscale::install(app);
     load_internal_asset!(app, UI_SHADER_HANDLE, "ui.wgsl", shader::from_wgsl);
+    load_internal_asset!(app, UI_SHADER_HANDLE_DX11, "ui.wgsl", shader::from_wgsl_dx11);
     load_internal_asset!(
         app,
         composite::UI_COMPOSITE_SHADER_HANDLE,

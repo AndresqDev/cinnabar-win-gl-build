@@ -141,7 +141,11 @@ pub(crate) fn ui_pipeline_descriptor(
         label: Some("shared retained UI overlay pipeline".into()),
         layout: vec![bind_group_layout],
         vertex: VertexState {
-            shader: UI_SHADER_HANDLE,
+            shader: if crate::gl_compat::dx11() {
+                UI_SHADER_HANDLE_DX11
+            } else {
+                UI_SHADER_HANDLE
+            },
             entry_point: Some("ui_vertex".into()),
             buffers: vec![VertexBufferLayout {
                 array_stride: size_of::<FontAtlasVertex>() as u64,
@@ -192,7 +196,11 @@ pub(crate) fn ui_pipeline_descriptor(
             ..default()
         },
         fragment: Some(FragmentState {
-            shader: UI_SHADER_HANDLE,
+            shader: if crate::gl_compat::dx11() {
+                UI_SHADER_HANDLE_DX11
+            } else {
+                UI_SHADER_HANDLE
+            },
             entry_point: Some("ui_fragment".into()),
             targets: vec![Some(ColorTargetState {
                 format: render_scene::SCENE_COLOR_FORMAT,

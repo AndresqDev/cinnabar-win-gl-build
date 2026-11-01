@@ -90,6 +90,13 @@ impl Plugin for ChunkRenderPlugin {
             );
         super::visibility::install(app);
 
+        // The DX11 legacy profile has no storage buffers yet. Keep the
+        // main-world publication resources above, but do not build the GPU
+        // chunk pipeline, storage layouts or culling passes.
+        if crate::gl_compat::dx11() {
+            return;
+        }
+
         if app.get_sub_app(RenderApp).is_none() {
             return;
         }
@@ -215,6 +222,9 @@ impl Plugin for ChunkRenderPlugin {
 
     fn finish(&self, app: &mut App) {
         install_atmosphere(app);
+        if crate::gl_compat::dx11() {
+            return;
+        }
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             transparent::gamma_pass::install_graph(render_app.world_mut());
         }
