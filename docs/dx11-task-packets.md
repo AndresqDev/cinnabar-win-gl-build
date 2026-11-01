@@ -16,13 +16,17 @@ pruebas, rama propuesta y criterio de aceptación. No implementa código.
 
 ## 0. Resultado del piloto de anidamiento
 
-Esta sesión es capa 1 y no tiene herramienta `subagent`. No se lanzaron
-líderes de capa 2 ni implementadores de capa 3; no hay worktrees hijos ni
-ramas hijas. No se simulan hijos. Por eso **ningún paquete está activo**:
-todos quedan propuestos hasta que una sesión con delegación los asigne.
+El piloto real se ejecutó con tres capas: capa 1 lanzó 2 líderes de capa 2
+(`lead-verification`, `lead-hal-core`); cada líder lanzó 2 implementadores de
+capa 3. Los implementadores no tienen `subagent` y no crearon capa 4. Dos
+agotaron su límite de pasos y sus líderes revisaron y commitearon el trabajo.
 
-El detalle está en [dx11-agent-map.md](dx11-agent-map.md). El primer paquete
-que debe activarse es **P6 — Verificación**, no un paquete de implementación.
+**P6 y P1 están entregados** en las ramas `dx11-verification` y
+`dx11-hal-core`, y la capa 1 mergeó ambos en `dx11-stabilization` con el
+contrato verde en WARP. P2–P5 siguen propuestos y no se activan sin nueva
+instrucción.
+
+El detalle está en [dx11-agent-map.md](dx11-agent-map.md).
 
 ## 1. Reglas comunes
 
@@ -530,10 +534,21 @@ Un paquete se acepta solo si:
 
 ## 11. Estado actual y siguiente paso
 
-Ningún paquete está activo: el piloto no pudo lanzar capa 2. El primer paso
-real es repetir el piloto en una sesión con `subagent` y activar
-**P6 — Verificación**. Después, **P1 — HAL core**. Recursos, shaders,
-pipelines y Bevy/Cinnabar esperan los handoffs y los slots disponibles.
+**P6 — Verificación** y **P1 — HAL core** entregaron su primera fase. La rama
+`dx11-stabilization` de `AndresqDev/wgpu` @ `9bc4fc056` contiene:
 
-Sin el test de contrato de P6, la Puerta 0 no se cierra y no se abre la
-Puerta 1. Sin la Puerta 1, no se toca Bevy ni se publica una build.
+- `wgpu-hal/tests/dx11_contract.rs` y `.github/workflows/dx11-contract.yml`;
+- correcciones de Puerta 0 en `conv.rs`, `adapter.rs`, `types.rs`, `device.rs`;
+- `raw-dx11-resize.rs` y fence real `D3D11_QUERY_EVENT`;
+- workflow `dx11-hal-core-check.yml` con check, tests puros y ejemplos.
+
+Evidencia verde: contrato `41308953949` (WARP), HAL core `41309216229`
+(incluye `raw-dx11-resources` y `raw-dx11-triangle` con readback). Puerta 0
+cerrada en WARP; hardware, debug layer y recuperación de device loss siguen
+abiertos.
+
+Siguiente: **P2 — Recursos**, después **P3 — Shaders/descriptores**, después
+**P4 — Pipelines/comandos**. P1 mantiene follow-ups de debug layer, device
+loss, alignments y paridad con hardware. Nada de esto se activa sin una nueva
+instrucción de capa 0. Sin la Puerta 1 completa, no se toca Bevy/Cinnabar ni
+se publica una build.

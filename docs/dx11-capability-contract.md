@@ -2,11 +2,14 @@
 
 | Campo | Valor |
 | --- | --- |
-| Estado | Puerta 0 — contrato v0 para revisión |
+| Estado | Puerta 0 — contrato v1 implementado y verificado en CI sobre WARP; hardware pendiente |
 | Fecha | 2026-11-01 |
-| Rama | `dx11-stabilization` |
-| Base | `dea0b3d` |
-| Backend de referencia | `AndresqDev/wgpu` @ `b85f3a16a9dfc6bbcc9da650755c23f92b6cf636` |
+| Rama | `dx11-stabilization` (documentación) |
+| Base documental | `dea0b3d` |
+| Integración wgpu | `AndresqDev/wgpu` `dx11-stabilization` @ `9bc4fc056` |
+| Pin de referencia (histórico) | `b85f3a16a9dfc6bbcc9da650755c23f92b6cf636` |
+| Test de contrato | `wgpu-hal/tests/dx11_contract.rs`, workflow `DX11 Contract` |
+| Evidencia | Run rojo del pin `41306698696`; run verde del candidato P1+P6 `41308541042`; run verde de integración `41308953949` |
 | Alcance | `wgpu-hal` DX11 y su integración con Cinnabar |
 | Compilación local | Ninguna; este documento no aprueba una build |
 
@@ -17,15 +20,24 @@ los contratos de integración. No sustituye al plan: lo hace verificable.
 
 ## 0. Resultado del piloto de anidamiento
 
-Esta sesión es capa 1 y **no tiene disponible la herramienta `subagent`** ni
-otra herramienta de delegación. Por eso no se lanzaron agentes de capa 2, no
-hubo capa 2 que intentara lanzar capa 3, y no se creó ningún worktree hijo. No
-se simulan hijos. El detalle y las limitaciones están en
-[dx11-agent-map.md](dx11-agent-map.md).
+El piloto real de tres capas se ejecutó en esta fase:
 
-Consecuencia para este documento: las capacidades se derivan de inspección de
-la fuente del pin, no de una ejecución. La validación runtime y el piloto real
-de tres capas siguen pendientes.
+- **Capa 0** (sesión principal) lanzó una sesión de **capa 1**.
+- **Capa 1** lanzó dos líderes de **capa 2** en paralelo: `lead-verification`
+  (P6) y `lead-hal-core` (P1).
+- Cada líder de capa 2 lanzó **dos implementadores de capa 3** (cuatro en
+  total), cada uno con worktree y rama propios.
+- Los implementadores de capa 3 **no tienen `subagent`** y no crearon capa 4.
+  Ambos líderes lo reportaron explícitamente; no se simuló ningún hijo.
+- Dos implementadores agotaron su límite de pasos antes de commitear; su
+  líder revisó, corrigió y commiteó el trabajo. Esto es una limitación
+  operativa, no un fallo de jerarquía.
+- Ningún agente de capa 2/3 mergeó en `dx11-stabilization` ni pusheó a
+  `dx11-integration`. La capa 1 revisó y mergeó.
+
+Consecuencia: la jerarquía de tres capas está validada y la evidencia de
+runtime existe. Sigue siendo obligatorio repetir la disciplina de propiedad de
+archivos y de CI remoto en cada paquete.
 
 ## 1. Regla de anuncio
 
@@ -51,8 +63,9 @@ comentario o una intención en el plan no cuentan como implementación.
 | `X` | Ausente, rechazado explícitamente o nunca anunciado |
 | `?` | No verificado; no puede usarse como garantía |
 
-**Ninguna fila de este documento tiene evidencia `R` (runtime) en este
-piloto.** Los workflows `dx11-*.yml` del fork existen, pero no se ejecutaron.
+**La evidencia de runtime de la Puerta 0 está en §9.1.** Las filas `S` se
+conservan como inspección del pin; el test de contrato verde complementa la
+validación runtime en WARP. La paridad con hardware sigue sin evidencia `R`.
 
 ## 2. Resumen ejecutivo
 
@@ -63,8 +76,8 @@ SM 5.0, crea render pipelines y ejecuta draws con readback. Los ejemplos
 `raw-dx11`, `raw-dx11-resources`, `raw-dx11-shader`, `raw-dx11-triangle` y
 `raw-dx11-window` cubren parte de ese camino.
 
-Pero el anuncio actual es **más amplio que la implementación**. Los bloqueos
-principales de Puerta 0 son:
+Pero el anuncio del pin era **más amplio que la implementación**. Los
+bloqueos principales de Puerta 0 eran:
 
 - anuncia `TEXTURE_COMPRESSION_BC` sin mapear ningún formato BC;
 - anuncia `MULTISAMPLE_X4` por formato aunque solo acepta `sample_count == 1`;
@@ -78,8 +91,17 @@ principales de Puerta 0 son:
 - faltan la capa de debug, fences de GPU reales, `wait_for_idle` real, pérdida
   de dispositivo controlada y las pruebas de resize.
 
-La Puerta 0 no está cerrada: faltan el test de contrato y la corrección de
-estos anuncios. Este documento no publica ni aprueba ninguna build.
+Los sobre-anuncios anteriores están corregidos en la integración v1:
+`TEXTURE_COMPRESSION_BC` retirada; `MULTISAMPLE_X4` retirada; storage y
+compute a 0; `set_immediates` inalcanzable mediante layout rechazado; storage
+buffers/texturas rechazados en el layout; límites 1D/3D a 0. La Puerta 0 queda
+**cerrada en WARP** con el test de contrato verde y la Puerta 0 roja del pin
+como evidencia. Queda pendiente la paridad con hardware, la capa de debug, la
+pérdida de dispositivo controlada y los fences sin serialización de submits.
+
+La evidencia de ejecución está en `docs/evidence/dx11-contract-gate0.md` del
+fork de wgpu (run rojo `41306698696`, run verde `41308541042`, integración
+`41308953949`). No se publica ni aprueba ninguna build.
 
 ## 3. Identidad, instancia y presentación
 
@@ -107,8 +129,9 @@ estos anuncios. Este documento no publica ni aprueba ninguna build.
 La swapchain se crea con `DXGI_SWAP_EFFECT_FLIP_DISCARD`, formato
 `B8G8R8A8_UNORM` y una vista RTV sRGB cuando se pide
 `Bgra8UnormSrgb`. Si el flip model falla, se reintenta con
-`DXGI_SWAP_EFFECT_DISCARD` y un buffer. Es un camino real, pero la Puerta 1
-todavía no tiene una prueba de resize ni de pérdida de dispositivo.
+`DXGI_SWAP_EFFECT_DISCARD` y un buffer. Es un camino real; la prueba de resize
+ya existe (`raw-dx11-resize`), pero la pérdida de dispositivo controlada sigue
+pendiente de la Puerta 1.
 
 ## 4. Features
 
@@ -120,7 +143,7 @@ todavía no tiene una prueba de resize ni de pérdida de dispositivo.
 | --- | --- | --- | --- | --- |
 | `DEPTH_CLIP_CONTROL` | 11_0/10_1 | `S` | `create_rasterizer_state` usa `DepthClipEnable` | Mantener; añadir test |
 | `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` | 11_0/10_1 | `S`, parcial | `adapter.rs::texture_format_capabilities` consulta `CheckFeatureSupport` | Mantener solo si la matriz por formato pasa; corregir `MULTISAMPLE_X4` |
-| `TEXTURE_COMPRESSION_BC` | 11_0 | `S`, **falso** | Se anuncia, pero `conv::map_texture_format` no mapea BC1–BC7 | Retirar o implementar BC completo |
+| `TEXTURE_COMPRESSION_BC` | 11_0 | `S`, **falso** | Se anunciaba, pero `conv::map_texture_format` no mapea BC1–BC7 | **Retirada en v1**; no se anuncia |
 
 `TEXTURE_COMPRESSION_BC` es el caso más peligroso: `wgpu-core` puede validar
 una textura BC porque la feature está activa y después la creación falla en
@@ -153,31 +176,37 @@ no se anuncian:
 - `MULTISAMPLE_ARRAY`, `MULTIVIEW`, `DUAL_SOURCE_BLENDING` ni
   `CONSERVATIVE_RASTERIZATION`.
 
-### 4.3 Features que deben retirarse o implementarse antes de cerrar Puerta 0
+### 4.3 Features que debían retirarse o implementarse antes de cerrar Puerta 0
 
-| Elemento | Problema | Decisión |
+| Elemento | Problema | Decisión v1 |
 | --- | --- | --- |
-| `TEXTURE_COMPRESSION_BC` | No hay mapeo BC | Retirar en el contrato v0; implementar en un paquete posterior |
-| `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` | Las caps por formato sobre-anuncian MSAA | Mantener solo con caps corregidas y matriz verde |
-| `DEPTH_CLIP_CONTROL` | Implementado, sin test dedicado | Mantener; test de profundidad recortada |
+| `TEXTURE_COMPRESSION_BC` | No hay mapeo BC | **Retirada**; verificado por el test de contrato |
+| `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` | Las caps por formato sobre-anunciaban MSAA | **Mantenida** con `MULTISAMPLE_X4` retirada y matriz de formatos verificada en WARP |
+| `DEPTH_CLIP_CONTROL` | Implementado, sin test dedicado | Mantenida; el test de contrato no ejecuta depth clipping (Puerta 1) |
 
 ## 5. Downlevel flags
 
-### 5.1 Cómo se calculan hoy
+### 5.1 Cómo se calculan en v1
 
-`conv::downlevel_for_feature_level` parte de
-`wgpu_types::DownlevelFlags::compliant()`. En esta versión, `compliant()` es
-**todas** las flags menos `ANISOTROPIC_FILTERING`. Después elimina:
+`conv::downlevel_for_feature_level` ya **no parte de
+`wgpu_types::DownlevelFlags::compliant()`**. Construye `DownlevelFlags::empty()`
+y añade exactamente:
 
-- `VIEW_FORMATS`;
-- `SURFACE_VIEW_FORMATS`;
-- `NONBLOCKING_QUERY_RESOLVE`;
-- `COMPUTE_SHADERS`;
-- `FRAGMENT_WRITABLE_STORAGE`.
+```
+BASE_VERTEX
+NON_POWER_OF_TWO_MIPMAPPED_TEXTURES
+CUBE_ARRAY_TEXTURES
+COMPARISON_SAMPLERS
+INDEPENDENT_BLEND
+FULL_DRAW_INDEX_UINT32
+DEPTH_BIAS_CLAMP
+```
 
-Para feature level 10_1 elimina además `FRAGMENT_STORAGE` y `VERTEX_STORAGE`.
-El resultado en 11_0 sigue siendo una lista heredada, no una lista de
-capacidades comprobadas. Esto viola la regla 1 del plan.
+`shader_model` es `Sm5` en 11_0 y `Sm4` en 10_1. `is_webgpu_compliant()` es
+siempre `false`, que es la respuesta honesta para un backend downlevel.
+
+La tabla de §5.2 se conserva como análisis histórico del pin; la columna
+«Acción v0» se ejecutó en v1 y el conjunto final es el de §5.3.
 
 ### 5.2 Flags activas y verificación
 
@@ -210,9 +239,9 @@ capacidades comprobadas. Esto viola la regla 1 del plan.
 | `TEXTURE_COMPRESSION` | Activa | BC/ETC2/ASTC no mapeados | **Retirar** |
 | `ANISOTROPIC_FILTERING` | Inactiva | El sampler acepta anisotropía, pero la flag no se anuncia | Correcto: no anunciar |
 
-### 5.3 Conjunto objetivo v0
+### 5.3 Conjunto implementado en v1
 
-El contrato v0 no parte de `compliant()`. Propone una lista explícita mínima:
+El contrato v1 implementado no parte de `compliant()`. Anuncia exactamente:
 
 ```
 BASE_VERTEX
@@ -224,10 +253,10 @@ FULL_DRAW_INDEX_UINT32
 DEPTH_BIAS_CLAMP
 ```
 
-`DEPTH_TEXTURE_AND_BUFFER_COPIES` y `UNRESTRICTED_INDEX_BUFFER` se añaden solo
-si sus tests pasan. Cualquier otra flag queda fuera hasta que exista
-implementación y prueba. Esto hace que `is_webgpu_compliant()` sea `false`,
-que es la respuesta honesta para un backend downlevel.
+`DEPTH_TEXTURE_AND_BUFFER_COPIES` y `UNRESTRICTED_INDEX_BUFFER` siguen fuera
+hasta que sus tests dedicados pasen. Cualquier otra flag queda fuera hasta que
+exista implementación y prueba. Esto hace que `is_webgpu_compliant()` sea
+`false`.
 
 ## 6. Formatos
 
@@ -270,19 +299,21 @@ hay un `Stencil8` real: el plan lo prohíbe y el contrato lo mantiene fuera.
 | --- | --- |
 | `TEXTURE2D` | `SAMPLED | COPY_SRC | COPY_DST` |
 | `SHADER_SAMPLE` | `SAMPLED_LINEAR` |
-| `RENDER_TARGET` | `COLOR_ATTACHMENT | MULTISAMPLE_X4` |
+| `RENDER_TARGET` | `COLOR_ATTACHMENT` |
 | `BLENDABLE` | `COLOR_ATTACHMENT_BLEND` |
 | `DEPTH_STENCIL` | `DEPTH_STENCIL_ATTACHMENT` |
 
-El problema es `MULTISAMPLE_X4`: la creación de texturas y render passes exige
-`sample_count == 1`, y no hay resolve. Anunciar `MULTISAMPLE_X4` permite que
-`wgpu-core` valide una textura o pipeline MSAA y después el HAL la rechace.
-Debe retirarse hasta que exista MSAA real y una prueba de resolve.
+El problema histórico era `MULTISAMPLE_X4`: la creación de texturas y render
+passes exige `sample_count == 1`, y no hay resolve. Anunciarlo permitía que
+`wgpu-core` validara una textura o pipeline MSAA y después el HAL la rechazara.
+**v1 retira todos los bits `MULTISAMPLE_*`**; el test de contrato verifica que
+ningún formato de la allowlist los anuncia y que MSAA x4 falla con error
+explícito. `TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` se mantiene con esta
+matriz corregida.
 
-`TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` solo puede mantenerse si esta
-traducción se corrige y se prueba formato por formato. Mientras tanto, el
-contrato v0 no garantiza ninguna capacidad por formato que no esté en la
-matriz de P6.
+`TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES` se mantiene porque la traducción se
+corrigió y el test de contrato verifica la matriz por formato. El contrato v1
+solo garantiza las capacidades por formato cubiertas por esa matriz.
 
 ### 6.3 Superficie
 
@@ -293,10 +324,65 @@ No se anuncian 10 bits, HDR, `Mailbox`, `ExclusiveFullScreen` ni
 
 ## 7. Límites
 
-Los valores salen de `Limits::downlevel_defaults()` con los cambios de
-`conv::limits_for_feature_level`: dimensión 1D/2D 16384 en 11_0 y 8192 en
-10_1, dimensión 3D 2048 y arrays 2048. El resto queda en los valores
-downlevel por defecto.
+### 7.1 Tabla implementada en v1
+
+Estos son los valores que publica `conv::limits_for_feature_level` en la
+integración y que el test de contrato verifica campo por campo:
+
+| Límite | v1 | Estado |
+| --- | --- | --- |
+| `max_texture_dimension_1d` | 0 | 1D no implementado; no se anuncia |
+| `max_texture_dimension_2d` | 16384 (11_0) / 8192 (10_1) | Implementado |
+| `max_texture_dimension_3d` | 0 | 3D no implementado; no se anuncia |
+| `max_texture_array_layers` | 2048 | Implementado |
+| `max_bind_groups` | 4 | Implementado |
+| `max_bind_groups_plus_vertex_buffers` | 24 | Conservador |
+| `max_bindings_per_bind_group` | 64 | Límite verificado; sustituye a 1000 |
+| `max_dynamic_uniform_buffers_per_pipeline_layout` | 8 | Implementado con `Context1` |
+| `max_dynamic_storage_buffers_per_pipeline_layout` | 0 | Storage no implementado |
+| `max_sampled_textures_per_shader_stage` | 16 | Implementado |
+| `max_samplers_per_shader_stage` | 16 | Implementado |
+| `max_storage_buffers_per_shader_stage` | 0 | Storage no implementado |
+| `max_storage_textures_per_shader_stage` | 0 | Storage no implementado |
+| `max_uniform_buffers_per_shader_stage` | 12 | Implementado |
+| `max_binding_array_elements_per_shader_stage` | 0 | Binding arrays no implementados |
+| `max_binding_array_acceleration_structure_elements_per_shader_stage` | 0 | No aplica |
+| `max_binding_array_sampler_elements_per_shader_stage` | 0 | No aplica |
+| `max_uniform_buffer_binding_size` | 16384 | Implementado |
+| `max_storage_buffer_binding_size` | 0 | Storage no implementado |
+| `max_vertex_buffers` | 8 | Implementado |
+| `max_buffer_size` | 268435456 | Conservador |
+| `max_vertex_attributes` | 16 | Implementado |
+| `max_vertex_buffer_array_stride` | 2048 | Implementado |
+| `max_inter_stage_shader_variables` | 15 | Conservador |
+| `min_uniform_buffer_offset_alignment` | 256 | Implementado |
+| `min_storage_buffer_offset_alignment` | 256 | Mantenido; storage no anunciado |
+| `max_color_attachments` | 4 | Implementado |
+| `max_color_attachment_bytes_per_sample` | 32 | Sin MSAA, suficiente |
+| `max_compute_workgroup_storage_size` | 0 | Compute no implementado |
+| `max_compute_invocations_per_workgroup` | 0 | Compute no implementado |
+| `max_compute_workgroup_size_x/y/z` | 0/0/0 | Compute no implementado |
+| `max_compute_workgroups_per_dimension` | 0 | Compute no implementado |
+| `max_immediate_size` | 0 | Push constants no implementados |
+| `max_buffers_and_acceleration_structures_per_shader_stage` | 12 | Recalculado para storage 0 |
+| Límites mesh/task/ray tracing/multiview | 0 | No se anuncian |
+| `Alignments` | sin cambios (`buffer_copy_offset = 1`, etc.) | **Pendiente**; follow-up de Puerta 1 |
+
+**Consecuencia operativa:** `wgpu-core` valida `required_limits` contra los
+límites del adaptador al crear el dispositivo. Con storage/compute en 0 y
+`max_bindings_per_bind_group = 64`, una petición con
+`Limits::downlevel_defaults()` o `Limits::default()` será rechazada. El perfil
+futuro `Dx11Legacy` debe pedir los límites del adaptador o un conjunto
+explícito bajo. Esto es honesto y deliberado; no se “arregla” re-anunciando
+storage.
+
+### 7.2 Tabla histórica del pin (pre-v1)
+
+Los valores del pin salían de `Limits::downlevel_defaults()` con los cambios
+de `conv::limits_for_feature_level`: dimensión 1D/2D 16384 en 11_0 y 8192 en
+10_1, dimensión 3D 2048 y arrays 2048. El resto quedaba en los valores
+downlevel por defecto. Se conserva como análisis histórico; la tabla
+normativa es §7.1.
 
 Estado: `OK` = soportado y conservador; `SOBRE` = anunciado sin
 implementación; `COND` = depende de una condición o no está probado.
@@ -346,7 +432,7 @@ que después no se puede bindear. Deben ser 0 hasta que la capacidad exista.
 
 ## 8. Lista explícita de lo que NO se anuncia
 
-El contrato v0 **no anuncia**:
+El contrato v1 **no anuncia**:
 
 - compute shaders, compute pipelines ni dispatch;
 - storage buffers, storage textures, UAVs, escritura de storage ni
@@ -395,9 +481,13 @@ Puerta 0, no una capacidad del backend.
 
 ## 9. Diseño del test de contrato (Puerta 0)
 
-El test todavía no existe. Debe vivir en el fork de wgpu, ejecutarse en
-Windows CI (WARP y hardware) y usar la API pública de `wgpu` cuando sea
-posible, además de HAL para los casos internos.
+El test está implementado en `wgpu-hal/tests/dx11_contract.rs` del fork de
+wgpu y se ejecuta en Windows CI con el workflow `DX11 Contract`. Usa la API
+HAL (`Instance`, `Adapter`, `Device`, `CommandEncoder`) porque la instantánea
+es exactamente el anuncio del backend, y crea una superficie Win32 oculta para
+las comprobaciones de superficie. Los ocho puntos siguientes son la
+especificación que el test implementa; el estado real de ejecución está en
+§9.1.
 
 1. **Instantánea del anuncio.** Leer `adapter.features()`,
    `adapter.downlevel_capabilities()`, `adapter.limits()`,
@@ -422,42 +512,93 @@ posible, además de HAL para los casos internos.
 8. **Cierre de Puerta 0.** El test verde, los sobre-anuncios retirados o
    implementados y este documento actualizado. Sin eso no se abre la Puerta 1.
 
+### 9.1 Resultado de ejecución
+
+| Ejecución | Commit | Resultado |
+| --- | --- | --- |
+| Pin, solo test P6 | `10115febd` (base `b85f3a16a`) | **Rojo esperado**: 146 violaciones (~73 por adaptador); `check` y `fmt` verdes. Run `41306698696` |
+| Candidato P6+P1 | `1deb02958` (merge de `10115febd` + `640c64917`) | **Verde**: `1 passed; 0 failed`; `check` y `fmt` verdes. Run `41308541042` |
+| Integración `dx11-stabilization` | `77da36e6c` | **Verde**: mismo test, sin cambios. Run `41308953949` |
+
+El run rojo enumera exactamente los sobre-anuncios del pin: BC, 13 flags
+extra de downlevel, 14 límites de storage/compute/1D/3D, `MULTISAMPLE_X4` en
+37 formatos, storage BGL aceptado, `immediate_size = 4` aceptado y cuatro
+`unimplemented!()`. El run verde demuestra que las correcciones de P1 hacen
+pasar el mismo test sin debilitarlo.
+
+Limitaciones de la evidencia: el runner hosted solo expone
+`Microsoft Basic Render Driver` (software, `0x1414:0x008c`, FL 11_0); no hay
+paridad con hardware. El flag impreso `software/WARP` es `false` por una
+clasificación conservadora de `DeviceType::Cpu`; el nombre del adaptador y la
+ausencia de hardware confirman que es software. `maximum_frame_latency` no se
+aplica en `configure`; `Alignments` queda fuera de alcance; los métodos de
+ray tracing del command encoder siguen siendo no-ops silenciosos en el pin y
+no se asertan porque los entry points de descriptor fallan primero.
+
 ## 10. Estado de las puertas
 
 | Puerta | Estado | Evidencia |
 | --- | --- | --- |
-| 0 — Congelación y contrato | Documentos creados; test y correcciones pendientes | Este documento, `dx11-agent-map.md`, `dx11-task-packets.md` |
-| 1 — Conformidad HAL | Parcial | `raw-dx11`, `raw-dx11-resources`, `raw-dx11-shader`, `raw-dx11-triangle`, `raw-dx11-window`; faltan 2 RT, arrays/cubemap, resize, fences reales, device loss y debug layer |
+| 0 — Congelación y contrato | **Cerrada en WARP**; hardware pendiente | Test `wgpu-hal/tests/dx11_contract.rs` verde en `41308541042`/`41308953949`; rojo del pin en `41306698696`; evidencia `docs/evidence/dx11-contract-gate0.md` |
+| 1 — Conformidad HAL | Parcial; avances P1 | `raw-dx11`, `raw-dx11-resources`, `raw-dx11-shader`, `raw-dx11-triangle`, `raw-dx11-window`, nuevo `raw-dx11-resize`; fence `D3D11_QUERY_EVENT` y readback verdes en `41309216229`; faltan 2 RT, arrays/cubemap, device loss controlado, debug layer, depth clipping y test dedicado de fence |
 | 2 — Menú Bevy/Cinnabar | No iniciada | Sin perfil `Dx11Legacy` verificado ni captura de menú |
 | 3 — Mundo local mínimo | No iniciada | Sin build ni prueba |
 | 4 — Mundo vanilla | No iniciada | Sin build ni prueba |
 | 5 — Gameplay completo | No iniciada | Sin build ni prueba |
-| 6 — Compute opcional | No iniciada | Fuera del contrato v0 |
+| 6 — Compute opcional | No iniciada | Fuera del contrato v1 |
 
 No se publica ninguna build de usuario hasta que la puerta correspondiente
 esté cerrada.
 
 ## 11. Riesgos y bloqueos
 
-- **BC falso**: cualquier asset BC falla al crear la textura. Es el bloqueo
-  más probable para el menú de Cinnabar.
-- **MSAA falso**: una ruta que pida 4x pasa la validación y falla en el HAL.
-- **Storage/compute falsos**: layouts aceptados que no se pueden bindear o
-  draws que leen datos vacíos.
-- **Immediates silenciosos**: un shader con push constants lee ceros sin error.
-- **Fences de CPU**: `Queue::submit` señaliza el fence en CPU y
-  `wait_for_idle` solo hace `Flush`; no hay espera real de GPU. La Puerta 1 no
-  puede cerrarse con esto.
-- **Sin debug layer ni device loss**: no se pueden detectar errores de driver
-  ni validar recuperación.
-- **Sin resize probado**: la recreación de swapchain existe, pero no hay test
-  de resize ni de recursos asociados.
+### Resueltos en v1
+
+- **BC falso**: `TEXTURE_COMPRESSION_BC` retirada; una textura BC falla con
+  error explícito, verificado en el test de contrato.
+- **MSAA falso**: `MULTISAMPLE_X4` retirada de todas las caps; MSAA x4 falla
+  en textura, render pass y pipeline.
+- **Storage/compute falsos**: límites a 0 y storage BGL rechazado en el HAL y
+  en el layout; no se acepta y descarta.
+- **Immediates silenciosos**: `max_immediate_size = 0` y todo layout con
+  `immediate_size > 0` se rechaza.
+- **Fences de CPU**: sustituidos por `ID3D11Query` `D3D11_QUERY_EVENT` con
+  espera real; `raw-dx11-resources` y `raw-dx11-triangle` verifican submit,
+  wait y readback en CI (`41309216229`).
+- **Sin resize probado**: `raw-dx11-resize` verifica 320x240 → 640x360 en CI.
+- **`unimplemented!()` alcanzable**: los stubs de compute, query set y ray
+  tracing devuelven `Err`; el test lo comprueba con `catch_unwind`.
+
+### Pendientes
+
+- **Hardware sin verificar**: la evidencia verde es solo WARP/software. La
+  paridad con la Intel HD 4400 sigue siendo una puerta abierta de Puerta 1.
+- **Device loss**: hay detección (`GetDeviceRemovedReason` → `Lost`) y
+  `present` devuelve error, pero no hay recuperación controlada ni test que
+  fuerce un reset.
+- **Debug layer D3D11**: no implementada; no hay validación de errores de
+  driver en WARP ni hardware.
+- **Fence serializa submits**: el mismo `ID3D11Query` no puede re-armarse
+  mientras su marcador está en vuelo; `submit` espera al marcador anterior.
+  Es correcto pero puede bloquear hasta 5 s. Diseñar un pool de queries es
+  follow-up de Puerta 1.
+- **`request_device` con defaults**: storage/compute en 0 y
+  `max_bindings_per_bind_group = 64` hacen que
+  `Limits::downlevel_defaults()`/`default()` sean rechazados. `Dx11Legacy`
+  debe pedir los límites del adaptador.
+- **Alignments**: `buffer_copy_offset`, `buffer_copy_pitch` y
+  `uniform_bounds_check_alignment` siguen en 1 sin prueba; follow-up.
+- **1D/3D reales y BC**: no implementados y no anunciados. Si los assets de
+  Cinnabar usan BC, hay que decidir entre implementar BC con readback o usar
+  assets sin comprimir antes de la Puerta 2.
+- **Ray tracing del command encoder**: métodos no-op silenciosos en el pin;
+  los entry points de descriptor fallan primero, así que no son alcanzables
+  desde una API válida, pero deben devolver error explícito en un follow-up.
+- **`maximum_frame_latency`**: se anuncia 1..=2 pero `configure` no lo aplica;
+  no debe tratarse como capacidad verificada.
 - **`BUILD-NOTES.md` desactualizado**: afirma que ningún fork de wgpu
   implementa DX11; el pin actual sí tiene un HAL DX11. Es documentación de un
   build GL temporal y no debe usarse como contrato.
-- **Assets BC**: si el resource pack usa BC y P2 no implementa BC, el menú de
-  Cinnabar no llega. Hay que decidir entre implementar BC o usar una ruta de
-  assets sin comprimir; no se anuncia BC mientras no exista.
 
 ## 12. Referencias
 
@@ -465,7 +606,10 @@ esté cerrada.
 - Mapa de agentes: [`docs/dx11-agent-map.md`](dx11-agent-map.md)
 - Paquetes de tareas: [`docs/dx11-task-packets.md`](dx11-task-packets.md)
 - Fuente del pin: `wgpu-hal/src/dx11/{adapter,conv,device,command,surface,queue,shader,types,instance,mod}.rs`
-- Ejemplos del fork: `wgpu-hal/examples/raw-dx11{,-resources,-shader,-triangle,-window}.rs`
-- Workflows del fork: `.github/workflows/dx11-{hal,resources,descriptors,pipeline,surface,core}-check.yml`
+- Test de contrato: `wgpu-hal/tests/dx11_contract.rs`
+- Evidencia: [`docs/evidence/dx11-contract-gate0.md`](https://github.com/AndresqDev/wgpu/blob/dx11-stabilization/docs/evidence/dx11-contract-gate0.md)
+- Ejemplos del fork: `wgpu-hal/examples/raw-dx11{,-resources,-shader,-triangle,-window,-resize}.rs`
+- Workflows del fork: `.github/workflows/dx11-{hal-resources,descriptors,pipeline,surface,core,hal-core}-check.yml` y `.github/workflows/dx11-contract.yml`
 - Límites de wgpu: `wgpu-types/src/limits.rs`
 - Capacidades de formato: `wgpu-hal/src/dx11/adapter.rs::texture_format_capabilities`
+- Integración: `AndresqDev/wgpu` `dx11-stabilization` @ `9bc4fc056`

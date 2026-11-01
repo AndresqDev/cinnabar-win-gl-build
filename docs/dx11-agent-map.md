@@ -100,55 +100,36 @@ No abren una cuarta capa. No mergean. No pushean.
 
 ## 3. Piloto de anidamiento: resultado real
 
-### Qué se comprobó
+El piloto de tres capas se ejecutó con la configuración de OpenCode que permite
+`subagent_depth: 3`.
 
-Esta sesión es **capa 1**, lanzada por la sesión principal (capa 0). Antes de
-crear documentos se comprobó el catálogo de herramientas de esta sesión:
+### Jerarquía observada
 
-- `search("subagent")` no devolvió ninguna herramienta de subagentes; solo
-  `tools.opencode.models`;
-- `search("agent")` devolvió solo `tools.opencode.models`;
-- `search("delegate")`, `search("child")`, `search("task")`,
-  `search("spawn")`, `search("launch")`, `search("parallel")` y
-  `search("worker")` no devolvieron herramientas de delegación;
-- los recursos MCP disponibles están vacíos;
-- el catálogo de herramientas de Code Mode solo expone OpenCode (modelos,
-  recursos MCP, mover/renombrar sesión, worktrees) y Supabase; las
-  herramientas genéricas de edición/lectura no incluyen delegación.
+| Capa | Sesión | Hijos lanzados | Resultado |
+| --- | --- | --- | --- |
+| 0 | Sesión principal | 1 capa 1 | OK |
+| 1 | Dirección de programa | 2 líderes de capa 2 | OK |
+| 2 | `lead-verification` (P6) | 2 implementadores | OK; ambos reportaron que **no** tienen `subagent` |
+| 2 | `lead-hal-core` (P1) | 2 implementadores | OK; ambos reportaron que **no** tienen `subagent` |
+| 3 | Implementadores | Ninguno | **Bloqueado**: sin herramienta de delegación; no se creó capa 4 |
 
-### Resultado
+### Evidencia de anidamiento
 
-| Comprobación | Resultado |
-| --- | --- |
-| ¿Esta sesión tiene `subagent`? | **No** |
-| Agentes de capa 2 lanzados | **0** |
-| Agentes de capa 3 lanzados | **0** |
-| ¿Capa 2 pudo intentar capa 3? | **No aplica: no hubo capa 2** |
-| Worktrees/ramas hijas creadas | **0** |
-| Ediciones de capa 2/3 fuera de `docs/` | **0** |
-| Builds, pushes o merges de capa 2/3 | **0** |
+- 2 líderes de capa 2 lanzados en paralelo.
+- 4 implementadores de capa 3 lanzados (2 por líder), cada uno con worktree y
+  rama propios.
+- Los 4 implementadores reportaron ausencia de `subagent`; no se simuló ningún
+  hijo ni se creó una cuarta capa.
+- Dos implementadores agotaron su límite de pasos antes de commitear; sus
+  líderes revisaron, corrigieron y commitearon el trabajo. Limitación
+  operativa, no de jerarquía.
+- Capas 2 y 3 no mergearon en `dx11-stabilization` ni pushearon a
+  `dx11-integration`. Los líderes sí pushearon sus ramas de feature
+  (`dx11-verification`, `dx11-hal-core`), como permite el encargo de
+  implementación. La capa 1 revisó y mergeó.
 
-No se simularon hijos. No se inventaron ramas, commits ni reportes. El bloqueo
-está en esta sesión de capa 1, no necesariamente en la sesión principal: la
-capa 0 puede tener una herramienta de delegación que esta sesión no recibió.
-
-### Consecuencia
-
-Se aplica la regla del plan: si un subagente no tiene herramienta de
-subagentes, su padre coordina en paralelo y no se simula el anidamiento. La
-validación de tres capas queda pendiente y debe repetirse en una sesión que sí
-tenga `subagent`/Task:
-
-1. capa 1 lanza un líder de capa 2 en modo lectura;
-2. capa 2 intenta lanzar un verificador de capa 3 solo para una comprobación
-   de API/lectura;
-3. capa 3 reporta si pudo ejecutar y qué limitaciones encontró;
-4. se registran los tres niveles, los worktrees y la ausencia de ediciones
-   fuera de `docs/`/worktree.
-
-Criterio de éxito del piloto real: tres niveles observados, ningún agente de
-capa 2/3 edita código, compila, pushea o mergea, y el reporte de capa 3 llega
-a capa 1.
+Criterio de éxito cumplido: tres niveles observados, capa 3 terminal, ningún
+merge de integración por capas 2/3, y reporte de capa 3 entregado a capa 1.
 
 ## 4. Activación y límite de tres hijos
 
@@ -161,12 +142,14 @@ registrado.
 
 ### Slots actuales
 
+Estado tras la primera entrega de Puerta 0/Puerta 1:
+
 | Padre | Hijos activos | Evidencia |
 | --- | --- | --- |
-| Capa 0 (principal) | 1 (esta sesión de capa 1) | Sesión actual |
-| Capa 1 (esta sesión) | 0 | Sin herramienta de delegación |
-| Capa 2 | 0 | No existen líderes lanzados |
-| Capa 3 | 0 | No existen implementadores lanzados |
+| Capa 0 (principal) | 0 | La sesión de capa 1 terminó su entrega |
+| Capa 1 | 0 | Los 2 líderes de capa 2 entregaron |
+| Capa 2 | 0 | `lead-verification` y `lead-hal-core` entregaron |
+| Capa 3 | 0 | 4 implementadores entregaron; sus worktrees pueden limpiarse |
 
 ### Orden de activación recomendado
 
@@ -365,12 +348,23 @@ No se introduce ninguna capa adicional. La jerarquía máxima sigue siendo
 
 ## 11. Próximo paso
 
-El primer líder de capa 2 que debe activarse es **Verificación**
-(`lead-verification`, rama `dx11-verification`), porque su primer entregable
-es el test de contrato de Puerta 0 y la retirada de los anuncios falsos. Sin
-ese test, cualquier implementación puede avanzar sobre una base que miente.
+**P6 — Verificación** y **P1 — HAL core** entregaron su primera fase:
 
-Inmediatamente después debe activarse **HAL core** (`lead-hal-core`, rama
-`dx11-hal-core`) para superficie, fences reales, resize, device loss y debug
-layer. Recursos, shaders, pipelines y Bevy/Cinnabar esperan sus handoffs y los
-slots disponibles.
+- P6: test de contrato `wgpu-hal/tests/dx11_contract.rs`, workflow
+  `DX11 Contract`, evidencia y run rojo/verde.
+- P1: correcciones de Puerta 0, resize, fence `D3D11_QUERY_EVENT`, readback y
+  detección de device loss.
+
+La rama `dx11-stabilization` de `AndresqDev/wgpu` contiene ambos paquetes y el
+contrato verde en WARP (`41308953949`). Siguiente orden:
+
+1. **P2 — Recursos**: buffers, texturas 2D/arrays/cubemaps, formatos, vistas,
+   samplers, copias y mapeo; decidir BC con readback o ruta sin comprimir.
+2. **P3 — Shaders/descriptores**: Naga HLSL, FXC, layouts y negativos.
+3. **P4 — Pipelines/comandos**: 2 RT, profundidad, arrays/cubemap, draws e
+   indirectos.
+4. **P1 follow-ups**: debug layer, recuperación de device loss, test dedicado
+   de fence sin serialización, alignments y paridad con hardware.
+
+Ninguno de estos paquetes se activa sin una nueva instrucción de capa 0. No se
+toca Cinnabar/Bevy ni se publican builds hasta cerrar la Puerta 1 con hardware.
