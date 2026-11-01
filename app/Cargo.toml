@@ -155,7 +155,7 @@ crash-monitor = { path = "../crates/crash-monitor" }
 wgpu = { workspace = true, features = ["webgpu"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-wgpu = { workspace = true, features = ["dx11", "gles"] }
+wgpu = { workspace = true, features = ["gles"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -168,8 +168,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CADisplayLink", "CAFrameRateRange", "CALayer", "CAMetalLayer", "objc2-metal"] }
 
 [target.'cfg(windows)'.dependencies]
-# WGL backend for the explicit OpenGL fallback (DX12 and Vulkan remain the defaults).
-wgpu = { workspace = true, features = ["gles"] }
+# Native DX11 backend plus the explicit OpenGL fallback (DX12 and Vulkan remain first).
+wgpu = { workspace = true, features = ["dx11", "gles"] }
 raw-window-handle = "0.6.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
