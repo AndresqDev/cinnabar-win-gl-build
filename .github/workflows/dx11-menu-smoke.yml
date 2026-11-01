@@ -1,0 +1,98 @@
+name: DX11 menu CI smoke
+
+# Runs the already-built Cinnabar DX11 artifact on a Windows runner with WARP.
+# This is not a hardware validation; it checks that the menu initializes and
+# exits through the acceptance path without a panic or device error.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Windows DX11 build run ID containing Cinnabar-Windows-DX11
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  smoke:
+    name: Run menu acceptance smoke
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - name: Download DX11 artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          gh run download "${{ inputs.run_id }}" `
+            --repo "${{ github.repository }}" `
+            --name Cinnabar-Windows-DX11 `
+            --dir dist
+
+      - name: Locate client
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist -Recurse -Filter cinnabar.exe |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "cinnabar.exe was not found in the artifact"
+          }
+          $exe.FullName
+
+      - name: Run hidden menu acceptance smoke
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist -Recurse -Filter cinnabar.exe |
+            Select-Object -First 1
+          $dir = $exe.Directory.FullName
+          $metrics = Join-Path $PWD "dx11-menu-metrics.json"
+          $stdout = Join-Path $PWD "dx11-menu.stdout.log"
+          $stderr = Join-Path $PWD "dx11-menu.stderr.log"
+
+          $env:WGPU_BACKEND = "dx11"
+          $env:CINNABAR_RENDER_DIAGNOSTICS = "1"
+          $env:WGPU_VALIDATION_INDIRECT_CALL = "0"
+
+          $p = Start-Process -FilePath $exe.FullName `
+            -WorkingDirectory $dir `
+            -ArgumentList "--acceptance-seconds", "10", "--metrics-out", $metrics `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr
+
+          if (-not $p.WaitForExit(90000)) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "--- stdout ---"
+            Get-Content $stdout -ErrorAction SilentlyContinue
+            Write-Host "--- stderr ---"
+            Get-Content $stderr -ErrorAction SilentlyContinue
+            throw "menus smoke timed out after 90 seconds"
+          }
+
+          Write-Host "--- stdout ---"
+          Get-Content $stdout -ErrorAction SilentlyContinue
+          Write-Host "--- stderr ---"
+          Get-Content $stderr -ErrorAction SilentlyContinue
+
+          if ($p.ExitCode -ne 0) {
+            throw "menu smoke exited with $($p.ExitCode)"
+          }
+          if (-not (Test-Path $metrics)) {
+            throw "menu smoke did not produce metrics"
+          }
+          Get-Content $metrics
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx11-menu-smoke
+          path: |
+            dx11-menu-metrics.json
+            dx11-menu.stdout.log
+            dx11-menu.stderr.log
+          if-no-files-found: warn
