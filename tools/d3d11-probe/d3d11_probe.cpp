@@ -46,10 +46,9 @@ constexpr D3D_FEATURE_LEVEL kFeatureLevels[] = {
     D3D_FEATURE_LEVEL_10_1,
 };
 
-// This triangle covers the center pixel of the 64x64 target. Its vertices are
-// clockwise in D3D screen space so the default back-face culling keeps it. The
-// pixel shader returns a constant red so the readback expectation is
-// unambiguous.
+// This screen-space triangle covers the whole 64x64 target, so the readback
+// does not depend on triangle winding or viewport coverage. The pixel shader
+// returns a constant red so the expectation is unambiguous.
 constexpr char kTriangleShader[] = R"hlsl(
 struct VertexOutput {
     float4 position : SV_Position;
@@ -57,11 +56,11 @@ struct VertexOutput {
 };
 
 VertexOutput VSMain(uint vertexId : SV_VertexID) {
-    float2 position = float2(0.8, -0.8);
+    float2 position = float2(-1.0, 3.0);
     if (vertexId == 0) {
-        position = float2(-0.8, -0.8);
+        position = float2(-1.0, -1.0);
     } else if (vertexId == 1) {
-        position = float2(0.0, 0.8);
+        position = float2(3.0, -1.0);
     }
 
     VertexOutput output;
@@ -634,6 +633,19 @@ bool RunOffscreenTriangle(
         return false;
     }
 
+    D3D11_RASTERIZER_DESC rasterizer_desc = {};
+    rasterizer_desc.FillMode = D3D11_FILL_SOLID;
+    rasterizer_desc.CullMode = D3D11_CULL_NONE;
+    rasterizer_desc.DepthClipEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> rasterizer;
+    result = device->CreateRasterizerState(
+        &rasterizer_desc, rasterizer.ReleaseAndGetAddressOf());
+    if (FAILED(result)) {
+        Log("[fail] offscreen: CreateRasterizerState failed: " +
+            FormatHr(result));
+        return false;
+    }
+
     const float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     context->ClearRenderTargetView(target_view.Get(), clear_color);
 
@@ -651,9 +663,11 @@ bool RunOffscreenTriangle(
 
     context->IASetInputLayout(nullptr);
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->RSSetState(rasterizer.Get());
     context->VSSetShader(vertex_shader.Get(), nullptr, 0);
     context->PSSetShader(pixel_shader.Get(), nullptr, 0);
     context->Draw(3, 0);
+    context->RSSetState(nullptr);
 
     // The render target cannot be a copy source while it is bound.
     context->OMSetRenderTargets(0, nullptr, nullptr);
