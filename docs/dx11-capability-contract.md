@@ -341,10 +341,10 @@ integración y que el test de contrato verifica campo por campo:
 | `max_dynamic_uniform_buffers_per_pipeline_layout` | 8 | Implementado con `Context1` |
 | `max_dynamic_storage_buffers_per_pipeline_layout` | 0 | Storage no implementado |
 | `max_sampled_textures_per_shader_stage` | 16 | Implementado |
-| `max_samplers_per_shader_stage` | 16 | Implementado |
+| `max_samplers_per_shader_stage` | 8 | Implementado |
 | `max_storage_buffers_per_shader_stage` | 0 | Storage no implementado |
 | `max_storage_textures_per_shader_stage` | 0 | Storage no implementado |
-| `max_uniform_buffers_per_shader_stage` | 12 | Implementado |
+| `max_uniform_buffers_per_shader_stage` | 7 | Implementado |
 | `max_binding_array_elements_per_shader_stage` | 0 | Binding arrays no implementados |
 | `max_binding_array_acceleration_structure_elements_per_shader_stage` | 0 | No aplica |
 | `max_binding_array_sampler_elements_per_shader_stage` | 0 | No aplica |
@@ -398,10 +398,10 @@ implementación; `COND` = depende de una condición o no está probado.
 | `max_dynamic_uniform_buffers_per_pipeline_layout` | 8 | `COND` | Requiere `ID3D11DeviceContext1` y offsets de 256 bytes |
 | `max_dynamic_storage_buffers_per_pipeline_layout` | 4 | `SOBRE` | El layout rechaza offsets dinámicos de storage |
 | `max_sampled_textures_per_shader_stage` | 16 | `OK` | Conservador frente a 128 |
-| `max_samplers_per_shader_stage` | 16 | `OK` | Coincide con el máximo de D3D11 (16) |
+| `max_samplers_per_shader_stage` | 8 | `OK` | Coincide con el máximo de D3D11 (16) |
 | `max_storage_buffers_per_shader_stage` | 4 | `SOBRE` | `set_bind_group` descarta storage buffers |
 | `max_storage_textures_per_shader_stage` | 4 | `SOBRE` | Las vistas UAV se rechazan |
-| `max_uniform_buffers_per_shader_stage` | 12 | `OK` | Conservador |
+| `max_uniform_buffers_per_shader_stage` | 7 | `OK` | Conservador |
 | `max_uniform_buffer_binding_size` | 16 KiB | `OK` | La implementación acepta hasta 64 KiB |
 | `max_storage_buffer_binding_size` | 128 MiB | `SOBRE` | No hay binding de storage |
 | `max_vertex_buffers` | 8 | `OK` | Conservador |
