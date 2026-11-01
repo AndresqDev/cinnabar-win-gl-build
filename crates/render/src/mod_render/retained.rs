@@ -63,7 +63,7 @@ pub(super) fn install(app: &mut App) {
     install_systems(app.sub_app_mut(RenderApp));
     // The clip mask reads world depth in a fragment shader; Naga cannot translate that
     // textureLoad to GLSL. Keep retained mod geometry, but omit clip masks on GL.
-    if !crate::gl_compat::enabled() {
+    if !crate::gl_compat::gl() {
         clips::install(app.sub_app_mut(RenderApp));
     }
     crate::chunk::blocks::install(app);

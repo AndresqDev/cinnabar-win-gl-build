@@ -307,7 +307,7 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
     });
     let mut uploaded_bytes = 0u64;
-    let gl_compat = crate::gl_compat::enabled();
+    let compatibility = crate::gl_compat::enabled();
     let mut textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut native_leaf_textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
@@ -325,9 +325,9 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         let (texture, view, uploaded) =
             upload_texture_page(render_device, render_queue, page, &plans, label);
         uploaded_bytes = uploaded_bytes.saturating_add(uploaded);
-        if gl_compat {
-            // GL cannot alias the sRGB allocation as raw UNORM. Upload a companion linear page
-            // so leaves keep their original gamma-space filtering.
+        if compatibility {
+            // The compatibility path has no alternate raw view of the sRGB allocation. Upload
+            // a companion linear page so leaves keep their original gamma-space filtering.
             let (leaf_texture, leaf_view, leaf_uploaded) =
                 upload_linear_texture_page(render_device, render_queue, page, &plans, label);
             uploaded_bytes = uploaded_bytes.saturating_add(leaf_uploaded);
@@ -445,11 +445,12 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
     let native_leaf_views: [TextureView; assets::MAX_TEXTURE_PAGES] = native_leaf_views
         .try_into()
         .expect("every physical page uploads a native leaf view");
-    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> = gl_compat.then(|| {
-        native_leaf_textures
-            .try_into()
-            .expect("every physical page uploads a native leaf texture")
-    });
+    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> =
+        compatibility.then(|| {
+            native_leaf_textures
+                .try_into()
+                .expect("every physical page uploads a native leaf texture")
+        });
     let sampler = render_device.create_sampler(&chunk_sampler_descriptor());
     let native_leaf_sampler =
         render_device.create_sampler(&crate::material_shader::native_leaf_sampler_descriptor());
@@ -567,11 +568,7 @@ pub(in crate::chunk) fn upload_texture_page(
     upload_plans: &[TextureMipUploadPlan],
     label: &'static str,
 ) -> (Texture, TextureView, u64) {
-    let view_formats = if crate::gl_compat::enabled() {
-        &[][..]
-    } else {
-        &[TextureFormat::Rgba8Unorm][..]
-    };
+    let view_formats = crate::gl_compat::view_formats(&[TextureFormat::Rgba8Unorm]);
     upload_texture_page_format(
         render_device,
         render_queue,

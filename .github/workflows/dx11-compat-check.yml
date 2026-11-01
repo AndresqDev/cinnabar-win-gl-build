@@ -1,0 +1,45 @@
+name: DX11 compatibility check
+
+# Fast compile check for the backend-neutral compatibility split. The actual
+# D3D11 backend is built separately; this workflow keeps the Cinnabar render
+# crate compiling while the HAL is still being developed.
+
+on:
+  push:
+    branches: [dx11-compat]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check render compatibility
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check render crate
+        shell: bash
+        run: cargo check --locked --profile play -p render
+
+      - name: Run compatibility unit tests
+        shell: bash
+        run: cargo test --locked --profile play -p render --lib gl_compat::tests

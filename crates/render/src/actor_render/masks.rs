@@ -109,7 +109,7 @@ impl Specializer<RenderPipeline> for MaskSpecializer {
         fragment.entry_point = Some("actor_mask_fragment".into());
         // Dissolve masks read their private depth texture in the fragment shader.
         // GL cannot translate that textureLoad, so retain ordinary mask coverage.
-        let dissolve = !crate::gl_compat::enabled()
+        let dissolve = !crate::gl_compat::gl()
             && key.actor.material & assets::EntityRenderMaterialState::KIND_MASK
                 == assets::EntityRenderMaterial::DissolveColor as u32;
         if dissolve {

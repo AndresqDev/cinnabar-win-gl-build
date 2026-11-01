@@ -63,7 +63,7 @@ pub struct EntityShadowRenderPlugin;
 impl Plugin for EntityShadowRenderPlugin {
     fn build(&self, app: &mut App) {
         // Shadow coverage reads the depth texture, unsupported by Naga's GLSL backend.
-        if crate::gl_compat::enabled() {
+        if crate::gl_compat::gl() {
             return;
         }
         crate::upload_staging::install(app);
@@ -80,7 +80,7 @@ impl Plugin for EntityShadowRenderPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        if crate::gl_compat::enabled() {
+        if crate::gl_compat::gl() {
             return;
         }
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {

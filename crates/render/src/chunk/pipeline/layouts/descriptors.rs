@@ -116,7 +116,7 @@ pub(in crate::chunk) fn build(compact: bool) -> [RenderPipelineDescriptor; 5] {
         transparent_descriptor,
         depth_liquid_descriptor,
     ];
-    if crate::gl_compat::enabled() {
+    if crate::gl_compat::gl() {
         // GLSL combines images and samplers. The GL path uses one sampler for the native
         // terrain pages and the shared block sampler for all opaque world draws.
         for descriptor in &mut descriptors {

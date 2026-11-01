@@ -148,7 +148,7 @@ pub(in crate::chunk) fn prepare_chunk_texture_assets(
             // A GL worker would build and upload the atlas while holding the context lock the
             // render thread needs. Keep the build on the render thread there instead of
             // detaching it; native backends keep the parallel worker.
-            && !crate::gl_compat::enabled()
+            && !crate::gl_compat::gl()
         {
             let assets = assets.clone();
             let device = render_device.clone();
@@ -239,7 +239,7 @@ pub(in crate::chunk) fn prepare_chunk_texture_assets(
         let _ = sender.send(result);
     };
     #[cfg(not(target_arch = "wasm32"))]
-    if crate::gl_compat::enabled() {
+    if crate::gl_compat::gl() {
         // See the bootstrap gate: GL must not upload from a detached worker.
         work();
     } else {

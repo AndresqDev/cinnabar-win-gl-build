@@ -181,7 +181,7 @@ struct GraphInstalled;
 /// Installs the clip stage once after the view schedule exists.
 pub(crate) fn install_graph(world: &mut World) {
     // The clip mask shader reads world depth, which Naga cannot translate to GLSL.
-    if crate::gl_compat::enabled() || world.contains_resource::<GraphInstalled>() {
+    if crate::gl_compat::gl() || world.contains_resource::<GraphInstalled>() {
         return;
     }
     let installed = world

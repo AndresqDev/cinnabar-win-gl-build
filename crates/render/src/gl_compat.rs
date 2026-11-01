@@ -1,12 +1,42 @@
-//! Compatibility policy for the OpenGL and ANGLE/GLES backends.
+//! Compatibility policy shared by the OpenGL and D3D11 backends.
 //!
 //! wgpu's GL/GLES backend cannot create the alternate sRGB/linear texture views Cinnabar uses.
-//! The GL fallback therefore renders the main scene in one sRGB attachment and flattens every
-//! other alternate view to its base format. This module is the single place that decides which
-//! compatibility adaptations are active.
+//! The compatibility path therefore renders the main scene in one sRGB attachment and flattens
+//! every other alternate view to its base format. D3D11 needs those shared adaptations too, but
+//! not the GL/ANGLE-specific context lock, shader-def and array-layout workarounds. This module
+//! keeps the two concepts apart: [`enabled`] selects the shared legacy policy, [`gl`] selects
+//! GL-only hacks, and [`dx11`] identifies the D3D11 path.
 
 use bevy::render::render_resource::TextureFormat;
 use std::sync::OnceLock;
+
+/// The renderer backend whose compatibility policy is installed for this process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompatBackend {
+    /// Native backend with alternate views and native pipeline compilation.
+    None,
+    /// OpenGL or ANGLE/GLES.
+    Gl,
+    /// Direct3D 11.
+    Dx11,
+}
+
+impl CompatBackend {
+    /// Whether the backend shares the legacy scene, view and gamma adaptations.
+    fn enabled(self) -> bool {
+        matches!(self, Self::Gl | Self::Dx11)
+    }
+
+    /// Whether the backend is GL/ANGLE.
+    fn gl(self) -> bool {
+        matches!(self, Self::Gl)
+    }
+
+    /// Whether the backend is D3D11.
+    fn dx11(self) -> bool {
+        matches!(self, Self::Dx11)
+    }
+}
 
 /// Opt-in switch for ANGLE's separate EGL compile context.
 pub const COMPILE_CONTEXT_ENV: &str = "CINNABAR_ANGLE_COMPILE_CONTEXT";
@@ -18,29 +48,71 @@ pub const COMPILE_CONTEXT_MARKER: &str = "angle-compile-context";
 /// Marker wgpu's GLES adapter appends when no shared compile context was created.
 pub const COMPILE_CONTEXT_UNAVAILABLE_MARKER: &str = "angle-compile-context-unavailable";
 
-static GL_COMPAT: OnceLock<bool> = OnceLock::new();
+static BACKEND: OnceLock<CompatBackend> = OnceLock::new();
 static COMPILE_CONTEXT: OnceLock<bool> = OnceLock::new();
 
-/// Records the backend chosen for this process. Called once before renderer resources are built.
+/// Records the compatibility backend for this process. Called once before renderer resources
+/// are built.
 ///
 /// Pipeline compilation stays synchronous because this entry point runs before an adapter
 /// exists and therefore cannot confirm that the separate compile context was created. Renderer
 /// startup uses [`install_with_compile_context`] once the adapter reports its marker.
+pub fn install_backend(backend: CompatBackend) {
+    install_policy(backend, false);
+}
+
+/// Compatibility wrapper for callers that only know whether GL is selected.
+///
+/// `true` selects [`CompatBackend::Gl`]; `false` selects [`CompatBackend::None`].
 pub fn install(gl: bool) {
-    install_with_compile_context(gl, false);
+    install_backend(from_gl(gl));
 }
 
 /// Records the backend and whether ANGLE may compile on its separate context.
 ///
 /// The caller reads [`COMPILE_CONTEXT_ENV`] once so every later decision sees the same mode.
 pub fn install_with_compile_context(gl: bool, compile_context: bool) {
-    let _ = GL_COMPAT.set(gl);
-    let _ = COMPILE_CONTEXT.set(gl && compile_context);
+    install_policy(from_gl(gl), compile_context);
 }
 
-/// Whether the active renderer is the native OpenGL compatibility path.
+fn from_gl(gl: bool) -> CompatBackend {
+    if gl {
+        CompatBackend::Gl
+    } else {
+        CompatBackend::None
+    }
+}
+
+/// The public entry points converge here, so the backend is the single source of truth and
+/// the compile context can only exist on GL.
+fn install_policy(backend: CompatBackend, compile_context: bool) {
+    let _ = BACKEND.set(backend);
+    let _ = COMPILE_CONTEXT.set(backend.gl() && compile_context);
+}
+
+fn backend() -> CompatBackend {
+    *BACKEND.get().unwrap_or(&CompatBackend::None)
+}
+
+/// Whether the active backend needs the shared legacy compatibility adaptations.
+///
+/// True for GL and D3D11. Those backends flatten alternate texture views and keep the encoded
+/// scene/gamma formats; backend-specific workarounds must use [`gl`] or [`dx11`] instead.
 pub fn enabled() -> bool {
-    *GL_COMPAT.get().unwrap_or(&false)
+    backend().enabled()
+}
+
+/// Whether the active backend is GL/ANGLE.
+///
+/// GL-only workarounds include the single-context scheduling, the `GL_COMPAT` shader def and
+/// the padded array layouts.
+pub fn gl() -> bool {
+    backend().gl()
+}
+
+/// Whether the active backend is D3D11.
+pub fn dx11() -> bool {
+    backend().dx11()
 }
 
 /// Whether GL runs pipeline compilation on ANGLE's separate EGL context.
@@ -98,7 +170,8 @@ pub fn compile_context_active(gl: bool, requested: bool, adapter_available: bool
 /// Whether the selected backend must compile pipelines synchronously.
 ///
 /// Only GL without its separate compile context needs serialization; other backends keep
-/// Bevy's worker compilation.
+/// Bevy's worker compilation. The `gl` argument is the GL selection, not [`enabled`], which is
+/// also true for D3D11.
 pub fn synchronous_pipeline_compilation(gl: bool) -> bool {
     synchronous_pipeline_compilation_for(gl, compile_context_enabled())
 }
@@ -107,34 +180,34 @@ fn synchronous_pipeline_compilation_for(gl: bool, compile_context: bool) -> bool
     gl && !compile_context
 }
 
-/// Flattens alternate texture views to the base format on GL.
+/// Flattens alternate texture views to the base format on compatibility backends.
 pub(crate) fn view_formats(formats: &'static [TextureFormat]) -> &'static [TextureFormat] {
-    view_formats_for(formats, enabled())
+    view_formats_for(formats, backend())
 }
 
-/// Flattens a requested view format to the base format on GL.
+/// Flattens a requested view format to the base format on compatibility backends.
 pub(crate) fn view_format(format: Option<TextureFormat>) -> Option<TextureFormat> {
-    view_format_for(format, enabled())
+    view_format_for(format, backend())
 }
 
 /// Storage format for the shared main-pass colour target.
 pub(crate) fn scene_storage_format(format: TextureFormat) -> TextureFormat {
-    scene_storage_format_for(format, enabled())
+    scene_storage_format_for(format, backend())
 }
 
 /// Colour-target format for pipelines that would normally write the encoded scene view.
 pub(crate) fn gamma_target_format(format: TextureFormat) -> TextureFormat {
-    gamma_target_format_for(format, enabled())
+    gamma_target_format_for(format, backend())
 }
 
 /// GL picks a texture target from the layer count, ignoring the requested view dimension.
 /// Array textures therefore need at least two layers and must not look like a cube map.
 pub fn array_storage_layers(square: bool, layers: u32) -> u32 {
-    array_storage_layers_for(square, layers, enabled())
+    array_storage_layers_for(square, layers, backend())
 }
 
-fn array_storage_layers_for(square: bool, layers: u32, gl: bool) -> u32 {
-    if !gl {
+fn array_storage_layers_for(square: bool, layers: u32, backend: CompatBackend) -> u32 {
+    if !backend.gl() {
         return layers;
     }
     let mut storage = layers.max(2);
@@ -146,10 +219,19 @@ fn array_storage_layers_for(square: bool, layers: u32, gl: bool) -> u32 {
 
 /// Pads layer-major upload data when the GL storage has extra blank layers.
 pub fn array_pixels<'a>(square: bool, layers: u32, pixels: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-    if !enabled() || layers == 0 {
+    array_pixels_for(square, layers, pixels, backend())
+}
+
+fn array_pixels_for<'a>(
+    square: bool,
+    layers: u32,
+    pixels: &'a [u8],
+    backend: CompatBackend,
+) -> std::borrow::Cow<'a, [u8]> {
+    if !backend.gl() || layers == 0 {
         return std::borrow::Cow::Borrowed(pixels);
     }
-    let storage = array_storage_layers(square, layers);
+    let storage = array_storage_layers_for(square, layers, backend);
     if storage == layers {
         return std::borrow::Cow::Borrowed(pixels);
     }
@@ -160,24 +242,27 @@ pub fn array_pixels<'a>(square: bool, layers: u32, pixels: &'a [u8]) -> std::bor
     std::borrow::Cow::Owned(padded)
 }
 
-fn view_formats_for(formats: &'static [TextureFormat], gl: bool) -> &'static [TextureFormat] {
-    if gl { &[] } else { formats }
+fn view_formats_for(
+    formats: &'static [TextureFormat],
+    backend: CompatBackend,
+) -> &'static [TextureFormat] {
+    if backend.enabled() { &[] } else { formats }
 }
 
-fn view_format_for(format: Option<TextureFormat>, gl: bool) -> Option<TextureFormat> {
-    if gl { None } else { format }
+fn view_format_for(format: Option<TextureFormat>, backend: CompatBackend) -> Option<TextureFormat> {
+    if backend.enabled() { None } else { format }
 }
 
-fn scene_storage_format_for(format: TextureFormat, gl: bool) -> TextureFormat {
-    if gl {
+fn scene_storage_format_for(format: TextureFormat, backend: CompatBackend) -> TextureFormat {
+    if backend.enabled() {
         format
     } else {
         format.remove_srgb_suffix()
     }
 }
 
-fn gamma_target_format_for(format: TextureFormat, gl: bool) -> TextureFormat {
-    if gl {
+fn gamma_target_format_for(format: TextureFormat, backend: CompatBackend) -> TextureFormat {
+    if backend.enabled() {
         format
     } else {
         format.remove_srgb_suffix()
@@ -192,19 +277,43 @@ mod tests {
     const ENCODED: TextureFormat = TextureFormat::Rgba8UnormSrgb;
 
     #[test]
-    fn gl_flattens_view_formats_and_formats() {
-        assert_eq!(view_formats_for(&[RAW], true), &[]);
-        assert_eq!(view_format_for(Some(RAW), true), None);
-        assert_eq!(scene_storage_format_for(ENCODED, true), ENCODED);
-        assert_eq!(gamma_target_format_for(ENCODED, true), ENCODED);
+    fn backends_separate_shared_compatibility_from_gl_only_policy() {
+        assert!(!CompatBackend::None.enabled());
+        assert!(!CompatBackend::None.gl());
+        assert!(!CompatBackend::None.dx11());
+
+        assert!(CompatBackend::Gl.enabled());
+        assert!(CompatBackend::Gl.gl());
+        assert!(!CompatBackend::Gl.dx11());
+
+        assert!(CompatBackend::Dx11.enabled());
+        assert!(!CompatBackend::Dx11.gl());
+        assert!(CompatBackend::Dx11.dx11());
     }
 
     #[test]
-    fn native_backends_keep_alternate_views() {
-        assert_eq!(view_formats_for(&[RAW], false), &[RAW]);
-        assert_eq!(view_format_for(Some(RAW), false), Some(RAW));
-        assert_eq!(scene_storage_format_for(ENCODED, false), RAW);
-        assert_eq!(gamma_target_format_for(ENCODED, false), RAW);
+    fn gl_bool_entry_points_map_to_compat_backends() {
+        assert_eq!(from_gl(true), CompatBackend::Gl);
+        assert_eq!(from_gl(false), CompatBackend::None);
+    }
+
+    #[test]
+    fn compatibility_backends_flatten_view_formats_and_formats() {
+        for backend in [CompatBackend::Gl, CompatBackend::Dx11] {
+            assert_eq!(view_formats_for(&[RAW], backend), &[]);
+            assert_eq!(view_format_for(Some(RAW), backend), None);
+            assert_eq!(scene_storage_format_for(ENCODED, backend), ENCODED);
+            assert_eq!(gamma_target_format_for(ENCODED, backend), ENCODED);
+        }
+    }
+
+    #[test]
+    fn native_backend_keeps_alternate_views_and_linear_storage() {
+        let backend = CompatBackend::None;
+        assert_eq!(view_formats_for(&[RAW], backend), &[RAW]);
+        assert_eq!(view_format_for(Some(RAW), backend), Some(RAW));
+        assert_eq!(scene_storage_format_for(ENCODED, backend), RAW);
+        assert_eq!(gamma_target_format_for(ENCODED, backend), RAW);
     }
 
     #[test]
@@ -253,12 +362,38 @@ mod tests {
 
     #[test]
     fn gl_array_storage_avoids_one_and_cube_layer_counts() {
-        assert_eq!(array_storage_layers_for(true, 1, true), 2);
-        assert_eq!(array_storage_layers_for(false, 1, true), 2);
-        assert_eq!(array_storage_layers_for(true, 6, true), 7);
-        assert_eq!(array_storage_layers_for(true, 12, true), 13);
-        assert_eq!(array_storage_layers_for(false, 6, true), 6);
-        assert_eq!(array_storage_layers_for(true, 5, true), 5);
-        assert_eq!(array_storage_layers_for(true, 6, false), 6);
+        assert_eq!(array_storage_layers_for(true, 1, CompatBackend::Gl), 2);
+        assert_eq!(array_storage_layers_for(false, 1, CompatBackend::Gl), 2);
+        assert_eq!(array_storage_layers_for(true, 6, CompatBackend::Gl), 7);
+        assert_eq!(array_storage_layers_for(true, 12, CompatBackend::Gl), 13);
+        assert_eq!(array_storage_layers_for(false, 6, CompatBackend::Gl), 6);
+        assert_eq!(array_storage_layers_for(true, 5, CompatBackend::Gl), 5);
+    }
+
+    #[test]
+    fn dx11_and_native_array_storage_keeps_the_requested_layers() {
+        for backend in [CompatBackend::None, CompatBackend::Dx11] {
+            assert_eq!(array_storage_layers_for(true, 1, backend), 1);
+            assert_eq!(array_storage_layers_for(false, 1, backend), 1);
+            assert_eq!(array_storage_layers_for(true, 6, backend), 6);
+            assert_eq!(array_storage_layers_for(false, 6, backend), 6);
+        }
+    }
+
+    #[test]
+    fn only_gl_pads_array_pixels() {
+        let pixels = [1, 2, 3, 4];
+        assert!(matches!(
+            array_pixels_for(true, 1, &pixels, CompatBackend::Dx11),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            array_pixels_for(true, 1, &pixels, CompatBackend::None),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            &*array_pixels_for(true, 1, &pixels, CompatBackend::Gl),
+            [1u8, 2, 3, 4, 0, 0, 0, 0].as_slice()
+        );
     }
 }

@@ -37,7 +37,7 @@ pub struct CameraMotionBlurPlugin;
 impl Plugin for CameraMotionBlurPlugin {
     fn build(&self, app: &mut App) {
         // The blur shader reads the depth texture, which Naga cannot translate to GLSL.
-        if crate::gl_compat::enabled() || app.get_sub_app(RenderApp).is_none() {
+        if crate::gl_compat::gl() || app.get_sub_app(RenderApp).is_none() {
             return;
         }
         load_internal_asset!(app, SHADER, "motion_blur.wgsl", |source, path| {
