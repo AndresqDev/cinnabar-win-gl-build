@@ -6,7 +6,7 @@
 | Fecha | 2026-11-01 |
 | Rama de integración | `dx11-stabilization` @ `dea0b3d` |
 | Backend de referencia | `AndresqDev/wgpu` @ `b85f3a16a9dfc6bbcc9da650755c23f92b6cf636` |
-| Compilación local | Prohibida en este piloto; las pruebas van a CI |
+| Compilación local | Prohibida en los agentes. HAL/pruebas DX11: VPS Linux con Podman y ejecución en Windows por SSH. Cinnabar: GitHub Actions. |
 | Publicación de builds | Prohibida hasta la puerta correspondiente |
 
 Este documento divide el trabajo de la
@@ -38,8 +38,10 @@ El detalle está en [dx11-agent-map.md](dx11-agent-map.md).
   prepara el merge con aprobación de capa 0.
 - Un paquete no toca archivos de otro dueño sin handoff y sin serialización
   de la capa 1.
-- Las pruebas se ejecutan en GitHub Actions (Windows), no en el checkout
-  local del agente. En este piloto no se ejecuta nada.
+- Las pruebas DX11/HAL se compilan en el VPS Linux con Podman y se ejecutan
+  en la PC Windows por SSH; las de Cinnabar se compilan en GitHub Actions.
+  Ningún agente compila Rust en su checkout local. Las pruebas de
+  ventana/swapchain requieren una sesión interactiva de Windows.
 - Cada entrega incluye commit, diff, pruebas, limitaciones, impacto en el
   contrato y base de rebase.
 - No se abre una cuarta capa. El trabajo extra se divide en otro paquete de

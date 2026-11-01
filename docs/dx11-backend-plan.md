@@ -12,7 +12,10 @@ La prioridad no es "hacer que arranque una build". Es construir un camino con ca
 2. Un camino alcanzable no usa `unimplemented!()` ni panics como fallback. Devuelve un error explícito y la app decide.
 3. Los parches de compatibilidad de Bevy se hacen en un único lugar, documentados y con una prueba que demuestre que los sistemas retirados no dejan recursos o schedules rotos.
 4. No se mezclan ejecutables, DLLs o perfiles de builds distintas.
-5. Toda compilación Rust se ejecuta en GitHub Actions.
+5. Cinnabar se compila en GitHub Actions. Las pruebas DX11/HAL pueden
+   compilarse en el VPS Linux con Podman y ejecutarse en la PC Windows por SSH;
+   no se lanza CI solo para validar un cambio de HAL si el runner local puede
+   hacerlo.
 6. La rama de referencia estable y las ramas de implementación están separadas.
 7. No se publica una build para el usuario hasta pasar la puerta correspondiente.
 
