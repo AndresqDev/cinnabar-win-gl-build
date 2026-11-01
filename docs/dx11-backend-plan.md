@@ -18,7 +18,20 @@ La prioridad no es "hacer que arranque una build". Es construir un camino con ca
 
 ## Modelo de agentes
 
-Se usa una jerarquía de como máximo tres capas:
+Se usa una jerarquía de como máximo tres capas. Cada capa puede delegar en la siguiente mediante subagentes; la capa 3 no crea una cuarta capa.
+
+### Reglas de anidamiento
+
+- El agente principal es la capa 0 y no implementa módulos completos: integra, revisa y decide.
+- Capa 1: un único responsable de programa. Puede lanzar líderes de capa 2.
+- Capa 2: líderes de dominio. Investigan primero y pueden lanzar implementadores de capa 3.
+- Capa 3: implementadores y verificadores. No lanzan más agentes; devuelven commit, pruebas y limitaciones a su líder.
+- Un padre no puede tener más de tres hijos activos a la vez. Cada hijo tiene una rama/worktree y una lista de archivos propios.
+- Ningún hijo hace push ni mergea en la rama de integración. El padre revisa; la capa 1 mergea.
+- Si un subagente no tiene disponible la herramienta de subagentes, se coordina en paralelo desde su padre; no se simula anidamiento.
+- Antes de usar anidamiento masivo se hace un piloto de una rama con un líder y un implementador. Si el piloto falla, se mantiene la jerarquía lógica con agentes paralelos y revisión del padre.
+
+### Jerarquía operativa
 
 ### Capa 1 — Dirección de programa
 
