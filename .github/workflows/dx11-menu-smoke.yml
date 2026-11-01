@@ -10,6 +10,9 @@ on:
         description: Windows DX11 build run ID containing Cinnabar-Windows-DX11
         required: true
         type: string
+  push:
+    branches:
+      - dx11-bevy-compat
 
 permissions:
   contents: read
@@ -28,7 +31,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          gh run download "${{ inputs.run_id }}" `
+          gh run download "${{ inputs.run_id || '41340842062' }}" `
             --repo "${{ github.repository }}" `
             --name Cinnabar-Windows-DX11 `
             --dir dist
