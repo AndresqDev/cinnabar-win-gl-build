@@ -646,7 +646,7 @@ bool RunOffscreenTriangle(
         return false;
     }
 
-    const float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    const float clear_color[4] = {0.0f, 0.25f, 0.0f, 1.0f};
     context->ClearRenderTargetView(target_view.Get(), clear_color);
 
     ID3D11RenderTargetView* views[] = {target_view.Get()};
@@ -668,10 +668,16 @@ bool RunOffscreenTriangle(
     context->PSSetShader(pixel_shader.Get(), nullptr, 0);
     context->Draw(3, 0);
     context->RSSetState(nullptr);
+    context->Flush();
 
     // The render target cannot be a copy source while it is bound.
     context->OMSetRenderTargets(0, nullptr, nullptr);
-    context->CopyResource(staging.Get(), target.Get());
+    const HRESULT copy_result = context->CopyResource(staging.Get(), target.Get());
+    Log("[info] copy: CopyResource hr=" + FormatHr(copy_result));
+    if (FAILED(copy_result)) {
+        Log("[fail] readback: CopyResource failed: " + FormatHr(copy_result));
+        return false;
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
@@ -689,36 +695,56 @@ bool RunOffscreenTriangle(
     }
 
     const std::size_t center = static_cast<std::size_t>(kProbeSize / 2);
-    const std::uint8_t* row =
-        static_cast<const std::uint8_t*>(mapped.pData) +
-        center * static_cast<std::size_t>(mapped.RowPitch);
-    const std::uint8_t* pixel = row + center * kBytesPerPixel;
-    const std::uint8_t blue = pixel[0];
-    const std::uint8_t green = pixel[1];
-    const std::uint8_t red = pixel[2];
-    const std::uint8_t alpha = pixel[3];
+    const auto* base = static_cast<const std::uint8_t*>(mapped.pData);
+    const auto* center_pixel =
+        base + center * static_cast<std::size_t>(mapped.RowPitch) +
+        center * kBytesPerPixel;
+    const auto* corner_pixel = base;
+    const std::uint8_t center_blue = center_pixel[0];
+    const std::uint8_t center_green = center_pixel[1];
+    const std::uint8_t center_red = center_pixel[2];
+    const std::uint8_t center_alpha = center_pixel[3];
+    const std::uint8_t corner_blue = corner_pixel[0];
+    const std::uint8_t corner_green = corner_pixel[1];
+    const std::uint8_t corner_red = corner_pixel[2];
+    const std::uint8_t corner_alpha = corner_pixel[3];
     context->Unmap(staging.Get(), 0);
 
     std::ostringstream pixel_log;
-    pixel_log << "[info] readback: pixel=(" << center << "," << center
-              << ") BGRA=(" << static_cast<unsigned int>(blue) << ","
-              << static_cast<unsigned int>(green) << ","
-              << static_cast<unsigned int>(red) << ","
-              << static_cast<unsigned int>(alpha) << ")";
+    pixel_log << "[info] readback: center BGRA=("
+              << static_cast<unsigned int>(center_blue) << ","
+              << static_cast<unsigned int>(center_green) << ","
+              << static_cast<unsigned int>(center_red) << ","
+              << static_cast<unsigned int>(center_alpha) << ")"
+              << " corner BGRA=("
+              << static_cast<unsigned int>(corner_blue) << ","
+              << static_cast<unsigned int>(corner_green) << ","
+              << static_cast<unsigned int>(corner_red) << ","
+              << static_cast<unsigned int>(corner_alpha) << ")";
     Log(pixel_log.str());
 
-    const bool is_red =
-        red >= 250 && green <= 5 && blue <= 5 && alpha >= 250;
-    if (!is_red) {
-        Log("[fail] readback: expected a red pixel, got BGRA=(" +
-            std::to_string(static_cast<unsigned int>(blue)) + "," +
-            std::to_string(static_cast<unsigned int>(green)) + "," +
-            std::to_string(static_cast<unsigned int>(red)) + "," +
-            std::to_string(static_cast<unsigned int>(alpha)) + ")");
+    const bool center_is_red =
+        center_red >= 250 && center_green <= 5 &&
+        center_blue <= 5 && center_alpha >= 250;
+    const bool corner_is_red =
+        corner_red >= 250 && corner_green <= 5 &&
+        corner_blue <= 5 && corner_alpha >= 250;
+    if (!center_is_red || !corner_is_red) {
+        Log("[fail] readback: expected red at center and corner, got center "
+            "BGRA=(" +
+            std::to_string(static_cast<unsigned int>(center_blue)) + "," +
+            std::to_string(static_cast<unsigned int>(center_green)) + "," +
+            std::to_string(static_cast<unsigned int>(center_red)) + "," +
+            std::to_string(static_cast<unsigned int>(center_alpha)) +
+            ") corner BGRA=(" +
+            std::to_string(static_cast<unsigned int>(corner_blue)) + "," +
+            std::to_string(static_cast<unsigned int>(corner_green)) + "," +
+            std::to_string(static_cast<unsigned int>(corner_red)) + "," +
+            std::to_string(static_cast<unsigned int>(corner_alpha)) + ")");
         return false;
     }
 
-    Log("[pass] readback: red pixel verified");
+    Log("[pass] readback: red pixel verified at center and corner");
     return true;
 }
 
