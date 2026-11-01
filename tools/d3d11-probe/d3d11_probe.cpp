@@ -672,12 +672,8 @@ bool RunOffscreenTriangle(
 
     // The render target cannot be a copy source while it is bound.
     context->OMSetRenderTargets(0, nullptr, nullptr);
-    const HRESULT copy_result = context->CopyResource(staging.Get(), target.Get());
-    Log("[info] copy: CopyResource hr=" + FormatHr(copy_result));
-    if (FAILED(copy_result)) {
-        Log("[fail] readback: CopyResource failed: " + FormatHr(copy_result));
-        return false;
-    }
+    context->CopyResource(staging.Get(), target.Get());
+    Log("[info] copy: CopyResource submitted");
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     result = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
