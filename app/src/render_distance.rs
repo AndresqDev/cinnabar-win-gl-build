@@ -70,6 +70,7 @@ pub(crate) fn apply_render_distance(
         closed_send_log.reset();
         return;
     }
+    let transferring = world.dimension_transfer.active();
     let Some(stream) = world.stream.as_mut() else {
         progressive.reset();
         closed_send_log.reset();
@@ -98,8 +99,10 @@ pub(crate) fn apply_render_distance(
             session,
             target_radius,
             // Startup priority is held until local terrain is presentable; the full render
-            // distance only ramps after that entry gate opens.
-            loading: stream.startup_priority(),
+            // distance only ramps after that entry gate opens. A dimension transfer instead
+            // needs the fixed nine-by-nine client-ticking area.
+            loading: stream.startup_priority() || transferring,
+            loading_radius: if transferring { 4 } else { 0 },
             now,
             frame_delta: time.delta(),
             work,

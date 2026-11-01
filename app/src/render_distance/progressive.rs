@@ -77,6 +77,9 @@ pub(super) struct ProgressInput {
     /// one-column/3x3 startup neighbourhood until the world is presentable; otherwise a high
     /// render-distance setting can flood the join before the first playable frame.
     pub(super) loading: bool,
+    /// Exact radius the loading screen needs. Zero means the ordinary one-column startup cap;
+    /// dimension transfers need the fixed client-ticking neighbourhood (radius four).
+    pub(super) loading_radius: i32,
     pub(super) now: Duration,
     pub(super) frame_delta: Duration,
     pub(super) work: WorkCounts,
@@ -202,10 +205,19 @@ impl ProgressiveLoad {
         let requested = input
             .target_radius
             .clamp(0, render_api::MAX_VIEW_RADIUS_CHUNKS);
-        // While the loading screen is still building the entry view, do not let the user's
-        // render distance grow the join. One safe neighbourhood is enough to become playable;
-        // the full target is restored after loading releases.
-        let target = if input.loading { requested.min(1) } else { requested };
+        // While loading, do not let the user's render distance grow the join. A dimension
+        // transfer needs the fixed radius-four client-ticking neighbourhood; an ordinary join
+        // needs only the one-column/3x3 neighbourhood. The full target is restored after release.
+        let loading_target = if input.loading_radius > 0 {
+            input.loading_radius.clamp(0, render_api::MAX_VIEW_RADIUS_CHUNKS)
+        } else {
+            requested.min(1)
+        };
+        let target = if input.loading {
+            loading_target
+        } else {
+            requested
+        };
         if self.session != Some(input.session) {
             self.begin(input.session, target, input.now);
             self.desired_radius = requested;
@@ -213,8 +225,8 @@ impl ProgressiveLoad {
             self.retarget(requested, input.now);
         }
         if input.loading {
-            if self.target_radius > 1 {
-                self.target_radius = 1;
+            if self.target_radius != loading_target {
+                self.target_radius = loading_target;
                 self.phase = Phase::Ramp;
                 self.wait_reason = None;
                 self.ring_wait_started_at = None;
@@ -541,6 +553,7 @@ mod tests {
             session,
             target_radius,
             loading: false,
+            loading_radius: 0,
             now: Duration::from_millis(now_millis),
             frame_delta: Duration::from_millis(frame_millis),
             work: WorkCounts::default(),
@@ -694,6 +707,21 @@ mod tests {
 
         let release = input(1, 8, 1_000, 16);
         assert_eq!(load.update(release, |_| true), Some(2));
+        assert_eq!(load.target_radius(), 8);
+    }
+
+    #[test]
+    fn a_dimension_transfer_keeps_the_fixed_radius_four_entry_area() {
+        let mut load = ProgressiveLoad::default();
+        let mut transfer = input(1, 8, 0, 16);
+        transfer.loading = true;
+        transfer.loading_radius = 4;
+        assert_eq!(load.update(transfer, |_| true), Some(0));
+        load.confirm_sent(0);
+        assert_eq!(load.target_radius(), 4);
+
+        let release = input(1, 8, 16, 16);
+        assert_eq!(load.update(release, |_| true), None);
         assert_eq!(load.target_radius(), 8);
     }
 
