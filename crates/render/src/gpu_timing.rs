@@ -422,7 +422,7 @@ impl GpuTimestamps {
         // wgpu's GL backend resolves query results with synchronous getQueryObject calls while
         // it processes the resolve copy. That stalls the context for the whole frame, so the GL
         // compatibility path opts out of GPU spans instead of paying for diagnostics.
-        if crate::gl_compat::enabled() {
+        if crate::gl_compat::gl() {
             info!("GPU pass timestamps disabled on the GL compatibility path");
             return None;
         }

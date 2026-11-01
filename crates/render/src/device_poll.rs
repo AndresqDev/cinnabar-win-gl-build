@@ -55,7 +55,7 @@ impl FramesInFlight {
     ) -> Result<wgpu::PollStatus, wgpu::PollError> {
         // AutoFinish fences complete at submission, so an empty submit marker buys nothing and
         // takes the GL context lock. Normal fences need it to learn the oldest unfinished frame.
-        let marker = if crate::gl_compat::enabled() && auto_finish() {
+        let marker = if crate::gl_compat::gl() && auto_finish() {
             None
         } else {
             Some(queue.submit([]))

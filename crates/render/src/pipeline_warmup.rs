@@ -329,7 +329,7 @@ fn install(app: &mut App) -> Option<&mut SubApp> {
             .add_systems(Render, publish_readiness.in_set(RenderSystems::Cleanup));
         info!(
             "pipeline warmup: critical owners gate loading; background owners {}",
-            if !crate::gl_compat::enabled() {
+            if !crate::gl_compat::gl() {
                 "queue during loading too, without gating readiness"
             } else if crate::gl_compat::compile_context_enabled() {
                 "are deferred until readiness on ANGLE's separate compile context"
@@ -382,7 +382,7 @@ fn collect_views(
     // admission too, so GL backgrounds cannot start on the menu's empty critical set.
     registry.background.observe(
         admission.is_admitted() && shared.is_ready(),
-        crate::gl_compat::enabled(),
+        crate::gl_compat::gl(),
     );
 }
 
@@ -415,7 +415,7 @@ fn warm_owner_views<T: PrewarmPipelines>(
 /// context. Queuing the world's critical variants there makes Bevy compile them synchronously
 /// on the render thread, which freezes the menu before the draw path can request what it needs.
 fn prewarm_allowed() -> bool {
-    !crate::gl_compat::enabled() || crate::gl_compat::compile_context_enabled()
+    !crate::gl_compat::gl() || crate::gl_compat::compile_context_enabled()
 }
 
 /// Specializes once per view configuration; later frames only compare keys.
@@ -479,7 +479,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
             *skipped = true;
         }
         // A missing owner must not strand every later background slot on GL.
-        if crate::gl_compat::enabled() {
+        if crate::gl_compat::gl() {
             let WarmupRegistry {
                 background_ids,
                 failed,
@@ -503,7 +503,7 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
         return;
     };
     let warmed = warmed.for_generation(registry.views_generation);
-    if !crate::gl_compat::enabled() {
+    if !crate::gl_compat::gl() {
         let WarmupRegistry {
             views,
             background_ids,

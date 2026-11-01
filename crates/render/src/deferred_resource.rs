@@ -46,7 +46,7 @@ fn poll<T: Resource>(world: &mut World) {
     if let Some(create) = pending.create.take() {
         // GL submissions execute while holding the single WGL context lock. A detached
         // constructor would therefore stall the render thread instead of overlapping it.
-        if crate::gl_compat::enabled() {
+        if crate::gl_compat::gl() {
             world.insert_resource(create());
             return;
         }
