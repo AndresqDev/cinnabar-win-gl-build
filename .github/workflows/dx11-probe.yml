@@ -1,0 +1,93 @@
+name: Direct3D 11 probe
+
+# Native D3D11 feasibility spike for the Windows renderer. Everything is built
+# and executed on a GitHub-hosted Windows runner; no Rust or wgpu is involved.
+
+on:
+  push:
+    branches: [dx11-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Electron 35 still ships a standalone d3dcompiler_47.dll. The probe links
+  # the SDK import library, so the runtime DLL is staged next to the exe.
+  ELECTRON_VERSION: "35.7.5"
+
+jobs:
+  probe:
+    name: Build and run native D3D11 probe
+    runs-on: windows-2025
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile probe
+        shell: cmd
+        run: |
+          if not exist dist\dx11-probe mkdir dist\dx11-probe
+          cl /nologo /std:c++17 /EHsc /W4 /O2 /MT /DNDEBUG /DUNICODE /D_UNICODE tools\d3d11-probe\d3d11_probe.cpp /Fe:dist\dx11-probe\dx11_probe.exe /Fo:dist\dx11-probe\ /link /SUBSYSTEM:CONSOLE
+          if errorlevel 1 exit /b 1
+          if exist dist\dx11-probe\d3d11_probe.obj del /q dist\dx11-probe\d3d11_probe.obj
+
+      - name: Stage d3dcompiler runtime from Electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path $PWD "dist/dx11-probe"
+          $zip = Join-Path $env:RUNNER_TEMP "electron-d3dcompiler.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "electron-d3dcompiler"
+          $url = "https://github.com/electron/electron/releases/download/v$env:ELECTRON_VERSION/electron-v$env:ELECTRON_VERSION-win32-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+
+          $dll = Join-Path $dir "d3dcompiler_47.dll"
+          if (-not (Test-Path $dll)) {
+            throw "Electron $env:ELECTRON_VERSION is missing d3dcompiler_47.dll"
+          }
+          Copy-Item $dll (Join-Path $out "d3dcompiler_47.dll") -Force
+          Copy-Item (Join-Path $dir "LICENSE") `
+            (Join-Path $out "Electron-LICENSE.txt") -Force
+          Copy-Item (Join-Path $dir "LICENSES.chromium.html") `
+            (Join-Path $out "THIRD_PARTY_LICENSES.chromium.html") -Force
+
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Run probe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $out = Join-Path $PWD "dist/dx11-probe"
+          $exe = Join-Path $out "dx11_probe.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Probe executable was not built"
+          }
+          if (-not (Test-Path (Join-Path $out "d3dcompiler_47.dll"))) {
+            throw "d3dcompiler_47.dll was not staged next to the probe"
+          }
+
+          $log = Join-Path $out "probe.log"
+          & $exe 2>&1 | Tee-Object -FilePath $log
+          $exitCode = $LASTEXITCODE
+          Write-Host "dx11_probe exit code: $exitCode"
+          if ($exitCode -ne 0) {
+            throw "dx11_probe failed with exit code $exitCode"
+          }
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dx11-probe
+          path: dist/dx11-probe
+          if-no-files-found: warn
+          retention-days: 7
