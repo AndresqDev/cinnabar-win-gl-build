@@ -28,12 +28,12 @@ macro_rules! backends {
         }
     };
 }
-backends!(Vulkan => ("vulkan", "Vulkan"), Dx12 => ("dx12", "DX12"), Gl => ("gl", "GL"), Metal => ("metal", "Metal"));
+backends!(Vulkan => ("vulkan", "Vulkan"), Dx12 => ("dx12", "DX12"), Dx11 => ("dx11", "DX11"), Gl => ("gl", "GL"), Metal => ("metal", "Metal"));
 
 impl Backend {
     /// Renderer-supported APIs shared by the Video choices and native candidate discovery.
     /// GL is appended last so saved choices for the other APIs keep their indices.
-    pub const AVAILABLE: &'static [Self] = &[Self::Vulkan, Self::Dx12, Self::Metal, Self::Gl];
+    pub const AVAILABLE: &'static [Self] = &[Self::Vulkan, Self::Dx12, Self::Metal, Self::Gl, Self::Dx11];
 
     /// Parses a single backend, rejecting lists and unsupported spellings.
     pub fn parse(value: &str) -> Option<Self> {
@@ -76,7 +76,7 @@ impl Platform {
     /// either. `WGPU_BACKEND=gl` still selects it explicitly.
     pub const fn backends(self) -> &'static [Backend] {
         match self {
-            Self::Windows => &[Backend::Dx12, Backend::Vulkan, Backend::Gl],
+            Self::Windows => &[Backend::Dx12, Backend::Vulkan, Backend::Dx11, Backend::Gl],
             Self::Linux | Self::Android => &[Backend::Vulkan],
             Self::Macos | Self::Ios => &[Backend::Metal],
         }

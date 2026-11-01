@@ -9,6 +9,7 @@ pub(super) fn flags(backend: Backend) -> wgpu::Backends {
     match backend {
         Backend::Vulkan => wgpu::Backends::VULKAN,
         Backend::Dx12 => wgpu::Backends::DX12,
+        Backend::Dx11 => wgpu::Backends::DX11,
         Backend::Gl => wgpu::Backends::GL,
         Backend::Metal => wgpu::Backends::METAL,
     }
@@ -306,10 +307,16 @@ impl From<&wgpu::Adapter> for AdapterCapabilities {
 
 /// The GL fallback flattens alternate views, so it does not require VIEW_FORMATS.
 fn required_downlevel_flags(adapter: &AdapterCapabilities) -> wgpu::DownlevelFlags {
-    let required = if adapter.backend == wgpu::Backend::Gl {
+    let required = if matches!(adapter.backend, wgpu::Backend::Gl | wgpu::Backend::Dx11) {
         REQUIRED_DOWNLEVEL_FLAGS - wgpu::DownlevelFlags::VIEW_FORMATS
     } else {
         REQUIRED_DOWNLEVEL_FLAGS
+    };
+    let required = if matches!(adapter.backend, wgpu::Backend::Gl | wgpu::Backend::Dx11) {
+        // The legacy compatibility path forces single-sample rendering.
+        required - wgpu::DownlevelFlags::MULTISAMPLED_SHADING
+    } else {
+        required
     };
     if adapter.angle {
         // The GL compatibility path forces single-sample rendering and skips

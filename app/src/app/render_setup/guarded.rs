@@ -207,7 +207,12 @@ pub(super) fn render_plugin(
         "{}",
         summary(environment.as_deref(), video, chosen, fallback.as_ref())
     ));
-    let gl_compat = chosen == Backend::Gl;
+    let compatibility = match chosen {
+        Backend::Gl => render::gl_compat::CompatBackend::Gl,
+        Backend::Dx11 => render::gl_compat::CompatBackend::Dx11,
+        _ => render::gl_compat::CompatBackend::None,
+    };
+    let gl_compat = compatibility == render::gl_compat::CompatBackend::Gl;
     // The environment only requests the separate context; wgpu's adapter marker proves it
     // exists. Activating asynchronous compilation without that proof would let workers share
     // the presentation context and stall the render thread. The env is read exactly as wgpu
@@ -218,7 +223,11 @@ pub(super) fn render_plugin(
         compile_context_requested,
         adapter_compile_context,
     );
-    render::gl_compat::install_with_compile_context(gl_compat, angle_compile_context);
+    if gl_compat {
+        render::gl_compat::install_with_compile_context(true, angle_compile_context);
+    } else {
+        render::gl_compat::install_backend(compatibility);
+    }
     if gl_compat {
         log(format_args!(
             "Renderer GL compatibility: single sRGB scene target, no HDR/Enhanced or shader packs"
@@ -244,6 +253,10 @@ pub(super) fn render_plugin(
             } else {
                 "unset"
             },
+        ));
+    } else if compatibility == render::gl_compat::CompatBackend::Dx11 {
+        log(format_args!(
+            "Renderer DX11 compatibility: single sRGB scene target, no HDR/Enhanced or shader packs"
         ));
     }
     install_guard(app, guard);
