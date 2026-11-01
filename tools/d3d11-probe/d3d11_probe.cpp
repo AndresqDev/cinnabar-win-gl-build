@@ -69,8 +69,8 @@ VertexOutput VSMain(uint vertexId : SV_VertexID) {
     return output;
 }
 
-float4 PSMain(float4 color : COLOR0) : SV_Target {
-    return color;
+float4 PSMain() : SV_Target {
+    return float4(1.0, 0.0, 0.0, 1.0);
 }
 )hlsl";
 
@@ -646,7 +646,7 @@ bool RunOffscreenTriangle(
         return false;
     }
 
-    const float clear_color[4] = {0.0f, 0.25f, 0.0f, 1.0f};
+    const float clear_color[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     context->ClearRenderTargetView(target_view.Get(), clear_color);
 
     ID3D11RenderTargetView* views[] = {target_view.Get()};
