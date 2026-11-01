@@ -1,0 +1,43 @@
+name: Cinnabar DX11 source check
+
+on:
+  push:
+    branches: [dx11-wgpu-source]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: Check Cinnabar against the DX11 wgpu fork
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Show toolchain versions
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check renderer and launcher
+        shell: bash
+        run: |
+          cargo check --locked --profile play --no-default-features -p render
+          cargo check --locked --profile play --no-default-features -p launcher
+
+      - name: Check client
+        shell: bash
+        run: cargo check --locked --profile play --no-default-features -p cinnabar
