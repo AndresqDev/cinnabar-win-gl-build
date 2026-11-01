@@ -81,9 +81,14 @@ jobs:
           $env:CINNABAR_RENDER_DIAGNOSTICS = "1"
           $env:WGPU_VALIDATION_INDIRECT_CALL = "0"
 
+          # An explicit asset path skips first-run preparation. The client
+          # falls back to diagnostic assets when the blob is absent, which is
+          # enough to exercise the menu render path on CI.
+          $assetPath = Join-Path $dir "resources\assets\dx11-smoke.mcbea"
+
           $p = Start-Process -FilePath $exe.FullName `
             -WorkingDirectory $dir `
-            -ArgumentList "--frame-cap", "30" `
+            -ArgumentList "--frame-cap", "30", "--assets", $assetPath `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr
