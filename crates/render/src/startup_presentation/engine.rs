@@ -12,10 +12,10 @@ use bevy::{
     render::{
         Render, RenderStartup, RenderSystems,
         render_resource::{
-            SparseBufferUpdateBindGroups, init_sparse_buffer_update_bind_groups,
+            DownlevelFlags, SparseBufferUpdateBindGroups, init_sparse_buffer_update_bind_groups,
             update_sparse_buffers,
         },
-        renderer::{RenderGraph, RenderGraphSystems},
+        renderer::{RenderAdapter, RenderGraph, RenderGraphSystems},
     },
 };
 use render_scene::startup_work::{WorldWorkAdmission, world_work_allowed};
@@ -52,17 +52,28 @@ pub(super) fn install(app: &mut SubApp) {
             init_sparse_buffer_update_bind_groups
                 .before(RenderSystems::PrepareViews)
                 .run_if(not(resource_exists::<SparseBufferUpdateBindGroups>))
-                .run_if(world_work_allowed),
+                .run_if(world_work_allowed)
+                .run_if(compute_supported),
         );
         if take(app, RenderGraph, update_sparse_buffers) {
             app.add_systems(
                 RenderGraph,
                 update_sparse_buffers
                     .in_set(RenderGraphSystems::Begin)
-                    .run_if(resource_exists::<SparseBufferUpdateBindGroups>),
+                    .run_if(resource_exists::<SparseBufferUpdateBindGroups>)
+                    .run_if(compute_supported),
             );
         }
     }
+}
+
+fn compute_supported(adapter: Option<Res<RenderAdapter>>) -> bool {
+    adapter.is_some_and(|adapter| {
+        adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(DownlevelFlags::COMPUTE_SHADERS)
+    })
 }
 
 /// Removes a typed initializer once, without relying on its diagnostic name or schedule layout.
