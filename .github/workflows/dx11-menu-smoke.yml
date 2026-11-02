@@ -83,7 +83,7 @@ jobs:
 
           $p = Start-Process -FilePath $exe.FullName `
             -WorkingDirectory $dir `
-            -ArgumentList "--frame-cap", "30" `
+            -ArgumentList "--vsync", "--frame-cap", "30" `
             -NoNewWindow -PassThru `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr
