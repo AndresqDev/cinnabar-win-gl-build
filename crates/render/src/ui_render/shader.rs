@@ -154,7 +154,11 @@ pub(super) fn from_wgsl_dx11(raw: &str, path: impl Into<String>) -> Shader {
 /// storage binding in `ui.wgsl`; without it the menu and regular UI can still
 /// render, while in-game model overlays are unavailable on this backend.
 fn source_dx11(raw: &str) -> String {
-    let mut text = source(raw);
+    // Remove the storage-backed model palette while the source still uses the
+    // symbolic style-bit names. `source` substitutes those names later; doing
+    // the removal after that would leave the branch pointing at a declaration
+    // that no longer exists.
+    let mut text = raw.to_owned();
 
     if let (Some(struct_start), Some(binding_start)) = (
         text.find("struct UiModelBone {"),
@@ -172,5 +176,5 @@ fn source_dx11(raw: &str) -> String {
         text.replace_range(branch_start..branch_end, "");
     }
 
-    text
+    source(&text)
 }
