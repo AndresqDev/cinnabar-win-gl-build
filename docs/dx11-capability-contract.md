@@ -115,12 +115,12 @@ fork de wgpu (run rojo `41306698696`, run verde `41308541042`, integración
 | Superficie Win32 (`HWND`) | `S` | `instance.rs::create_surface` | Solo Win32 |
 | Formatos de superficie BGRA8 UNORM/SRGB | `S` | `surface.rs::configure` | Solo esos dos |
 | Espacio de color sRGB | `S` | `surface.rs::configure` | `Auto`/`Srgb`; el resto se rechaza |
-| Present modes FIFO e Immediate | `S` | `surface.rs::configure` | Solo esos; `AutoVsync`/`AutoNoVsync` se mapean |
+| Present mode FIFO | `S` | `surface.rs::configure` | Solo FIFO; `AutoVsync`/`AutoNoVsync` se resuelven a FIFO |
 | Alpha de composición Opaque | `S` | `surface.rs::configure` | `Auto`/`Inherit`/`Opaque`; el resto se rechaza |
 | Swapchain flip-discard de 2 buffers | `S`/`W` | `surface.rs`; `raw-dx11-window` | Detalle de implementación; test pendiente |
 | Fallback discard de 1 buffer | `S` | `surface.rs::configure` | Fallback para drivers que no exponen el segundo buffer |
 | Resize por recreación de swapchain | `S` | `configure` suelta la swapchain anterior | Sí, pero sin test de resize todavía |
-| `desired_maximum_frame_latency` 1..=2 | `?` | `surface_capabilities` lo anuncia; `configure` no lo usa | No garantizarlo hasta medirlo |
+| `desired_maximum_frame_latency` 1..=2 | `S`/`W` | `surface.rs::configure` usa `IDXGISwapChain2::SetMaximumFrameLatency` | Aplicado cuando la interfaz está disponible; medición de hardware pendiente |
 | Debug layer D3D11 | `X` | `D3D11_CREATE_DEVICE_BGRA_SUPPORT` únicamente | No se anuncia |
 | Detección y recuperación de device loss | `X` | `Present` devuelve `Lost`; no hay recuperación ni motivo | No se anuncia |
 | Timestamp de presentación | `X` | `INVALID_TIMESTAMP` | No se anuncia |
@@ -318,8 +318,8 @@ solo garantiza las capacidades por formato cubiertas por esa matriz.
 ### 6.3 Superficie
 
 Solo `Bgra8Unorm` y `Bgra8UnormSrgb`, con `TextureUses::COLOR_TARGET`,
-`SurfaceColorSpaces::SRGB`, `CompositeAlphaMode::Opaque`, `Fifo` e `Immediate`.
-No se anuncian 10 bits, HDR, `Mailbox`, `ExclusiveFullScreen` ni
+`SurfaceColorSpaces::SRGB`, `CompositeAlphaMode::Opaque` y `Fifo`.
+`Immediate` no se anuncia hasta estabilizar presentación y backbuffer. No se anuncian 10 bits, HDR, `Mailbox`, `ExclusiveFullScreen` ni
 `PostMultiplied`/`PreMultiplied`.
 
 ## 7. Límites
@@ -594,8 +594,9 @@ esté cerrada.
 - **Ray tracing del command encoder**: métodos no-op silenciosos en el pin;
   los entry points de descriptor fallan primero, así que no son alcanzables
   desde una API válida, pero deben devolver error explícito en un follow-up.
-- **`maximum_frame_latency`**: se anuncia 1..=2 pero `configure` no lo aplica;
-  no debe tratarse como capacidad verificada.
+- **`maximum_frame_latency`**: se anuncia 1..=2 y `configure` lo aplica con
+  `IDXGISwapChain2::SetMaximumFrameLatency` cuando la interfaz está disponible;
+  falta la medición en hardware nativo.
 - **`BUILD-NOTES.md` desactualizado**: afirma que ningún fork de wgpu
   implementa DX11; el pin actual sí tiene un HAL DX11. Es documentación de un
   build GL temporal y no debe usarse como contrato.
