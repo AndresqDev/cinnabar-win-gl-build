@@ -22,29 +22,38 @@ use render_scene::startup_work::{WorldWorkAdmission, world_work_allowed};
 
 /// Moves world-only initializers after the menu; direct joins retain the normal engine schedule.
 pub(super) fn install(app: &mut SubApp) {
-    if app
+    let admitted = app
         .world()
         .get_resource::<WorldWorkAdmission>()
-        .is_none_or(WorldWorkAdmission::is_admitted)
-    {
+        .is_none_or(WorldWorkAdmission::is_admitted);
+    // Keep the stock startup schedule for backends that can create compute pipelines. A
+    // direct-admitted DX11 launch would otherwise bypass the compute guard below and create
+    // Bevy's sparse-buffer compute pipeline on a backend without COMPUTE_SHADERS.
+    let adapter_compute_supported = app
+        .world()
+        .get_resource::<RenderAdapter>()
+        .is_some_and(adapter_supports_compute);
+    if admitted && adapter_compute_supported {
         return;
     }
-    if take(app, RenderStartup, init_copy_deferred_lighting_id_pipeline) {
-        app.add_systems(
-            Render,
-            init_copy_deferred_lighting_id_pipeline
-                .before(RenderSystems::PrepareViews)
-                .run_if(not(resource_exists::<CopyDeferredLightingIdPipeline>))
-                .run_if(world_work_allowed),
-        );
-    }
-    if take(app, Render, create_downsample_depth_pipelines) {
-        app.add_systems(
-            Render,
-            create_downsample_depth_pipelines
-                .in_set(RenderSystems::Prepare)
-                .run_if(world_work_allowed),
-        );
+    if !admitted {
+        if take(app, RenderStartup, init_copy_deferred_lighting_id_pipeline) {
+            app.add_systems(
+                Render,
+                init_copy_deferred_lighting_id_pipeline
+                    .before(RenderSystems::PrepareViews)
+                    .run_if(not(resource_exists::<CopyDeferredLightingIdPipeline>))
+                    .run_if(world_work_allowed),
+            );
+        }
+        if take(app, Render, create_downsample_depth_pipelines) {
+            app.add_systems(
+                Render,
+                create_downsample_depth_pipelines
+                    .in_set(RenderSystems::Prepare)
+                    .run_if(world_work_allowed),
+            );
+        }
     }
     if take(app, RenderStartup, init_sparse_buffer_update_bind_groups) {
         app.add_systems(
@@ -55,25 +64,27 @@ pub(super) fn install(app: &mut SubApp) {
                 .run_if(world_work_allowed)
                 .run_if(compute_supported),
         );
-        if take(app, RenderGraph, update_sparse_buffers) {
-            app.add_systems(
-                RenderGraph,
-                update_sparse_buffers
-                    .in_set(RenderGraphSystems::Begin)
-                    .run_if(resource_exists::<SparseBufferUpdateBindGroups>)
-                    .run_if(compute_supported),
-            );
-        }
+    }
+    if take(app, RenderGraph, update_sparse_buffers) {
+        app.add_systems(
+            RenderGraph,
+            update_sparse_buffers
+                .in_set(RenderGraphSystems::Begin)
+                .run_if(resource_exists::<SparseBufferUpdateBindGroups>)
+                .run_if(compute_supported),
+        );
     }
 }
 
+fn adapter_supports_compute(adapter: &RenderAdapter) -> bool {
+    adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(DownlevelFlags::COMPUTE_SHADERS)
+}
+
 fn compute_supported(adapter: Option<Res<RenderAdapter>>) -> bool {
-    adapter.is_some_and(|adapter| {
-        adapter
-            .get_downlevel_capabilities()
-            .flags
-            .contains(DownlevelFlags::COMPUTE_SHADERS)
-    })
+    adapter.is_some_and(|adapter| adapter_supports_compute(&adapter))
 }
 
 /// Removes a typed initializer once, without relying on its diagnostic name or schedule layout.
