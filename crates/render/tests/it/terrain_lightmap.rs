@@ -267,7 +267,8 @@ const CUBE_VERTEX: &str = r#"
     var out: VertexOutput;
     out.clip_position = vec4(corner * 2.0 - vec2(1.0), 0.5, 1.0);
     out.uv = vec2(0.5);
-    out.native_light_ao = vec3(terrain_light_levels(witness_sample(corner)), 1.0);
+    out.native_light_levels = terrain_light_levels(witness_sample(corner));
+    out.native_ao_face = 1.0;
     return out;
 }
 "#;
