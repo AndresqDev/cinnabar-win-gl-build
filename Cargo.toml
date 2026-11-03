@@ -185,13 +185,13 @@ wit-parser = "=0.247.0"
 [patch.crates-io]
 # Keep Linux crash dumps when a thread's stack cannot be read.
 minidump-writer = { git = "https://github.com/cinnabar-mc/minidump-writer", rev = "389d34092fb3323f2253010615eda402212e534f" }
-naga = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
-wgpu = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
-wgpu-core = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
-wgpu-hal = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
-wgpu-types = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
+naga = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
+wgpu = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
+wgpu-core = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
+wgpu-hal = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
+wgpu-types = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
 
-wgpu-naga-bridge = { git = "https://github.com/AndresqDev/wgpu", rev = "5259baad48aeab41894a04a1792c3c79545bfd18" }
+wgpu-naga-bridge = { git = "https://github.com/AndresqDev/wgpu", rev = "a60f89821aa66b0cb746041fb0338954c41e947d" }
 
 # Keep every Bevy crate on the same renderer fork revision. CI checks the locked graph.
 bevy = { git = "https://github.com/cinnabar-mc/bevy", rev = "35c49889b6c04a1aa86744ecba09586c392c2a31" }
