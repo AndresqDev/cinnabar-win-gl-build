@@ -307,9 +307,11 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
     });
     let mut uploaded_bytes = 0u64;
-    // Only the GL compatibility path needs a separate linear companion page. DX11 can bind
-    // the sRGB page directly for the non-Enhanced sampling path, avoiding a second full
-    // terrain atlas upload and the stale-layer risk that came with the ANGLE workaround.
+    // GL cannot create an alternate linear view of the sRGB allocation, so it needs a
+    // separate linear companion page. DX11 can create a linear SRV over the same sRGB
+    // allocation; the native-leaf shader expects gamma-encoded texels and samples that
+    // view without the sRGB decode. Reusing the sRGB view here darkens terrain because
+    // the shader then treats linear values as gamma values.
     let linear_leaf_pages = crate::gl_compat::gl();
     let mut textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
@@ -343,8 +345,18 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
             native_leaf_textures.push(leaf_texture);
             native_leaf_views.push(leaf_view);
         } else {
-            // DX11 binds the sRGB page itself; the non-Enhanced shader samples this slot.
-            native_leaf_views.push(view.clone());
+            // The raw linear view exposes the stored gamma-encoded texels. D3D11 treats
+            // Rgba8Unorm as a resource-compatible SRV format and does not apply sRGB decode.
+            let leaf_view = texture
+                .create_view(&TextureViewDescriptor {
+                    label: Some(label),
+                    format: Some(TextureFormat::Rgba8Unorm),
+                    dimension: Some(TextureViewDimension::D2Array),
+                    mip_level_count: Some(mip_level_count),
+                    array_layer_count: Some(storage_layers),
+                    ..Default::default()
+                });
+            native_leaf_views.push(leaf_view);
         }
         textures.push(texture);
         views.push(view);
@@ -567,7 +579,13 @@ pub(in crate::chunk) fn upload_texture_page(
     upload_plans: &[TextureMipUploadPlan],
     label: &'static str,
 ) -> (Texture, TextureView, u64) {
-    let view_formats = crate::gl_compat::view_formats(&[TextureFormat::Rgba8Unorm]);
+    // GL cannot create the alternate linear view, so only the DX11/native path advertises
+    // it. The texture remains sRGB for the ordinary block-page bindings.
+    let view_formats: &[TextureFormat] = if crate::gl_compat::gl() {
+        &[]
+    } else {
+        &[TextureFormat::Rgba8Unorm]
+    };
     upload_texture_page_format(
         render_device,
         render_queue,
