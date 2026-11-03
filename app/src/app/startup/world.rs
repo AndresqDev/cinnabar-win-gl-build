@@ -68,7 +68,16 @@ impl WorldPreparation {
                 queue.apply(app.world_mut());
             }
             Self::Deferred(prepare) => {
-                app.insert_resource(WorldWorkAdmission::after_menu())
+                // The DX11 swapchain path can render the menu without delivering
+                // the retained-UI presentation callback that normally opens this
+                // gate. Keep the menu gate for other backends, but let DX11 load
+                // the world textures and chunk atlas so the stream can drain.
+                let admission = if render::gl_compat::dx11() {
+                    WorldWorkAdmission::default()
+                } else {
+                    WorldWorkAdmission::after_menu()
+                };
+                app.insert_resource(admission)
                     .insert_resource(PendingWorld {
                         input: Some(prepare),
                         worker: None,
