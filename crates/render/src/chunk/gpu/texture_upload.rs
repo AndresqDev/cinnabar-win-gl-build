@@ -352,8 +352,8 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
                     label: Some(label),
                     format: Some(TextureFormat::Rgba8Unorm),
                     dimension: Some(TextureViewDimension::D2Array),
-                    mip_level_count: Some(mip_level_count),
-                    array_layer_count: Some(storage_layers),
+                    mip_level_count: Some(texture.mip_level_count()),
+                    array_layer_count: Some(texture.array_layer_count()),
                     ..Default::default()
                 });
             native_leaf_views.push(leaf_view);
