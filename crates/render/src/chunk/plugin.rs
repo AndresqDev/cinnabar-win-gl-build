@@ -90,12 +90,11 @@ impl Plugin for ChunkRenderPlugin {
             );
         super::visibility::install(app);
 
-        // The DX11 legacy profile has no storage buffers yet. Keep the
-        // main-world publication resources above, but do not build the GPU
-        // chunk pipeline, storage layouts or culling passes.
-        if crate::gl_compat::dx11() {
-            return;
-        }
+        // DX11 has read-only storage buffers but no compute/UAV path. The
+        // compact terrain layout fits its four vertex storage slots; keep the
+        // compute-based GPU culling disabled in `finish`, but enable the
+        // ordinary near-terrain upload and direct draw path so stream
+        // acknowledgements can drain.
 
         if app.get_sub_app(RenderApp).is_none() {
             return;
