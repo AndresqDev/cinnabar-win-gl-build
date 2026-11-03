@@ -4,11 +4,17 @@ use crate::runtime::network::resource_packs::PackApplication;
 use client_runtime::network::NetworkHandle;
 use std::time::Duration;
 
-use client_ui::ui_runtime::presentation::startup::StartupReadinessInput;
+use client_ui::ui_runtime::presentation::startup::{
+    MIN_VISIBLE_TERRAIN_BEFORE_PRESENTATION, StartupReadinessInput,
+};
 use render_model::VisibilityDiagnosticSnapshot;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use client_session::PacketSendError;
+
+/// Avoids repeating the fallback diagnostic every frame while a world is loading.
+static DX11_LOADING_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
 
 pub(super) struct LoadingObservation {
     pub restart: bool,
@@ -78,6 +84,49 @@ pub(super) fn prepare_loading(
                 stream.local_terrain_ready()
             }
         });
+    // The Intel DX11 path can present real opaque terrain while the dense-view count is
+    // still small (the startup radius is one 3x3 neighbourhood). GPU-completed opaque
+    // submissions are stronger evidence than the fixed 1024-entity threshold, so let
+    // that evidence release the loading overlay. The normal path remains unchanged for
+    // larger views and for other backends.
+    let dx11_completed_terrain = render::gl_compat::dx11()
+        && observation
+            .snapshot
+            .gpu_completed_opaque
+            .is_some_and(|digest| digest.count != 0)
+        && observation
+            .snapshot
+            .submitted_opaque
+            .is_some_and(|digest| digest.count != 0);
+    let visible_rendered = if dx11_completed_terrain {
+        observation
+            .visible_rendered
+            .max(MIN_VISIBLE_TERRAIN_BEFORE_PRESENTATION)
+    } else {
+        observation.visible_rendered
+    };
+    if dx11_completed_terrain && !DX11_LOADING_FALLBACK_LOGGED.swap(true, Ordering::AcqRel) {
+        bevy::log::warn!(
+            gpu_completed = ?observation.snapshot.gpu_completed_opaque,
+            submitted = ?observation.snapshot.submitted_opaque,
+            visible_rendered = observation.visible_rendered,
+            local_terrain_ready,
+            stream_work_drained,
+            render_work_drained = observation.render_work_drained,
+            pipelines_ready = observation.pipelines_ready,
+            "DX11 loading fallback: completed opaque terrain will release the world"
+        );
+    }
+    let experience_holds = {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            runtime.session.experiences.holds_world_entry()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    };
     // Release movement and loading End after the dimension handshake, presented
     // footing and a fresh GPU frame, without waiting for distant ticking columns.
     let (released, milestone) = presentation.startup_mut().observe_with_milestone(
@@ -86,11 +135,7 @@ pub(super) fn prepare_loading(
             connected,
             diagnostics_frame_generation: diagnostics.frame_generation(),
             snapshot: observation.snapshot,
-            visible_rendered: if transferring {
-                0
-            } else {
-                observation.visible_rendered
-            },
+            visible_rendered: if transferring { 0 } else { visible_rendered },
             local_terrain_ready,
             // Dragonfly's initial spawn streams after initialization, so startup
             // can release an empty drained view. A transfer instead waits for
@@ -108,16 +153,8 @@ pub(super) fn prepare_loading(
                 ),
             stream_work_drained,
             render_work_drained: observation.render_work_drained,
-            world_entry_held: {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    runtime.session.experiences.holds_world_entry()
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    false
-                }
-            } || !observation.pipelines_ready
+            world_entry_held: experience_holds
+                || (!dx11_completed_terrain && !observation.pipelines_ready)
                 || client_world.dimension_transfer.waiting_for_switch()
                 || (client_world.dimension_transfer.active() && !local_terrain_ready),
         },
