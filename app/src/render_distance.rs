@@ -49,10 +49,12 @@ pub(crate) fn apply_render_distance(
     network: Option<Res<NetworkHandle<PackApplication>>>,
     time: Res<Time<Real>>,
     mut progressive: Local<ProgressiveLoad>,
+    mut sent: Local<Option<(u64, u8)>>,
     mut closed_send_log: Local<ClosedSendLog>,
 ) {
     let (Some(ui), Some(mut world), Some(network)) = (ui, world, network) else {
         progressive.reset();
+        *sent = None;
         closed_send_log.reset();
         return;
     };
@@ -67,19 +69,43 @@ pub(crate) fn apply_render_distance(
     // Menus have no stream; checking the session before `as_mut` keeps `ClientWorld` unchanged.
     if session == 0 {
         progressive.reset();
+        *sent = None;
         closed_send_log.reset();
         return;
     }
     let transferring = world.dimension_transfer.active();
     let Some(stream) = world.stream.as_mut() else {
         progressive.reset();
+        *sent = None;
         closed_send_log.reset();
         return;
     };
+    // DX11 uses the original join order: request the configured radius immediately and let
+    // the stream admit the publisher view without the progressive/ANGLE cap. The progressive
+    // ramp remains available for the GL/ANGLE path below.
+    if render::gl_compat::dx11() {
+        stream.set_progressive_view(false);
+        stream.set_startup_priority(false);
+        let radius = u8::try_from(target_radius).unwrap_or(u8::MAX);
+        if stream.requested_radius() != Some(i32::from(radius)) {
+            stream.set_requested_radius(i32::from(radius));
+        }
+        let revision = (session, radius);
+        if *sent != Some(revision) {
+            let packet = protocol::request_chunk_radius_packet(
+                radius,
+                render_api::MAX_VIEW_RADIUS_CHUNKS as u8,
+            );
+            if network.send_settings_packet(session, packet).is_ok() {
+                *sent = Some(revision);
+            }
+        }
+        return;
+    }
     // The server's publisher can describe a much larger view than this client requested. On the
     // GL compatibility path that would defeat the progressive ramp and recreate the join burst;
     // cap admission and retention to the requested radius while the ramp grows it.
-    if render::gl_compat::enabled() {
+    if render::gl_compat::gl() {
         stream.set_progressive_view(true);
     }
 

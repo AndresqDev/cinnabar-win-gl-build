@@ -112,7 +112,7 @@ pub(super) fn build(
     }
     // Establish the client cap before the bootstrap ingest can admit server publisher chunks.
     // The per-frame render-distance system reasserts it, but this closes the first-frame window.
-    if render::gl_compat::enabled() {
+    if render::gl_compat::gl() {
         stream.set_progressive_view(true);
     }
     if bridge::latency_trace::active().is_some() {
@@ -123,7 +123,9 @@ pub(super) fn build(
     stream.set_local_game_mode_follows_default(player_game_mode_uses_world_default);
     stream.set_display_interval(display_interval);
     stream.begin_frame_work();
-    stream.set_startup_priority(true);
+    if !render::gl_compat::dx11() {
+        stream.set_startup_priority(true);
+    }
     stream.set_startup_terrain_announced(terrain_before_spawn);
     stream.set_custom_block_ids(custom_block_ids.unwrap_or_default());
     stream.set_sequential_id_remap(id_remap);

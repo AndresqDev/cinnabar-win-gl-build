@@ -307,7 +307,10 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
     });
     let mut uploaded_bytes = 0u64;
-    let compatibility = crate::gl_compat::enabled();
+    // Only the GL compatibility path needs a separate linear companion page. DX11 can bind
+    // the sRGB page directly for the non-Enhanced sampling path, avoiding a second full
+    // terrain atlas upload and the stale-layer risk that came with the ANGLE workaround.
+    let linear_leaf_pages = crate::gl_compat::gl();
     let mut textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut native_leaf_textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
@@ -325,8 +328,8 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         let (texture, view, uploaded) =
             upload_texture_page(render_device, render_queue, page, &plans, label);
         uploaded_bytes = uploaded_bytes.saturating_add(uploaded);
-        if compatibility {
-            // The compatibility path has no alternate raw view of the sRGB allocation. Upload
+        if linear_leaf_pages {
+            // The GL compatibility path has no alternate raw view of the sRGB allocation. Upload
             // a companion linear page so leaves keep their original gamma-space filtering.
             let (leaf_texture, leaf_view, leaf_uploaded) =
                 upload_linear_texture_page(render_device, render_queue, page, &plans, label);
@@ -340,12 +343,8 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
             native_leaf_textures.push(leaf_texture);
             native_leaf_views.push(leaf_view);
         } else {
-            native_leaf_views.push(texture.create_view(&TextureViewDescriptor {
-                label: Some("world leaf atlas gamma view"),
-                format: Some(TextureFormat::Rgba8Unorm),
-                dimension: Some(TextureViewDimension::D2Array),
-                ..Default::default()
-            }));
+            // DX11 binds the sRGB page itself; the non-Enhanced shader samples this slot.
+            native_leaf_views.push(view.clone());
         }
         textures.push(texture);
         views.push(view);
@@ -445,8 +444,8 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
     let native_leaf_views: [TextureView; assets::MAX_TEXTURE_PAGES] = native_leaf_views
         .try_into()
         .expect("every physical page uploads a native leaf view");
-    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> =
-        compatibility.then(|| {
+    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> = linear_leaf_pages
+        .then(|| {
             native_leaf_textures
                 .try_into()
                 .expect("every physical page uploads a native leaf texture")
