@@ -307,12 +307,12 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
     });
     let mut uploaded_bytes = 0u64;
-    // GL cannot create an alternate linear view of the sRGB allocation, so it needs a
-    // separate linear companion page. DX11 can create a linear SRV over the same sRGB
-    // allocation; the native-leaf shader expects gamma-encoded texels and samples that
-    // view without the sRGB decode. Reusing the sRGB view here darkens terrain because
-    // the shader then treats linear values as gamma values.
-    let linear_leaf_pages = crate::gl_compat::gl();
+    // Both compatibility paths use a separate linear companion page. GL cannot create a
+    // linear view of an sRGB allocation; D3D11 can, but Intel's legacy driver has shown
+    // unreliable results for sRGB texture-array views. The native-leaf shader expects
+    // gamma-encoded texels, so it samples a real Rgba8Unorm allocation on both paths. The
+    // duplicate page is small compared with the terrain mesh data and avoids format
+    // reinterpretation on the target HD 4400.
     let mut textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut views = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     let mut native_leaf_textures = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
@@ -330,34 +330,19 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         let (texture, view, uploaded) =
             upload_texture_page(render_device, render_queue, page, &plans, label);
         uploaded_bytes = uploaded_bytes.saturating_add(uploaded);
-        if linear_leaf_pages {
-            // The GL compatibility path has no alternate raw view of the sRGB allocation. Upload
-            // a companion linear page so leaves keep their original gamma-space filtering.
-            let (leaf_texture, leaf_view, leaf_uploaded) =
-                upload_linear_texture_page(render_device, render_queue, page, &plans, label);
-            uploaded_bytes = uploaded_bytes.saturating_add(leaf_uploaded);
-            native_leaf_bytes = native_leaf_bytes.saturating_add(
-                page.mips
-                    .iter()
-                    .map(|mip| mip.rgba8.len() as u64)
-                    .sum::<u64>(),
-            );
-            native_leaf_textures.push(leaf_texture);
-            native_leaf_views.push(leaf_view);
-        } else {
-            // The raw linear view exposes the stored gamma-encoded texels. D3D11 treats
-            // Rgba8Unorm as a resource-compatible SRV format and does not apply sRGB decode.
-            let leaf_view = texture
-                .create_view(&TextureViewDescriptor {
-                    label: Some(label),
-                    format: Some(TextureFormat::Rgba8Unorm),
-                    dimension: Some(TextureViewDimension::D2Array),
-                    mip_level_count: Some(texture.mip_level_count()),
-                    array_layer_count: Some(texture.depth_or_array_layers()),
-                    ..Default::default()
-                });
-            native_leaf_views.push(leaf_view);
-        }
+        // Upload a real linear companion page so leaves keep their original gamma-space
+        // filtering and DX11 never has to reinterpret the sRGB allocation.
+        let (leaf_texture, leaf_view, leaf_uploaded) =
+            upload_linear_texture_page(render_device, render_queue, page, &plans, label);
+        uploaded_bytes = uploaded_bytes.saturating_add(leaf_uploaded);
+        native_leaf_bytes = native_leaf_bytes.saturating_add(
+            page.mips
+                .iter()
+                .map(|mip| mip.rgba8.len() as u64)
+                .sum::<u64>(),
+        );
+        native_leaf_textures.push(leaf_texture);
+        native_leaf_views.push(leaf_view);
         textures.push(texture);
         views.push(view);
     }
@@ -456,12 +441,11 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
     let native_leaf_views: [TextureView; assets::MAX_TEXTURE_PAGES] = native_leaf_views
         .try_into()
         .expect("every physical page uploads a native leaf view");
-    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> = linear_leaf_pages
-        .then(|| {
-            native_leaf_textures
-                .try_into()
-                .expect("every physical page uploads a native leaf texture")
-        });
+    let native_leaf_textures: Option<[Texture; assets::MAX_TEXTURE_PAGES]> = Some(
+        native_leaf_textures
+            .try_into()
+            .expect("every physical page uploads a native leaf texture"),
+    );
     let sampler = render_device.create_sampler(&chunk_sampler_descriptor());
     let native_leaf_sampler =
         render_device.create_sampler(&crate::material_shader::native_leaf_sampler_descriptor());
@@ -579,13 +563,9 @@ pub(in crate::chunk) fn upload_texture_page(
     upload_plans: &[TextureMipUploadPlan],
     label: &'static str,
 ) -> (Texture, TextureView, u64) {
-    // GL cannot create the alternate linear view, so only the DX11/native path advertises
-    // it. The texture remains sRGB for the ordinary block-page bindings.
-    let view_formats: &[TextureFormat] = if crate::gl_compat::gl() {
-        &[]
-    } else {
-        &[TextureFormat::Rgba8Unorm]
-    };
+    // This allocation is only sampled through the ordinary sRGB page view. Native leaves
+    // use a separate Rgba8Unorm allocation, so the texture never needs format
+    // reinterpretation on DX11.
     upload_texture_page_format(
         render_device,
         render_queue,
@@ -593,7 +573,7 @@ pub(in crate::chunk) fn upload_texture_page(
         upload_plans,
         label,
         TextureFormat::Rgba8UnormSrgb,
-        view_formats,
+        &[],
     )
 }
 
@@ -722,8 +702,8 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(stats.texture_bytes_including_mips, expected);
-        assert_eq!(stats.queue_upload_bytes, expected);
+        assert_eq!(stats.texture_bytes_including_mips, expected * 2);
+        assert_eq!(stats.queue_upload_bytes, expected * 2);
     }
 
     #[cfg(feature = "enhanced")]
