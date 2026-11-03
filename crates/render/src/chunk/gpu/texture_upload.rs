@@ -330,17 +330,12 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         let (texture, view, uploaded) =
             upload_texture_page(render_device, render_queue, page, &plans, label);
         uploaded_bytes = uploaded_bytes.saturating_add(uploaded);
-        // Upload a real linear companion page so leaves keep their original gamma-space
-        // filtering and DX11 never has to reinterpret the sRGB allocation.
+        // Upload a real 2D atlas for native leaves. This avoids texture-array layer
+        // indexing on Intel and keeps the gamma-space data explicit in one allocation.
         let (leaf_texture, leaf_view, leaf_uploaded) =
-            upload_linear_texture_page(render_device, render_queue, page, &plans, label);
+            upload_linear_texture_atlas(render_device, render_queue, page, label)?;
         uploaded_bytes = uploaded_bytes.saturating_add(leaf_uploaded);
-        native_leaf_bytes = native_leaf_bytes.saturating_add(
-            page.mips
-                .iter()
-                .map(|mip| mip.rgba8.len() as u64)
-                .sum::<u64>(),
-        );
+        native_leaf_bytes = native_leaf_bytes.saturating_add(leaf_uploaded);
         native_leaf_textures.push(leaf_texture);
         native_leaf_views.push(leaf_view);
         textures.push(texture);
@@ -577,6 +572,118 @@ pub(in crate::chunk) fn upload_texture_page(
     )
 }
 
+/// Native terrain uses one 2D atlas per logical page. Each layer is placed in a
+/// fixed grid cell with an edge-extended border, so the shader never needs an
+/// array-layer index and mip sampling cannot bleed between neighbouring tiles.
+const TERRAIN_ATLAS_GRID: u32 = 32;
+
+fn upload_linear_texture_atlas(
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    texture_array: &TextureArray,
+    label: &'static str,
+) -> Option<(Texture, TextureView, u64)> {
+    let max_layers = TERRAIN_ATLAS_GRID.saturating_mul(TERRAIN_ATLAS_GRID);
+    if texture_array.layers == 0 || texture_array.layers > max_layers {
+        bevy::log::error!(
+            layers = texture_array.layers,
+            max_layers,
+            label,
+            "native terrain atlas page exceeds the fixed 2D grid"
+        );
+        return None;
+    }
+    let mip_level_count = u32::try_from(texture_array.mips.len())
+        .expect("validated terrain pages have a bounded mip count");
+    let tile = texture_array.mips.first().map_or(0, |mip| mip.size);
+    let side = tile.saturating_mul(2).saturating_mul(TERRAIN_ATLAS_GRID);
+    let texture = render_device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d {
+            width: side,
+            height: side,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut uploaded = 0u64;
+    let grid = TERRAIN_ATLAS_GRID as usize;
+    for (level, mip) in texture_array.mips.iter().enumerate() {
+        let tile = mip.size as usize;
+        let cell = tile.saturating_mul(2);
+        let pad = tile / 2;
+        let side = cell.saturating_mul(grid);
+        let layer_bytes = tile.saturating_mul(tile).saturating_mul(4);
+        let Some(source_len) = layer_bytes.checked_mul(texture_array.layers as usize) else {
+            bevy::log::error!(label, "native terrain atlas layer size overflowed");
+            return None;
+        };
+        if tile == 0 || mip.rgba8.len() != source_len || side == 0 {
+            bevy::log::error!(
+                label,
+                level,
+                tile,
+                bytes = mip.rgba8.len(),
+                expected = source_len,
+                "native terrain atlas mip layout is invalid"
+            );
+            return None;
+        }
+        let mut pixels = vec![0u8; side.saturating_mul(side).saturating_mul(4)];
+        for layer in 0..texture_array.layers as usize {
+            let source = &mip.rgba8[layer * layer_bytes..(layer + 1) * layer_bytes];
+            let dest_x = (layer % grid) * cell;
+            let dest_y = (layer / grid) * cell;
+            for y in 0..cell {
+                let source_y = y.saturating_sub(pad).min(tile - 1);
+                for x in 0..cell {
+                    let source_x = x.saturating_sub(pad).min(tile - 1);
+                    let source_offset = (source_y * tile + source_x) * 4;
+                    let dest_offset = ((dest_y + y) * side + dest_x + x) * 4;
+                    pixels[dest_offset..dest_offset + 4]
+                        .copy_from_slice(&source[source_offset..source_offset + 4]);
+                }
+            }
+        }
+        render_queue.profiled_write_texture(
+            TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: u32::try_from(level).expect("bounded mip index"),
+                origin: Origin3d::default(),
+                aspect: Default::default(),
+            },
+            &pixels,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(
+                    u32::try_from(side)
+                        .expect("bounded atlas side")
+                        .saturating_mul(4),
+                ),
+                rows_per_image: Some(u32::try_from(side).expect("bounded atlas side")),
+            },
+            Extent3d {
+                width: u32::try_from(side).expect("bounded atlas side"),
+                height: u32::try_from(side).expect("bounded atlas side"),
+                depth_or_array_layers: 1,
+            },
+        );
+        uploaded = uploaded.saturating_add(pixels.len() as u64);
+    }
+    let view = texture.create_view(&TextureViewDescriptor {
+        label: Some(label),
+        dimension: Some(TextureViewDimension::D2),
+        mip_level_count: Some(mip_level_count),
+        ..Default::default()
+    });
+    Some((texture, view, uploaded))
+}
+
 /// Uploads raw linear pages for native leaves and authored normal/material channels.
 fn upload_linear_texture_page(
     render_device: &RenderDevice,
@@ -684,26 +791,37 @@ mod tests {
         let pages = carrier.assets().texture_pages();
         let fallback = diagnostic_texture_page(&pages[0].texture).unwrap();
         let bindings = plan_texture_page_bindings(pages.len()).unwrap();
-        let expected: u64 = bindings
-            .into_iter()
-            .map(|binding| {
-                let page = match binding {
-                    TexturePageBinding::Asset(index) => {
-                        carrier.assets().terrain_texture_page(index).unwrap()
-                    }
-                    TexturePageBinding::DiagnosticFallback => std::borrow::Cow::Owned(
-                        assets::rebuild_legacy_terrain_mips(&fallback).unwrap(),
-                    ),
-                };
-                page.mips
-                    .iter()
-                    .map(|mip| mip.rgba8.len() as u64)
-                    .sum::<u64>()
-            })
-            .sum();
+        let mut expected = 0u64;
+        let mut expected_atlas = 0u64;
+        for binding in bindings {
+            let page = match binding {
+                TexturePageBinding::Asset(index) => {
+                    carrier.assets().terrain_texture_page(index).unwrap()
+                }
+                TexturePageBinding::DiagnosticFallback => {
+                    std::borrow::Cow::Owned(assets::rebuild_legacy_terrain_mips(&fallback).unwrap())
+                }
+            };
+            expected += page
+                .mips
+                .iter()
+                .map(|mip| mip.rgba8.len() as u64)
+                .sum::<u64>();
+            expected_atlas += page
+                .mips
+                .iter()
+                .map(|mip| {
+                    let side = u64::from(mip.size) * 2 * u64::from(TERRAIN_ATLAS_GRID);
+                    side * side * 4
+                })
+                .sum::<u64>();
+        }
 
-        assert_eq!(stats.texture_bytes_including_mips, expected * 2);
-        assert_eq!(stats.queue_upload_bytes, expected * 2);
+        assert_eq!(
+            stats.texture_bytes_including_mips,
+            expected + expected_atlas
+        );
+        assert_eq!(stats.queue_upload_bytes, expected + expected_atlas);
     }
 
     #[cfg(feature = "enhanced")]

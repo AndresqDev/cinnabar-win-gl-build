@@ -134,3 +134,43 @@ fn texture_gradient_scale(reference: u32, page_dimensions: vec2<u32>) -> vec2<f3
     }
     return vec2<f32>(dimensions) / vec2<f32>(page_dimensions) * texture_uv_scale(reference);
 }
+
+// Native terrain pages are packed as a fixed 2D grid. Each cell has an edge-extended
+// border, so mip sampling never crosses a neighbouring tile and the shader needs no
+// array-layer index. Keep this grid in sync with TERRAIN_ATLAS_GRID in texture_upload.rs.
+const TERRAIN_ATLAS_GRID: u32 = 32u;
+
+fn terrain_atlas_cell_dimensions(page_dimensions: vec2<u32>) -> vec2<f32> {
+    let cell = f32(page_dimensions.x) / f32(TERRAIN_ATLAS_GRID);
+    return vec2<f32>(cell);
+}
+
+fn terrain_atlas_uv_local(reference: u32, local_uv: vec2<f32>, page_dimensions: vec2<u32>) -> vec2<f32> {
+    let layer = u32(texture_layer(reference));
+    let cell = terrain_atlas_cell_dimensions(page_dimensions).x;
+    let tile = cell * 0.5;
+    let padding = cell * 0.25;
+    let tile_origin = vec2<f32>(f32(layer % TERRAIN_ATLAS_GRID), f32(layer / TERRAIN_ATLAS_GRID)) * cell + vec2<f32>(padding);
+    return (tile_origin + local_uv * tile) / f32(page_dimensions.x);
+}
+
+fn terrain_atlas_uv(reference: u32, uv: vec2<f32>, page_dimensions: vec2<u32>) -> vec2<f32> {
+    return terrain_atlas_uv_local(reference, uv * texture_uv_scale(reference), page_dimensions);
+}
+
+fn terrain_atlas_gradient_scale(reference: u32, page_dimensions: vec2<u32>) -> f32 {
+    let cell = terrain_atlas_cell_dimensions(page_dimensions).x;
+    return cell * 0.5 / f32(page_dimensions.x) * texture_uv_scale(reference);
+}
+
+fn sample_terrain(page: texture_2d<f32>, image_sampler: sampler, reference: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+    let dimensions = textureDimensions(page, 0);
+    let scale = terrain_atlas_gradient_scale(reference, dimensions);
+    return textureSampleGrad(page, image_sampler, terrain_atlas_uv(reference, uv, dimensions), dx * scale, dy * scale);
+}
+
+fn sample_terrain_cube(page: texture_2d<f32>, image_sampler: sampler, reference: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
+    let dimensions = textureDimensions(page, 0);
+    let scale = terrain_atlas_gradient_scale(reference, dimensions);
+    return textureSampleGrad(page, image_sampler, terrain_atlas_uv_local(reference, texture_cube_uv(reference, uv), dimensions), dx * scale, dy * scale);
+}
