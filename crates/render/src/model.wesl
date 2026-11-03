@@ -24,23 +24,20 @@ struct VertexOutput {
     @builtin(position) @invariant clip_position: vec4<f32>,
     // Partially covered MSAA pixels must sample inside the authored quad.
     @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
-    @location(1) @interpolate(flat) current_texture: u32,
+    // Current and next animation frames share one interpolator. D3D11 feature level 11
+    // exposes only 15 inter-stage variables, including FrontFacing.
+    @location(1) @interpolate(flat) textures: vec2<u32>,
     @location(2) normal: vec3<f32>,
     @location(3) @interpolate(flat) material_flags: u32,
     @location(4) @interpolate(flat) local_position: vec3<f32>,
     @location(5) @interpolate(flat) biome_record: u32,
-    @location(6) @interpolate(flat) next_texture: u32,
     @location(7) @interpolate(flat) frame_blend: f32,
     @location(8) @interpolate(flat) visibility: vec2<u32>,
     @location(9) lighting: vec3<f32>,
     @if(ENHANCED)
-    @location(11) sky_light: f32,
-    @if(ENHANCED)
-    @location(14) ambient_occlusion: f32,
+    @location(11) sky_ao: vec2<f32>,
     @if(!ENHANCED)
-    @location(11) native_light_levels: vec2<f32>,
-    @if(!ENHANCED)
-    @location(14) native_ao_face: f32,
+    @location(11) native_light_ao: vec3<f32>,
     @location(10) @interpolate(flat) world_origin: vec3<f32>,
     @location(12) world_position: vec3<f32>,
     @if(ENHANCED)
@@ -60,25 +57,20 @@ fn invisible_vertex() -> VertexOutput {
     var invisible: VertexOutput;
     invisible.clip_position = vec4(2.0, 2.0, 2.0, 1.0);
     invisible.uv = vec2(0.0);
-    invisible.current_texture = 0u;
+    invisible.textures = vec2(0u);
     invisible.normal = vec3(0.0);
     invisible.material_flags = 0u;
     invisible.local_position = vec3(0.0);
     invisible.biome_record = 0u;
-    invisible.next_texture = 0u;
     invisible.frame_blend = 0.0;
     invisible.visibility.x = 0u;
     invisible.lighting = vec3(0.0);
     @if(ENHANCED)
-    invisible.sky_light = 0.0;
-    @if(ENHANCED)
-    invisible.ambient_occlusion = 0.0;
+    invisible.sky_ao = vec2(0.0);
     @if(ENHANCED)
     invisible.surface_class = 0u;
     @if(!ENHANCED)
-    invisible.native_light_levels = vec2(0.0);
-    @if(!ENHANCED)
-    invisible.native_ao_face = 0.0;
+    invisible.native_light_ao = vec3(0.0);
     @if(!ENHANCED)
     invisible.tint_gamma = vec3(1.0);
     invisible.visibility.y = 0u;
@@ -410,12 +402,11 @@ fn model_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     @if(ENHANCED_SHADOW)
     out.clip_position = caster_clip(world, material_id, clamp(template_position.y, 0.0, 1.0));
     out.uv = model_corner_uv(quad, material, corner);
-    out.current_texture = frame.current;
+    out.textures = vec2(frame.current, frame.next);
     out.normal = model_quad_normal(quad);
     out.material_flags = material.flags;
     out.local_position = block_position;
     out.biome_record = u32(quad.chunk_origin.w);
-    out.next_texture = frame.next;
     out.frame_blend = frame.blend;
     out.visibility.x = MODEL_VISIBLE
         | select(0u, MODEL_BOUNDED_TILE, is_bamboo)
@@ -428,13 +419,9 @@ fn model_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     let terrain_shade = select(ao * dimming, pad_shade, is_lily_pad);
     out.lighting = light_colour(light_sample) * terrain_shade;
     @if(ENHANCED)
-    out.sky_light = sky_illumination(light_sample);
-    @if(ENHANCED)
-    out.ambient_occlusion = ao;
+    out.sky_ao = vec2(sky_illumination(light_sample), ao);
     @if(!ENHANCED)
-    out.native_light_levels = terrain_light_levels(light_sample);
-    @if(!ENHANCED)
-    out.native_ao_face = terrain_shade;
+    out.native_light_ao = vec3(terrain_light_levels(light_sample), terrain_shade);
     out.visibility.y = select(0u, 1u, (quad_flags & 8u) != 0u);
     out.world_position = world;
     out.world_origin = vec3<f32>(quad.chunk_origin.xyz);
@@ -722,7 +709,7 @@ fn apply_distance_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32>
 fn ordinary_world_model_gamma_colour(@if(!ENHANCED)
 in: VertexOutput, @if(!ENHANCED)
 sampled_gamma: vec4<f32>) -> vec4<f32> {
-    let lit_gamma = ((sampled_gamma.rgb * in.tint_gamma) * in.native_ao_face) * terrain_light_colour(in.native_light_levels);
+    let lit_gamma = ((sampled_gamma.rgb * in.tint_gamma) * in.native_light_ao.z) * terrain_light_colour(in.native_light_ao.xy);
     let fog_gamma = tint_to_gamma(vec4(atmosphere.fog_color_start.rgb, 1.0)).rgb;
     return vec4(mix(lit_gamma, fog_gamma, distance_fog_amount(in.world_position)), sampled_gamma.a);
 }
@@ -744,18 +731,18 @@ fn fragment(
     let dx = dpdx(in.uv);
     let dy = dpdy(in.uv);
     // Both views already hold the working colour space, so frames blend before the alpha test.
-    var sampled = sample_model_ref(in, in.current_texture, dx, dy);
+    var sampled = sample_model_ref(in, in.textures.x, dx, dy);
     if (in.frame_blend > 0.0) {
-        sampled = mix(sampled, sample_model_ref(in, in.next_texture, dx, dy), in.frame_blend);
+        sampled = mix(sampled, sample_model_ref(in, in.textures.y, dx, dy), in.frame_blend);
     }
     let alpha_cutout = (in.material_flags & MATERIAL_ALPHA_CUTOUT_FLAG) != 0u;
     @if(!ALPHA_TO_COVERAGE)
     if (alpha_cutout && sampled.a < MODEL_ALPHA_THRESHOLD) { discard; }
     @if(ALPHA_TO_COVERAGE)
     if (alpha_cutout) {
-        var cutout = model_cutout(in, in.current_texture, dx, dy, sampled);
+        var cutout = model_cutout(in, in.textures.x, dx, dy, sampled);
         if (in.frame_blend > 0.0) {
-            cutout = cutout_mix(cutout, model_cutout(in, in.next_texture, dx, dy, sampled), in.frame_blend);
+            cutout = cutout_mix(cutout, model_cutout(in, in.textures.y, dx, dy, sampled), in.frame_blend);
         }
         if (sampled.a < MODEL_ALPHA_THRESHOLD && cutout.coverage > 0.0) { sampled = cutout.colour; }
         sampled.a = cutout.coverage;
@@ -772,8 +759,8 @@ fn fragment(
         in.world_position,
         in.clip_position.xy,
         in.lighting,
-        in.sky_light,
-        in.ambient_occlusion,
+        in.sky_ao.x,
+        in.sky_ao.y,
         in.surface_class,
     );
     @if(!OPAQUE_OVERDRAW && ENHANCED)
@@ -797,9 +784,9 @@ fn fragment_blend(
 fn shade_blend(in: VertexOutput, front_facing: bool, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     if (in.visibility.x == 0u) { discard; }
     if (!front_facing && in.visibility.y == 0u) { discard; }
-    var sampled = sample_model_ref(in, in.current_texture, dx, dy);
+    var sampled = sample_model_ref(in, in.textures.x, dx, dy);
     if (in.frame_blend > 0.0) {
-        sampled = mix(sampled, sample_model_ref(in, in.next_texture, dx, dy), in.frame_blend);
+        sampled = mix(sampled, sample_model_ref(in, in.textures.y, dx, dy), in.frame_blend);
     }
     if ((in.material_flags & MATERIAL_CAULDRON_WATER_FLAG) != 0u) {
         @if(ENHANCED)
@@ -818,8 +805,8 @@ fn shade_blend(in: VertexOutput, front_facing: bool, dx: vec2<f32>, dy: vec2<f32
         in.world_position,
         in.clip_position.xy,
         in.lighting,
-        in.sky_light,
-        in.ambient_occlusion,
+        in.sky_ao.x,
+        in.sky_ao.y,
         in.surface_class,
     );
     @if(ENHANCED)
@@ -837,9 +824,9 @@ fn fragment_shadow(@if(ENHANCED_SHADOW)
 in: VertexOutput) {
     let dx = dpdx(in.uv);
     let dy = dpdy(in.uv);
-    var sampled = sample_model_ref(in, in.current_texture, dx, dy);
+    var sampled = sample_model_ref(in, in.textures.x, dx, dy);
     if (in.frame_blend > 0.0) {
-        sampled = mix(sampled, sample_model_ref(in, in.next_texture, dx, dy), in.frame_blend);
+        sampled = mix(sampled, sample_model_ref(in, in.textures.y, dx, dy), in.frame_blend);
     }
     if (in.visibility.x == 0u || ((in.material_flags & MATERIAL_ALPHA_CUTOUT_FLAG) != 0u && sampled.a < MODEL_ALPHA_THRESHOLD)) { discard; }
 }

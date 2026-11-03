@@ -82,8 +82,7 @@ fn terrain_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     let model = model_vertex(vertex_index, instance_index);
     out.clip_position = model.clip_position;
     out.routing.x = 0u;
-    out.textures.x = model.current_texture;
-    out.textures.y = model.next_texture;
+    out.textures = model.textures;
     out.frame_face.x = model.frame_blend;
     out.routing.y = model.visibility.y;
     out.world_position = model.world_position;
@@ -92,13 +91,11 @@ fn terrain_vertex(vertex_index: u32, instance_index: u32) -> VertexOutput {
     @if(ENHANCED)
     out.normal = model.normal;
     @if(ENHANCED)
-    out.sky_ao.x = model.sky_light;
-    @if(ENHANCED)
-    out.sky_ao.y = model.ambient_occlusion;
+    out.sky_ao = model.sky_ao;
     @if(ENHANCED)
     out.surface_class = model.surface_class;
     @if(!ENHANCED)
-    out.native_light_ao = vec3(model.native_light_levels, model.native_ao_face);
+    out.native_light_ao = model.native_light_ao;
     @if(!ENHANCED)
     out.tint_gamma = model.tint_gamma;
     out.model_uv = model.uv;
@@ -151,28 +148,23 @@ fn model_output(in: VertexOutput) -> ModelOutput {
     var model: ModelOutput;
     model.clip_position = in.clip_position;
     model.uv = in.model_uv;
-    model.current_texture = in.textures.x;
+    model.textures = in.textures;
     @if(ENHANCED)
     model.normal = in.normal;
     model.material_flags = in.material_biome.x;
     @if(ENHANCED)
     model.local_position = in.local_position;
     model.biome_record = in.material_biome.y;
-    model.next_texture = in.textures.y;
     model.frame_blend = in.frame_face.x;
     model.visibility.x = in.routing.w;
     @if(ENHANCED)
     model.lighting = in.lighting;
     @if(ENHANCED)
-    model.sky_light = in.sky_ao.x;
-    @if(ENHANCED)
-    model.ambient_occlusion = in.sky_ao.y;
+    model.sky_ao = in.sky_ao;
     @if(ENHANCED)
     model.surface_class = in.surface_class;
     @if(!ENHANCED)
-    model.native_light_levels = in.native_light_ao.xy;
-    @if(!ENHANCED)
-    model.native_ao_face = in.native_light_ao.z;
+    model.native_light_ao = in.native_light_ao;
     @if(!ENHANCED)
     model.tint_gamma = in.tint_gamma;
     @if(ENHANCED)

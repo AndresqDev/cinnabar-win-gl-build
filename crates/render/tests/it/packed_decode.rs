@@ -532,7 +532,7 @@ const MODEL_WITNESS: &str = r#"
 const MODEL_SHADE_WITNESS: &str = r#"
 @compute @workgroup_size(1) fn witness(@builtin(global_invocation_id) id: vec3<u32>) {
     let vertex = model_vertex(0u, id.x);
-    results[id.x] = vec4(bitcast<u32>(vertex.native_ao_face), vertex.visibility.x & MODEL_VISIBLE, 0u, 0u);
+    results[id.x] = vec4(bitcast<u32>(vertex.native_light_ao.z), vertex.visibility.x & MODEL_VISIBLE, 0u, 0u);
 }
 "#;
 

@@ -113,8 +113,7 @@ fn render_edge(gpu: &Gpu, held: bool, samples: u32, back: bool) -> Vec<u8> {
     out.material_flags = MODEL_FIXTURE_CUTOUT;
     out.visibility.x = 1u;
     out.visibility.y = 1u;
-    out.native_light_levels = vec2(15.0);
-    out.native_ao_face = 1.0;
+    out.native_light_ao = vec3(15.0, 15.0, 1.0);
     out.tint_gamma = vec3(1.0);
     return out;
 }"#
