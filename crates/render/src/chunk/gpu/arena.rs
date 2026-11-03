@@ -288,10 +288,20 @@ pub(in crate::chunk) fn create_indirect_buffer(
     render_device: &RenderDevice,
     command_capacity: usize,
 ) -> Buffer {
+    // The compact DX11 path uses direct draws and the adapter does not
+    // advertise INDIRECT_EXECUTION, so creating an INDIRECT buffer is a
+    // validation error even when no indirect draw is ever submitted. Keep
+    // the same storage for indirect bookkeeping, but only request the
+    // indirect usage where the backend can execute it.
+    let usage = if crate::gl_compat::dx11() {
+        BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST
+    } else {
+        BufferUsages::INDIRECT | BufferUsages::COPY_DST
+    };
     render_device.create_buffer(&BufferDescriptor {
         label: Some("packed chunk indirect commands"),
         size: command_capacity as u64 * INDEXED_INDIRECT_BYTES,
-        usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+        usage,
         mapped_at_creation: false,
     })
 }
