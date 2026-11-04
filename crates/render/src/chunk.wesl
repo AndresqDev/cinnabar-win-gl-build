@@ -1,6 +1,6 @@
 import render::chunk_records::{chunk_origins, animations, animation_frames, clock};
 
-import render::material::{MaterialGpu, materials, positional_material_id, texture_layer, texture_page, texture_cube_uv, texture_gradient_scale, sample_terrain_cube, terrain_atlas_uv_local, terrain_atlas_gradient_scale, material_face_is_visible, material_uses_native_leaf_colour, material_uses_overlay_mask, material_uv_flags, material_leaf_shade};
+import render::material::{MaterialGpu, materials, positional_material_id, texture_layer, texture_page, texture_cube_uv, texture_uv_scale, texture_gradient_scale, sample_terrain_cube, terrain_atlas_uv_local, terrain_atlas_gradient_scale, material_face_is_visible, material_uses_native_leaf_colour, material_uses_overlay_mask, material_uv_flags, material_leaf_shade};
 @if(ENHANCED_SHADOW)
 import render::enhanced::caster::caster_clip;
 import bevy_render::view::View;
@@ -655,7 +655,7 @@ fn fragment(in: VertexOutput, @builtin(front_facing) front: bool) -> @location(0
 fn cutout_terrain_cube(page: texture_2d<f32>, texture_ref: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, sampled: vec4<f32>) -> CutoutSample {
     let dimensions = textureDimensions(page, 0);
     let scale = terrain_atlas_gradient_scale(texture_ref, dimensions);
-    return cutout_alpha_2d(page, terrain_atlas_uv_local(texture_ref, texture_cube_uv(texture_ref, uv), dimensions), dx * scale, dy * scale, sampled, TERRAIN_ALPHA_THRESHOLD);
+    return cutout_alpha_2d(page, terrain_atlas_uv_local(texture_ref, fract(uv) * texture_uv_scale(texture_ref), dimensions), dx * scale, dy * scale, sampled, TERRAIN_ALPHA_THRESHOLD);
 }
 
 // Coverage shares color addressing and gradients for the source image on the selected page.

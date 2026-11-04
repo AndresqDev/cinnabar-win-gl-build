@@ -71,6 +71,12 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
     let identity = assets.binding_identity();
     let pages = assets.assets().texture_pages();
     let Some(page_bindings) = plan_texture_page_bindings(pages.len()) else {
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Error,
+            "page binding plan rejected page_count={} max_pages={}",
+            pages.len(),
+            assets::MAX_TEXTURE_PAGES
+        );
         bevy::log::error!(
             page_count = pages.len(),
             "chunk assets require one or {} texture pages",
@@ -94,7 +100,25 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
             .expect("binding plan includes a diagnostic fallback"),
     });
     let device_limits = render_device.limits();
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "atlas build start pages={} sampled_bindings={} samplers={} limits={:?}",
+        pages.len(),
+        crate::material_shader::CHUNK_SAMPLED_TEXTURE_BINDINGS,
+        crate::material_shader::CHUNK_SAMPLER_COUNT,
+        device_limits
+    );
     if !crate::material_shader::chunk_atlas_views_fit(&device_limits) {
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Error,
+            "atlas view limits rejected sampled={} required_sampled={} samplers={} required_samplers={} bindings={} required_binding={}",
+            device_limits.max_sampled_textures_per_shader_stage,
+            crate::material_shader::CHUNK_SAMPLED_TEXTURE_BINDINGS,
+            device_limits.max_samplers_per_shader_stage,
+            crate::material_shader::CHUNK_SAMPLER_COUNT,
+            device_limits.max_bindings_per_bind_group,
+            crate::material_shader::BIOME_QUERY_TABLES_BINDING
+        );
         bevy::log::error!(
             supported = device_limits.max_sampled_textures_per_shader_stage,
             supported_group_entries = device_limits.max_bindings_per_bind_group,
@@ -111,7 +135,25 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
     let mut terrain_pages = Vec::with_capacity(assets::MAX_TEXTURE_PAGES);
     for (binding, texture) in page_bindings.into_iter().zip(bound_pages) {
         let tile_size = texture.mips.first().map_or(0, |mip| mip.size);
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Texture,
+            "page binding={:?} layers={} tile={} mips={} max_layers={} max_dimension={}",
+            binding,
+            texture.layers,
+            tile_size,
+            texture.mips.len(),
+            limits.max_layers,
+            limits.max_dimension_2d
+        );
         if let Err(error) = limits.validate(texture.layers, tile_size) {
+            render_scene::graphics_trace_line!(
+                render_scene::graphics_trace::Channel::Error,
+                "texture page rejected binding={:?} layers={} tile={} error={:?}",
+                binding,
+                texture.layers,
+                tile_size,
+                error
+            );
             bevy::log::error!(?error, "chunk texture page exceeds adapter limits");
             return None;
         }
@@ -547,6 +589,16 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         native_leaf_sampler,
         sampler,
     };
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "atlas build complete sRGB_plus_native_bytes={} queued_upload_bytes={} material_bytes={} animation_bytes={} frame_bytes={} template_bytes={}",
+        stats.texture_bytes_including_mips,
+        stats.queue_upload_bytes,
+        stats.material_bytes,
+        stats.animation_bytes,
+        stats.animation_frame_bytes,
+        model_template_bytes
+    );
     Some((prepared, stats))
 }
 
@@ -585,6 +637,13 @@ fn upload_linear_texture_atlas(
 ) -> Option<(Texture, TextureView, u64)> {
     let max_layers = TERRAIN_ATLAS_GRID.saturating_mul(TERRAIN_ATLAS_GRID);
     if texture_array.layers == 0 || texture_array.layers > max_layers {
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Error,
+            "atlas layer grid rejected label={} layers={} max_layers={}",
+            label,
+            texture_array.layers,
+            max_layers
+        );
         bevy::log::error!(
             layers = texture_array.layers,
             max_layers,
@@ -597,6 +656,17 @@ fn upload_linear_texture_atlas(
         .expect("validated terrain pages have a bounded mip count");
     let tile = texture_array.mips.first().map_or(0, |mip| mip.size);
     let side = tile.saturating_mul(2).saturating_mul(TERRAIN_ATLAS_GRID);
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "atlas create label={} layers={} tile={} grid={} side={} mips={} format={:?}",
+        label,
+        texture_array.layers,
+        tile,
+        TERRAIN_ATLAS_GRID,
+        side,
+        texture_array.mips.len(),
+        TextureFormat::Rgba8Unorm
+    );
     let texture = render_device.create_texture(&TextureDescriptor {
         label: Some(label),
         size: Extent3d {
@@ -624,6 +694,16 @@ fn upload_linear_texture_atlas(
             return None;
         };
         if tile == 0 || mip.rgba8.len() != source_len || side == 0 {
+            render_scene::graphics_trace_line!(
+                render_scene::graphics_trace::Channel::Error,
+                "atlas mip rejected label={} level={} tile={} bytes={} expected={} side={}",
+                label,
+                level,
+                tile,
+                mip.rgba8.len(),
+                source_len,
+                side
+            );
             bevy::log::error!(
                 label,
                 level,
@@ -650,6 +730,18 @@ fn upload_linear_texture_atlas(
                 }
             }
         }
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Texture,
+            "atlas mip label={} level={} side={} cell={} tile={} padding={} layers={} bytes={}",
+            label,
+            level,
+            side,
+            cell,
+            tile,
+            pad,
+            texture_array.layers,
+            pixels.len()
+        );
         render_queue.profiled_write_texture(
             TexelCopyTextureInfo {
                 texture: &texture,
@@ -681,6 +773,14 @@ fn upload_linear_texture_atlas(
         mip_level_count: Some(mip_level_count),
         ..Default::default()
     });
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "atlas ready label={} texture_id={:?} view_id={:?} uploaded={}",
+        label,
+        texture.id(),
+        view.id(),
+        uploaded
+    );
     Some((texture, view, uploaded))
 }
 

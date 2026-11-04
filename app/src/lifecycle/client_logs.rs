@@ -21,6 +21,12 @@ pub(super) fn capture(layout: &InstallLayout) {
         return;
     }
     let dir = layout.log_dir();
+    if let Err(error) = render_scene::graphics_trace::install(&dir) {
+        bevy::log::warn!(
+            "graphics tracing unavailable for {}: {error}",
+            dir.display()
+        );
+    }
     let header = session_header();
     let files = SessionFiles {
         dir: &dir,

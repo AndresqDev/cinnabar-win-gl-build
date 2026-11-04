@@ -736,6 +736,24 @@ pub(crate) fn record_metrics(
     if sampling.visibility_elapsed >= VISIBILITY_DIAGNOSTIC_INTERVAL {
         sampling.visibility_elapsed = Duration::ZERO;
         let snapshot = visibility_snapshot;
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Frame,
+            "visibility frame_generation={} camera={:?} pose_generation={:?} view_generation={} draw_mode={:?} resident={} cave={} frustum={} submitted={} gpu_completed={}",
+            snapshot.frame_generation,
+            snapshot.camera,
+            snapshot.pose_generation,
+            snapshot.view_generation,
+            snapshot.draw_mode,
+            snapshot.resident_mesh.map_or(0, |digest| digest.count),
+            snapshot.cave_visible.map_or(0, |digest| digest.count),
+            snapshot
+                .frustum_visible_opaque
+                .map_or(0, |digest| digest.count),
+            snapshot.submitted_opaque.map_or(0, |digest| digest.count),
+            snapshot
+                .gpu_completed_opaque
+                .map_or(0, |digest| digest.count)
+        );
         #[cfg(feature = "acceptance")]
         if biome_blend_diagnostics_enabled(&acceptance)
             && let (Some(stream), Ok(camera)) = (client_world.stream.as_ref(), camera.single())

@@ -221,6 +221,23 @@ fn log_adapter_capabilities(
     let info = adapter.get_info();
     let angle = is_angle(&info);
     let downlevel = adapter.get_downlevel_capabilities();
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Adapter,
+        "adapter name={:?} backend={:?} angle={} vendor={:#x} device={:#x} device_type={:?} driver={:?} driver_info={:?} shader_model={:?} downlevel={:?} adapter_features={:?} requested_features={:?} limits={:?}",
+        info.name,
+        info.backend,
+        angle,
+        info.vendor,
+        info.device,
+        info.device_type,
+        info.driver,
+        info.driver_info,
+        downlevel.shader_model,
+        downlevel.flags,
+        adapter.features(),
+        features,
+        limits
+    );
     log(format_args!(
         "Renderer capabilities: name={:?} backend={:?} angle={} driver={:?} driver_info={:?} \
          shader_model={:?} downlevel={:?} adapter_features={:?} requested_features={:?} \

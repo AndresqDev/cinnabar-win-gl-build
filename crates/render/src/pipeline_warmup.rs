@@ -246,6 +246,15 @@ fn register_tier<T: PrewarmPipelines>(app: &mut App, tier: WarmupTier) {
         }
     };
     render_app.insert_resource(WarmupOwner::<T>::new(tier, slot));
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Pipeline,
+        "warmup register owner={} tier={:?} slot={} dx11={} gl={}",
+        type_name::<T>(),
+        tier,
+        slot,
+        crate::gl_compat::dx11(),
+        crate::gl_compat::gl()
+    );
     info!("pipeline warmup owner {}: {tier:?}", type_name::<T>());
     if tier == WarmupTier::Background {
         render_app.add_systems(
@@ -402,6 +411,13 @@ fn warm_owner_views<T: PrewarmPipelines>(
             }
             // The draw path would fail the same way, so the error does not hold loading.
             if let Err(error) = owner.prewarm(cache, view, ids) {
+                render_scene::graphics_trace_line!(
+                    render_scene::graphics_trace::Channel::Error,
+                    "pipeline prewarm failed owner={} view={:?} error={}",
+                    type_name::<T>(),
+                    view,
+                    error
+                );
                 error!("pipeline prewarm {}: {error}", type_name::<T>());
             }
             warmed.push(view);
@@ -445,6 +461,14 @@ fn prewarm_owner<T: PrewarmPipelines>(
     let before = ids.len();
     warm_owner_views(&mut *owner, &cache, views, &mut warmed, ids);
     if !*reported && !views.is_empty() {
+        render_scene::graphics_trace_line!(
+            render_scene::graphics_trace::Channel::Pipeline,
+            "warmup critical owner={} queued={} total_ids={} views={:?}",
+            type_name::<T>(),
+            ids.len() - before,
+            ids.len(),
+            views
+        );
         info!(
             "pipeline warmup owner {}: critical, queued {} variants",
             type_name::<T>(),
@@ -512,6 +536,14 @@ fn prewarm_background_owner<T: PrewarmPipelines>(
         let before = background_ids.len();
         warm_owner_views(&mut *owner, &cache, views, warmed, background_ids);
         if !*reported && !views.is_empty() {
+            render_scene::graphics_trace_line!(
+                render_scene::graphics_trace::Channel::Pipeline,
+                "warmup background owner={} queued={} total_ids={} readiness_unaffected views={:?}",
+                type_name::<T>(),
+                background_ids.len() - before,
+                background_ids.len(),
+                views
+            );
             info!(
                 "pipeline warmup owner {}: background queued during loading; {} variants, readiness unaffected",
                 type_name::<T>(),
@@ -620,6 +652,12 @@ fn ids_ready(
             ) => false,
             CachedPipelineState::Err(error) => {
                 if failed.insert(id) {
+                    render_scene::graphics_trace_line!(
+                        render_scene::graphics_trace::Channel::Error,
+                        "pipeline terminal error id={:?} error={}",
+                        id,
+                        error
+                    );
                     error!("pipeline prewarm {id:?}: {error}");
                 }
                 true

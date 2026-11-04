@@ -571,6 +571,14 @@ pub(in crate::chunk) fn entries<'a>(
                 resource: BindingResource::TextureView(view),
             }),
     );
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "bind group built entries={} sampled_pages={} native_leaf_views={} samplers={}",
+        entries.len(),
+        crate::material_shader::SAMPLED_TEXTURE_BINDINGS.len(),
+        crate::material_shader::NATIVE_LEAF_TEXTURE_BINDINGS.len(),
+        crate::material_shader::CHUNK_SAMPLER_COUNT
+    );
     entries
 }
 

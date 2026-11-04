@@ -172,5 +172,8 @@ fn sample_terrain(page: texture_2d<f32>, image_sampler: sampler, reference: u32,
 fn sample_terrain_cube(page: texture_2d<f32>, image_sampler: sampler, reference: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let dimensions = textureDimensions(page, 0);
     let scale = terrain_atlas_gradient_scale(reference, dimensions);
-    return textureSampleGrad(page, image_sampler, terrain_atlas_uv_local(reference, texture_cube_uv(reference, uv), dimensions), dx * scale, dy * scale);
+    // Greedy quads expose UVs in block extents. A 2D atlas is clamped, so fold
+    // every block back into the source tile before addressing the atlas cell.
+    let local_uv = fract(uv) * texture_uv_scale(reference);
+    return textureSampleGrad(page, image_sampler, terrain_atlas_uv_local(reference, local_uv, dimensions), dx * scale, dy * scale);
 }

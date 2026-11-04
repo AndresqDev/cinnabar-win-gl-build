@@ -673,6 +673,19 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
     upload_stats.model_streams_validated = model_streams_validated;
     upload_stats.range_plans = range_plans;
     upload_stats.candidates_deferred = selected.len().saturating_sub(successful_updates.len());
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Chunk,
+        "prepare_gpu_chunks candidates={} examined={} admitted={} deferred={} validated={} range_plans={} migrations={} growth_wait={} stats={:?}",
+        candidates.len(),
+        candidates_examined,
+        successful_updates.len(),
+        upload_stats.candidates_deferred,
+        model_streams_validated,
+        range_plans,
+        migrations_started,
+        uploads_waiting_for_growth,
+        *upload_stats
+    );
     #[cfg(feature = "tracy")]
     if let Some(client) = tracy_client::Client::running() {
         use tracy_client::plot_name;

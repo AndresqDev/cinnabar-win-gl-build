@@ -12,6 +12,8 @@ pub mod enhanced;
 pub mod entity_shadow;
 pub mod far_terrain;
 pub mod formats;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod graphics_trace;
 pub mod gpu_times;
 pub mod hand_rig;
 pub mod lighting;
