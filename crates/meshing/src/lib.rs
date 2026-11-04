@@ -28,6 +28,26 @@ mod types;
 
 const SIDE: usize = world::SUB_CHUNK_SIDE;
 
+/// Opt-in heavy terrain path: every exposed cube face becomes one synthetic
+/// model quad, sampled by the same model program, bindings and local UVs as
+/// stairs. `CINNABAR_STABLE_TERRAIN` remains an alias for existing shortcuts.
+#[must_use]
+pub fn compatibility_terrain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        ["CINNABAR_HEAVY_TERRAIN", "CINNABAR_STABLE_TERRAIN"]
+            .into_iter()
+            .any(|name| {
+                std::env::var_os(name).is_some_and(|value| {
+                    !matches!(
+                        value.to_string_lossy().to_ascii_lowercase().as_str(),
+                        "" | "0" | "false" | "off" | "no"
+                    )
+                })
+            })
+    })
+}
+
 pub use biome::{
     BIOME_NEIGHBOUR_SLOT_COUNT, BiomeBlendSample, ChunkBiomeTintIdentity,
     MAX_PACKED_BIOME_RECORD_WORDS, PackedBiomeRecord, biome_neighbour_index, biome_volume_index,

@@ -338,6 +338,23 @@ fn model_corner_uv(quad: ModelQuad, material: MaterialGpu, corner: u32) -> vec2<
         f32(packed_u16(quad.template_quad_base + 6u, uv_component)),
         f32(packed_u16(quad.template_quad_base + 6u, uv_component + 1u)),
     ) / 4096.0;
+    // Synthetic compatibility faces use exactly the native cube UV flags. The
+    // canonical template UV already equals greedy_uv(width=1, height=1, flags=0).
+    if ((quad.quad_flags & MODEL_QUAD_FLAG_COMPAT_CUBE) != 0u) {
+        let uv_flags = material_uv_flags(
+            material.flags,
+            quad.chunk_origin.xyz + vec3<i32>(quad.block_position),
+        );
+        switch uv_flags & 3u {
+            case 1u: { uv = vec2(uv.y, 1.0 - uv.x); }
+            case 2u: { uv = vec2(1.0) - uv; }
+            case 3u: { uv = vec2(1.0 - uv.y, uv.x); }
+            default: {}
+        }
+        if ((uv_flags & 4u) != 0u) { uv.x = 1.0 - uv.x; }
+        if ((uv_flags & 8u) != 0u) { uv.y = 1.0 - uv.y; }
+        return uv;
+    }
     // World rotation acts on the authored UV rectangle, independently of model geometry.
     if ((material.flags & MATERIAL_ISOTROPIC_FLAG) != 0u) {
         let uv_flags = material_uv_flags(material.flags, quad.chunk_origin.xyz + vec3<i32>(quad.block_position));

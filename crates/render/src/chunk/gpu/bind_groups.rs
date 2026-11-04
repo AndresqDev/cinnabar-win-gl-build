@@ -330,30 +330,68 @@ pub(in crate::chunk) fn chunk_sampler_descriptor() -> SamplerDescriptor<'static>
 }
 
 pub(in crate::chunk) fn encode_model_template_words(assets: &RuntimeAssets) -> Vec<u32> {
-    let template_count = u32::try_from(assets.model_templates().len()).unwrap_or(u32::MAX);
-    let mut words = Vec::with_capacity(
-        1 + assets.model_templates().len() * 3 + assets.model_quads().len() * 12,
-    );
+    let base_template_count = u32::try_from(assets.model_templates().len()).unwrap_or(u32::MAX);
+    let base_quad_count = u32::try_from(assets.model_quads().len()).unwrap_or(u32::MAX);
+    let material_count = u32::try_from(assets.materials().len()).unwrap_or(0);
+    let compat_templates = if meshing::compatibility_terrain_enabled() {
+        material_count
+            .checked_mul(assets::COMPAT_CUBE_TEMPLATE_FACES)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let template_count = base_template_count.saturating_add(compat_templates);
+    let quad_count = base_quad_count.saturating_add(compat_templates);
+    let mut words =
+        Vec::with_capacity((1 + template_count as usize).saturating_add(quad_count as usize * 12));
     words.push(template_count);
     for template in assets.model_templates() {
         words.extend([template.quad_start, template.quad_count, template.flags]);
     }
+    for material in 0..compat_templates / assets::COMPAT_CUBE_TEMPLATE_FACES {
+        for face in 0..assets::COMPAT_CUBE_TEMPLATE_FACES {
+            let local = material
+                .checked_mul(assets::COMPAT_CUBE_TEMPLATE_FACES)
+                .and_then(|base| base.checked_add(face));
+            let Some(quad_start) = local.and_then(|local| base_quad_count.checked_add(local))
+            else {
+                continue;
+            };
+            words.extend([quad_start, 1, 0]);
+        }
+    }
     for quad in assets.model_quads() {
-        let mut i16_values = quad.positions.iter().flatten().copied();
-        for _ in 0..6 {
-            let low = i16_values.next().expect("twelve model position components") as u16;
-            let high = i16_values.next().expect("twelve model position components") as u16;
-            words.push(u32::from(low) | (u32::from(high) << 16));
+        push_compat_model_quad(&mut words, *quad);
+    }
+    for material in 0..compat_templates / assets::COMPAT_CUBE_TEMPLATE_FACES {
+        let two_sided = assets
+            .materials()
+            .get(material as usize)
+            .is_some_and(|material| material.flags & assets::MATERIAL_FLAG_TWO_SIDED != 0);
+        for face in 0..assets::COMPAT_CUBE_TEMPLATE_FACES {
+            push_compat_model_quad(
+                &mut words,
+                assets::compat_cube_quad(material, face, two_sided),
+            );
         }
-        let mut u16_values = quad.uvs.iter().flatten().copied();
-        for _ in 0..4 {
-            let low = u16_values.next().expect("eight model UV components");
-            let high = u16_values.next().expect("eight model UV components");
-            words.push(u32::from(low) | (u32::from(high) << 16));
-        }
-        words.extend([quad.material, quad.flags]);
     }
     words
+}
+
+fn push_compat_model_quad(words: &mut Vec<u32>, quad: assets::ModelQuad) {
+    let mut i16_values = quad.positions.iter().flatten().copied();
+    for _ in 0..6 {
+        let low = i16_values.next().expect("twelve model position components") as u16;
+        let high = i16_values.next().expect("twelve model position components") as u16;
+        words.push(u32::from(low) | (u32::from(high) << 16));
+    }
+    let mut u16_values = quad.uvs.iter().flatten().copied();
+    for _ in 0..4 {
+        let low = u16_values.next().expect("eight model UV components");
+        let high = u16_values.next().expect("eight model UV components");
+        words.push(u32::from(low) | (u32::from(high) << 16));
+    }
+    words.extend([quad.material, quad.flags]);
 }
 
 pub(in crate::chunk) fn storage_table_fits(

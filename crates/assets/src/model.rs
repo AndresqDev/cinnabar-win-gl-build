@@ -358,6 +358,73 @@ pub struct ModelQuad {
 
 const _: () = assert!(std::mem::size_of::<ModelQuad>() == 48);
 
+/// Number of synthetic full-cube templates emitted per material by the heavy
+/// compatibility terrain path. One template owns one outward face, so a block
+/// face can keep its own material and a one-record lighting sidecar.
+pub const COMPAT_CUBE_TEMPLATE_FACES: u32 = 6;
+/// Marks a synthetic full-cube model quad so the model shader applies the same
+/// per-material UV quarter-turn/flip contract as the native cube path.
+pub const MODEL_QUAD_FLAG_COMPAT_CUBE: u32 = 1 << 8;
+
+/// Canonical outward cube-face corners, in the cube mesher's winding.
+pub const COMPAT_CUBE_POSITIONS: [[[i16; 3]; 4]; 6] = [
+    [[0, 0, 0], [0, 0, 256], [0, 256, 256], [0, 256, 0]],
+    [[256, 0, 0], [256, 256, 0], [256, 256, 256], [256, 0, 256]],
+    [[0, 0, 0], [256, 0, 0], [256, 0, 256], [0, 0, 256]],
+    [[0, 256, 0], [0, 256, 256], [256, 256, 256], [256, 256, 0]],
+    [[0, 0, 0], [0, 256, 0], [256, 256, 0], [256, 0, 0]],
+    [[0, 0, 256], [256, 0, 256], [256, 256, 256], [0, 256, 256]],
+];
+
+/// Equivalent of the cube path's `greedy_uv(..., width=1, height=1, flags=0)`.
+pub const COMPAT_CUBE_UVS: [[[u16; 2]; 4]; 6] = [
+    [[0, 4096], [4096, 4096], [4096, 0], [0, 0]],
+    [[4096, 4096], [4096, 0], [0, 0], [0, 4096]],
+    [[0, 4096], [4096, 4096], [4096, 0], [0, 0]],
+    [[0, 0], [0, 4096], [4096, 4096], [4096, 0]],
+    [[4096, 4096], [4096, 0], [0, 0], [0, 4096]],
+    [[0, 4096], [4096, 4096], [4096, 0], [0, 0]],
+];
+
+/// Model face ids for cube faces in `Face::ALL` order. Model faces are
+/// `1..=6 = down/up/west/east/north/south`; native cube faces are
+/// `0..=5 = west/east/down/up/north/south`.
+pub const COMPAT_CUBE_MODEL_FACES: [u32; 6] = [3, 4, 1, 2, 5, 6];
+
+/// Synthetic template id for one material's outward cube face.
+#[must_use]
+pub const fn compat_cube_template_id(base: u32, material: u32, face: u32) -> u32 {
+    base + material * COMPAT_CUBE_TEMPLATE_FACES + face
+}
+
+/// Material encoded by a synthetic template id, or `None` for a carrier template.
+#[must_use]
+pub const fn compat_cube_template_material(base: u32, template: u32) -> Option<u32> {
+    match template.checked_sub(base) {
+        Some(relative) => Some(relative / COMPAT_CUBE_TEMPLATE_FACES),
+        None => None,
+    }
+}
+
+/// Builds one synthetic template quad for `material` and cube `face` in
+/// `Face::ALL` order. The compat bit makes the model shader reproduce the cube
+/// path's material UV flags instead of the model path's authored UV rectangle.
+#[must_use]
+pub const fn compat_cube_quad(material: u32, face: u32, two_sided: bool) -> ModelQuad {
+    ModelQuad {
+        positions: COMPAT_CUBE_POSITIONS[face as usize],
+        uvs: COMPAT_CUBE_UVS[face as usize],
+        material,
+        flags: COMPAT_CUBE_MODEL_FACES[face as usize]
+            | MODEL_QUAD_FLAG_COMPAT_CUBE
+            | if two_sided {
+                MODEL_QUAD_FLAG_TWO_SIDED
+            } else {
+                0
+            },
+    }
+}
+
 /// Optional face and cull-face use `0 = none`, `1..=6 =
 /// down/up/west/east/north/south` in their respective three-bit fields.
 pub const MODEL_QUAD_FLAG_FACE_MASK: u32 = 0x07;

@@ -73,19 +73,10 @@ pub(crate) fn chunk_atlas_views_fit(limits: &wgpu::Limits) -> bool {
         && limits.max_bindings_per_bind_group > BIOME_QUERY_TABLES_BINDING
 }
 
-/// Opt-in terrain compatibility mode for drivers that mis-sample merged cube faces.
-/// It is deliberately read once at renderer startup, together with the shader defines.
+/// Opt-in heavy terrain compatibility mode for drivers that mis-sample merged
+/// cube faces. One process-wide answer is shared by meshing and the renderer.
 pub(crate) fn stable_terrain_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("CINNABAR_STABLE_TERRAIN").is_some_and(|value| {
-            let value = value.to_string_lossy();
-            !matches!(
-                value.to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "off" | "no"
-            )
-        })
-    })
+    meshing::compatibility_terrain_enabled()
 }
 
 /// Terrain samples nearest texels and interpolates only between mip levels.
@@ -189,6 +180,10 @@ pub(crate) fn source(source: &str) -> String {
         .replace("ACTOR_CHART_COORDINATE_BITS", &format!("{}u", u16::BITS))
         .replace("ACTOR_ALPHA_TEST_THRESHOLD", &format!("{:?}", assets::ENTITY_ALPHA_TEST_THRESHOLD))
         .replace("MODEL_RANDOM_OFFSET_FLAG", &format!("{}u", meshing::MODEL_REF_FLAG_RANDOM_OFFSET))
+        .replace(
+            "MODEL_QUAD_FLAG_COMPAT_CUBE",
+            &format!("{}u", assets::MODEL_QUAD_FLAG_COMPAT_CUBE),
+        )
         .replace("MODEL_SHADE_FACE_SHIFT", &format!("{}u", meshing::LIGHT_SAMPLE_SHADE_FACE_SHIFT))
         .replace("MODEL_BAMBOO_FLAG", &format!("{}u", assets::MODEL_TEMPLATE_FLAG_BAMBOO))
         .replace("BAMBOO_STEM_SIDE_QUAD_MASK", &format!("{}u", assets::bamboo::STEM_SIDE_QUAD_MASK))

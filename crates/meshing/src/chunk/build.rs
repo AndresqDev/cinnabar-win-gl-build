@@ -79,6 +79,10 @@ pub struct MeshOptions<'a> {
     /// Emits one quad per cube face instead of merging identical runs. Diagnostic fallback
     /// for atlas/texture-sampling stability; it deliberately gives up greedy meshing.
     pub force_single_block_faces: bool,
+    /// Replaces every one-block cube quad with a synthetic full-cube model quad. The
+    /// renderer then uses the same model program, bindings and local-UV sampling as stairs,
+    /// never the cube sampler. Requires `force_single_block_faces`.
+    pub compatibility_model_faces: bool,
     /// Draws every leaf with its cutout, two-sided material, keeping one quad per shared
     /// plane instead of opaque deep leaves. Set while a shader pack renders the world.
     pub cutout_leaves: bool,
@@ -523,7 +527,28 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
     } else {
         (Vec::new(), Vec::new())
     };
-    let (quads, cube_lighting, layout) = cube_streams.finish();
+    let (mut quads, mut cube_lighting, mut layout) = cube_streams.finish();
+    if options.compatibility_model_faces {
+        let template_base = u32::try_from(visuals.model_templates().len()).ok();
+        let converted = template_base.is_some_and(|template_base| {
+            super::compatibility::append_model_faces(
+                &quads,
+                &cube_lighting,
+                visuals.materials(),
+                template_base,
+                &mut model_refs,
+                &mut model_lighting,
+                &mut model_draw_refs,
+            )
+        });
+        if converted {
+            // The model stream now owns every cube face. Keep the layout empty so
+            // no stale solid/cutout range can reach the cube pipeline.
+            quads.clear();
+            cube_lighting.clear();
+            layout = crate::CubeQuadLayout::default();
+        }
+    }
     ChunkMesh {
         cube_streams: Box::new(CubeStreams {
             cube_quads: quads.into_boxed_slice(),

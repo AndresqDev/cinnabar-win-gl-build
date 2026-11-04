@@ -50,7 +50,7 @@ impl ModelValidationCache {
         {
             return (entry.valid, false);
         }
-        let valid = validate_partitioned_model_streams(
+        let valid = validate_partitioned_model_streams_with_compat(
             &instance.model_refs,
             &instance.model_lighting,
             &instance.model_draw_refs,
@@ -58,6 +58,7 @@ impl ModelValidationCache {
             assets.assets().model_templates(),
             assets.assets().model_quads(),
             assets.assets().materials(),
+            meshing::compatibility_terrain_enabled(),
         );
         if self.entries.len() < limit || self.entries.contains_key(&entity) {
             self.entries.insert(
@@ -177,6 +178,32 @@ pub(in crate::chunk) fn validate_partitioned_model_streams(
     model_quads: &[assets::ModelQuad],
     materials: &[Material],
 ) -> bool {
+    validate_partitioned_model_streams_with_compat(
+        model_refs,
+        model_lighting,
+        opaque_draw_refs,
+        blend_draw_refs,
+        model_templates,
+        model_quads,
+        materials,
+        false,
+    )
+}
+
+/// Validates the carrier model stream plus, when enabled, the synthetic
+/// full-cube templates appended after it. Synthetic quads are deliberately kept
+/// on the opaque route even for blend-flagged materials: the heavy path favors
+/// deterministic visibility over sorting rare translucent cube faces.
+pub(in crate::chunk) fn validate_partitioned_model_streams_with_compat(
+    model_refs: &[PackedModelRef],
+    model_lighting: &[PackedQuadLighting],
+    opaque_draw_refs: &[PackedModelDrawRef],
+    blend_draw_refs: &[PackedModelDrawRef],
+    model_templates: &[ModelTemplate],
+    model_quads: &[assets::ModelQuad],
+    materials: &[Material],
+    compat_cube_faces: bool,
+) -> bool {
     let any_draw = !opaque_draw_refs.is_empty() || !blend_draw_refs.is_empty();
     if model_refs.is_empty() != model_lighting.is_empty() || model_refs.is_empty() == any_draw {
         return false;
@@ -185,6 +212,12 @@ pub(in crate::chunk) fn validate_partitioned_model_streams(
         return true;
     }
 
+    let compat_base = compat_cube_faces
+        .then(|| u32::try_from(model_templates.len()).ok())
+        .flatten();
+    let synthetic_limit = u32::try_from(materials.len())
+        .ok()
+        .and_then(|count| count.checked_mul(assets::COMPAT_CUBE_TEMPLATE_FACES));
     let mut opaque_index = 0;
     let mut blend_index = 0;
     let mut expected_lighting_base = 0_usize;
@@ -195,18 +228,38 @@ pub(in crate::chunk) fn validate_partitioned_model_streams(
         let words = model_ref.words();
         let lighting_base = words[2] as usize;
         let visible_mask = words[3];
-        let Some(template) = model_templates.get(words[1] as usize) else {
-            return false;
-        };
-        let Ok(template_quad_count) = usize::try_from(template.quad_count) else {
-            return false;
-        };
-        let template_start = template.quad_start as usize;
-        let Some(template_end) = template_start.checked_add(template_quad_count) else {
-            return false;
-        };
-        let Some(template_quads) = model_quads.get(template_start..template_end) else {
-            return false;
+        let synthetic = compat_base.and_then(|base| {
+            let relative = words[1].checked_sub(base)?;
+            if synthetic_limit.is_none_or(|limit| relative >= limit) {
+                return None;
+            }
+            Some((
+                relative / assets::COMPAT_CUBE_TEMPLATE_FACES,
+                relative % assets::COMPAT_CUBE_TEMPLATE_FACES,
+            ))
+        });
+        let (template_quad_count, template_quads) = if let Some((material, face)) = synthetic {
+            if face >= assets::COMPAT_CUBE_TEMPLATE_FACES
+                || materials.get(material as usize).is_none()
+            {
+                return false;
+            }
+            (1, None)
+        } else {
+            let Some(template) = model_templates.get(words[1] as usize) else {
+                return false;
+            };
+            let Ok(template_quad_count) = usize::try_from(template.quad_count) else {
+                return false;
+            };
+            let template_start = template.quad_start as usize;
+            let Some(template_end) = template_start.checked_add(template_quad_count) else {
+                return false;
+            };
+            let Some(template_quads) = model_quads.get(template_start..template_end) else {
+                return false;
+            };
+            (template_quad_count, Some(template_quads))
         };
         if !(1..=32).contains(&template_quad_count)
             || visible_mask == 0
@@ -233,16 +286,25 @@ pub(in crate::chunk) fn validate_partitioned_model_streams(
         let mut visible = visible_mask;
         while visible != 0 {
             let quad_index = visible.trailing_zeros();
-            let Some(quad) = template_quads.get(quad_index as usize) else {
-                return false;
-            };
-            let is_blend = if quad.material == assets::DIAGNOSTIC_MATERIAL {
+            let is_blend = if synthetic.is_some() {
+                if quad_index != 0 {
+                    return false;
+                }
+                // Heavy compatibility faces stay on the opaque route.
                 false
             } else {
-                let Some(material) = materials.get(quad.material as usize) else {
+                let Some(quad) = template_quads.and_then(|quads| quads.get(quad_index as usize))
+                else {
                     return false;
                 };
-                material.flags & assets::MATERIAL_FLAG_ALPHA_BLEND != 0
+                if quad.material == assets::DIAGNOSTIC_MATERIAL {
+                    false
+                } else {
+                    let Some(material) = materials.get(quad.material as usize) else {
+                        return false;
+                    };
+                    material.flags & assets::MATERIAL_FLAG_ALPHA_BLEND != 0
+                }
             };
             let (draw_refs, draw_index) = if is_blend {
                 (blend_draw_refs, &mut blend_index)
