@@ -104,12 +104,11 @@ pub(crate) fn apply_render_distance(
         closed_send_log.reset();
         return;
     };
-    // DX11 normally uses the original join order: request the configured radius immediately
-    // and let the stream admit the publisher view without the progressive/ANGLE cap. The
-    // heavy model-face path is the exception: its per-chunk output is much larger, so it must
-    // ramp and back off like the GL compatibility path instead of flooding a legacy GPU with
-    // the full render-distance ring at once.
-    if render::gl_compat::dx11() && !meshing::compatibility_terrain_enabled() {
+    // DX11 uses the original join order: request the configured radius immediately and let
+    // the stream admit the publisher view without the progressive/ANGLE cap. The ANGLE ramp is
+    // known to be broken and must not be reused for the heavy path; the heavy path is protected
+    // only by the hard radius cap above.
+    if render::gl_compat::dx11() {
         stream.set_progressive_view(false);
         stream.set_startup_priority(false);
         let radius = u8::try_from(target_radius).unwrap_or(u8::MAX);
@@ -131,7 +130,7 @@ pub(crate) fn apply_render_distance(
     // The server's publisher can describe a much larger view than this client requested. On the
     // GL compatibility path that would defeat the progressive ramp and recreate the join burst;
     // cap admission and retention to the requested radius while the ramp grows it.
-    if render::gl_compat::gl() || meshing::compatibility_terrain_enabled() {
+    if render::gl_compat::gl() {
         stream.set_progressive_view(true);
     }
 
