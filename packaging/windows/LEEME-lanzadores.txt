@@ -7,6 +7,7 @@ No los pongas en una subcarpeta.
 Archivos:
 
   _assets.bat          Ruta del pack de assets compilado.
+  run-optimizado.bat   Ruta compacta, sin diagnosticos, radio 4.
   run-heavy.bat        Modo pesado, sin trazas.
   run-heavy-traces.bat Modo pesado, con trazas.
   run-normal.bat       Modo normal, sin trazas.
