@@ -83,6 +83,9 @@ pub struct MeshOptions<'a> {
     /// renderer then uses the same model program, bindings and local-UV sampling as stairs,
     /// never the cube sampler. Requires `force_single_block_faces`.
     pub compatibility_model_faces: bool,
+    /// Packs one-block compatibility faces into the compact 12-byte face stream. This is the
+    /// preferred terrain route when a chunk has no carrier models or overlays.
+    pub compatibility_compact_faces: bool,
     /// Draws every leaf with its cutout, two-sided material, keeping one quad per shared
     /// plane instead of opaque deep leaves. Set while a shader pack renders the world.
     pub cutout_leaves: bool,
@@ -528,7 +531,28 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
         (Vec::new(), Vec::new())
     };
     let (mut quads, mut cube_lighting, mut layout) = cube_streams.finish();
-    if options.compatibility_model_faces {
+    let compatibility_only = model_refs.is_empty() && transparent_model_draw_refs.is_empty();
+    let mut compat_faces = Vec::new();
+    if options.compatibility_compact_faces {
+        let template_base = u32::try_from(visuals.model_templates().len()).ok();
+        let converted = template_base.is_some_and(|template_base| {
+            compatibility_only
+                && super::compatibility::append_compact_faces(
+                    &quads,
+                    &cube_lighting,
+                    visuals.materials(),
+                    template_base,
+                    &mut compat_faces,
+                )
+        });
+        if converted {
+            quads.clear();
+            cube_lighting.clear();
+            layout = layout.with_compact_faces();
+        } else {
+            compat_faces.clear();
+        }
+    } else if options.compatibility_model_faces {
         let template_base = u32::try_from(visuals.model_templates().len()).ok();
         let converted = template_base.is_some_and(|template_base| {
             super::compatibility::append_model_faces(
@@ -546,8 +570,6 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
             // renderer can cull compatibility model draw references by camera direction.
             // Only pure terrain chunks are marked: chunks with carrier models or overlays
             // must keep their complete model draw range.
-            let compatibility_only =
-                model_refs.is_empty() && transparent_model_draw_refs.is_empty();
             quads.clear();
             cube_lighting.clear();
             layout = if compatibility_only {
@@ -570,6 +592,7 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
             opaque: model_draw_refs.into_boxed_slice(),
             transparent: transparent_model_draw_refs.into_boxed_slice(),
         }),
+        compat_faces: compat_faces.into_boxed_slice(),
         liquid_quads: liquid_quads.into_boxed_slice(),
         liquid_lighting: liquid_lighting.into_boxed_slice(),
         connectivity,

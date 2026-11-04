@@ -25,10 +25,12 @@ Antes de empezar:
 
 Modo pesado:
 
-  - terreno convertido a referencias de modelo, la ruta ya validada en Intel;
+  - terreno compacto de 12 bytes por cara, sin indirecciones de modelo;
   - mismo camino de muestreo que las escaleras;
   - UV locales, sin mipmaps y sin mezclar celdas del atlas;
   - cota estricta de radio en DX11, sin activar la carga progresiva de ANGLE;
+  - si aparece un problema, fuerza el camino de modelos completo ya validado:
+      CINNABAR_HEAVY_MODEL_TERRAIN=1
   - experimento opcional de cubos+greedy, solo para comparar:
       CINNABAR_HEAVY_CUBE_TERRAIN=1
 

@@ -144,7 +144,7 @@ pub use viewmodel_render::ViewmodelRenderPlugin;
 mod weather_render;
 
 use meshing::{
-    PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
+    CompatFace, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
 };
 
 pub use actor::gpu::storage_binding_bytes as actor_storage_binding_bytes;

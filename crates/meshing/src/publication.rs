@@ -1,6 +1,6 @@
 use crate::{
-    ChunkMesh, PackedBiomeRecord, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad,
-    PackedQuadLighting,
+    ChunkMesh, CompatFace, PackedBiomeRecord, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef,
+    PackedQuad, PackedQuadLighting,
 };
 
 /// Bytes occupied by one chunk origin in the GPU storage arena.
@@ -30,6 +30,7 @@ pub fn chunk_publication_byte_len(mesh: &ChunkMesh, biome: &PackedBiomeRecord) -
         .saturating_add(stream_bytes::<PackedModelDrawRef>(
             mesh.transparent_model_draw_refs().len(),
         ))
+        .saturating_add(stream_bytes::<CompatFace>(mesh.compat_faces().len()))
         .saturating_add(stream_bytes::<PackedLiquidQuad>(mesh.liquid_quads().len()))
         .saturating_add(stream_bytes::<PackedQuadLighting>(
             mesh.liquid_lighting().len(),

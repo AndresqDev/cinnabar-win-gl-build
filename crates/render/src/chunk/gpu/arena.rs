@@ -486,6 +486,7 @@ pub(in crate::chunk) struct FreshChunkRanges {
     pub(in crate::chunk) model_lighting_start: u32,
     pub(in crate::chunk) model_draw_start: u32,
     pub(in crate::chunk) transparent_model_draw_start: u32,
+    pub(in crate::chunk) compat_faces_start: u32,
     pub(in crate::chunk) liquid_start: u32,
     pub(in crate::chunk) liquid_lighting_start: u32,
     pub(in crate::chunk) cube_lighting_start: u32,
@@ -576,6 +577,7 @@ pub(in crate::chunk) fn plan_fresh_chunk_ranges(
         model_draw_start: geometry_stream_start.checked_add(layout.model_draw_offset)?,
         transparent_model_draw_start: geometry_stream_start
             .checked_add(layout.transparent_model_draw_offset)?,
+        compat_faces_start: geometry_stream_start.checked_add(layout.compat_faces_offset)?,
         liquid_start: geometry_stream_start.checked_add(layout.liquid_offset)?,
         liquid_lighting_start: geometry_stream_start.checked_add(layout.liquid_lighting_offset)?,
         cube_lighting_start: geometry_stream_start.checked_add(layout.cube_lighting_offset)?,
@@ -655,6 +657,7 @@ pub(in crate::chunk) struct ChunkRangePlan {
     pub(in crate::chunk) model_lighting_start: u32,
     pub(in crate::chunk) model_draw_start: u32,
     pub(in crate::chunk) transparent_model_draw_start: u32,
+    pub(in crate::chunk) compat_faces_start: u32,
     pub(in crate::chunk) liquid_start: u32,
     pub(in crate::chunk) liquid_lighting_start: u32,
     pub(in crate::chunk) cube_lighting_start: u32,
@@ -723,6 +726,8 @@ pub(in crate::chunk) fn plan_chunk_range_update(
     let model_draw_start = geometry_stream_start.checked_add(geometry_layout.model_draw_offset)?;
     let transparent_model_draw_start =
         geometry_stream_start.checked_add(geometry_layout.transparent_model_draw_offset)?;
+    let compat_faces_start =
+        geometry_stream_start.checked_add(geometry_layout.compat_faces_offset)?;
     let liquid_start = geometry_stream_start.checked_add(geometry_layout.liquid_offset)?;
     let liquid_lighting_start =
         geometry_stream_start.checked_add(geometry_layout.liquid_lighting_offset)?;
@@ -747,6 +752,7 @@ pub(in crate::chunk) fn plan_chunk_range_update(
         model_lighting_start,
         model_draw_start,
         transparent_model_draw_start,
+        compat_faces_start,
         liquid_start,
         liquid_lighting_start,
         cube_lighting_start,

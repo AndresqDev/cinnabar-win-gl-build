@@ -207,6 +207,10 @@ struct ModelQuad {
     selected_material_id: u32,
     /// Section origin in blocks, and the section's biome record in `w`.
     chunk_origin: vec4<i32>,
+    /// Inline light samples for the compact compatibility stream.
+    compat_light: vec4<u32>,
+    /// Nonzero when this quad was decoded from the compact compatibility stream.
+    compat: u32,
 }
 
 fn invalid_model_quad() -> ModelQuad {
@@ -219,6 +223,22 @@ fn invalid_model_quad() -> ModelQuad {
 /// `metadata_index`, validating every address it reads.
 fn model_quad(instance_index: u32, metadata_index: u32) -> ModelQuad {
     let geometry_word_count = arrayLength(&geometry_streams);
+    let origin = chunk_origins(metadata_index);
+    if ((origin.stream_bases.x & 0x80000000u) != 0u) {
+        if (instance_index > 0x55555554u) {
+            return invalid_model_quad();
+        }
+        let record_word = (origin.stream_bases.x & 0x7fffffffu) + instance_index * 3u;
+        if (record_word + 2u >= geometry_word_count) {
+            return invalid_model_quad();
+        }
+        return model_quad_compat(
+            geometry_streams[record_word],
+            geometry_streams[record_word + 1u],
+            geometry_streams[record_word + 2u],
+            metadata_index,
+        );
+    }
     if (instance_index > 0x7fffffffu) {
         return invalid_model_quad();
     }
@@ -229,6 +249,26 @@ fn model_quad(instance_index: u32, metadata_index: u32) -> ModelQuad {
     let model_ref_index = geometry_streams[draw_ref_word];
     let quad_index = geometry_streams[draw_ref_word + 1u];
     return model_quad_at(model_ref_index, quad_index, metadata_index);
+}
+
+/// Decodes the compact compatibility face: one header plus two inline light words.
+fn model_quad_compat(
+    header: u32,
+    light0: u32,
+    light1: u32,
+    metadata_index: u32,
+) -> ModelQuad {
+    // Header bits 0..11 are the local block position, 12..27 the absolute template id.
+    return model_quad_from_parts(
+        header & 0x0fffu,
+        (header >> 12u) & 0xffffu,
+        0u,
+        1u,
+        0u,
+        metadata_index,
+        vec4<u32>(light0 & 0xffffu, light0 >> 16u, light1 & 0xffffu, light1 >> 16u),
+        1u,
+    );
 }
 
 /// Decodes a stable model-ref address and template quad in an origin slot, validating all reads.
@@ -245,6 +285,32 @@ fn model_quad_at(model_ref_index: u32, quad_index: u32, metadata_index: u32) -> 
     let template_id = geometry_streams[ref_word + 1u];
     let lighting_base_index = geometry_streams[ref_word + 2u];
     let visible_quad_mask = geometry_streams[ref_word + 3u];
+    return model_quad_from_parts(
+        packed_transform,
+        template_id,
+        lighting_base_index,
+        visible_quad_mask,
+        quad_index,
+        metadata_index,
+        vec4<u32>(0u),
+        0u,
+    );
+}
+
+fn model_quad_from_parts(
+    packed_transform: u32,
+    template_id: u32,
+    lighting_base_index: u32,
+    visible_quad_mask: u32,
+    quad_index: u32,
+    metadata_index: u32,
+    compat_light: vec4<u32>,
+    compat: u32,
+) -> ModelQuad {
+    let geometry_word_count = arrayLength(&geometry_streams);
+    if (quad_index >= 32u) {
+        return invalid_model_quad();
+    }
     let template_word_count = model_templates_length();
     if (template_word_count < 4u) {
         return invalid_model_quad();
@@ -307,6 +373,8 @@ fn model_quad_at(model_ref_index: u32, quad_index: u32, metadata_index: u32) -> 
     if (lighting_base_index >= geometry_word_count / 2u || quad_index >= geometry_word_count / 2u - lighting_base_index) {
         return invalid_model_quad();
     }
+    quad.compat_light = compat_light;
+    quad.compat = compat;
     return quad;
 }
 
@@ -373,6 +441,9 @@ fn model_corner_uv(quad: ModelQuad, material: MaterialGpu, corner: u32) -> vec2<
 
 /// Packed light sample of `corner`, laid out as `cube_light_sample` describes in `chunk.wesl`.
 fn model_light_sample(quad: ModelQuad, corner: u32) -> u32 {
+    if (quad.compat != 0u) {
+        return quad.compat_light[corner];
+    }
     let light_word = geometry_streams[(quad.lighting_base_index + quad.quad_index) * 2u + corner / 2u];
     return select(light_word & 0xffffu, light_word >> 16u, (corner & 1u) != 0u);
 }

@@ -419,6 +419,7 @@ pub(in crate::chunk) fn apply_chunk_render_queue(
             model_lighting,
             model_draw_refs,
             transparent_model_draw_refs,
+            compat_faces,
             liquid_quads,
             liquid_lighting,
         ) = pending.mesh.into_streams();
@@ -445,6 +446,7 @@ pub(in crate::chunk) fn apply_chunk_render_queue(
             model_lighting: Arc::from(model_lighting),
             model_draw_refs: Arc::from(model_draw_refs),
             transparent_model_draw_refs: Arc::from(transparent_model_draw_refs),
+            compat_faces: Arc::from(compat_faces),
             liquid_quads: Arc::from(liquid_quads),
             liquid_lighting: Arc::from(liquid_lighting),
             has_depth_liquid,

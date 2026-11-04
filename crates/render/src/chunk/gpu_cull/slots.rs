@@ -225,7 +225,10 @@ pub(in crate::chunk) fn cull_record(
     }
     if let Some(draw) = model_mdi_draw_command(allocation) {
         source.model = draw.first_instance..draw.first_instance + draw.instance_count;
-        if allocation.quad_range.is_empty() && allocation.cube_layout.is_compat_model() {
+        if allocation.quad_range.is_empty()
+            && (allocation.cube_layout.is_compat_model()
+                || allocation.cube_layout.is_compact_faces())
+        {
             source.model_solid_ends = CubeQuadLayout::SOLID_FACE_ORDER
                 .map(|face| allocation.cube_layout.solid_range(face).end);
             source.model_compat = true;

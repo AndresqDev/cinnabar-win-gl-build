@@ -112,10 +112,12 @@ impl MeshSnapshot {
             ::meshing::MeshOptions {
                 rendering: self.rendering,
                 split_tinted_faces: biome.uniform_tint_index().is_none(),
-                // The model-ref fallback needs one face per block. The cube path is free to
-                // merge identical coplanar faces greedily, which is the main vertex reduction.
-                force_single_block_faces: ::meshing::compatibility_model_faces_enabled(),
+                // The model and compact compatibility paths need one face per block. The cube
+                // path is free to merge identical coplanar faces greedily.
+                force_single_block_faces: ::meshing::compatibility_compact_faces_enabled()
+                    || ::meshing::compatibility_model_faces_enabled(),
                 compatibility_model_faces: ::meshing::compatibility_model_faces_enabled(),
+                compatibility_compact_faces: ::meshing::compatibility_compact_faces_enabled(),
                 cutout_leaves: self.java_meshing.is_some(),
                 water_filled: self.java_meshing.as_deref().unwrap_or_default(),
                 overlays: &overlays,

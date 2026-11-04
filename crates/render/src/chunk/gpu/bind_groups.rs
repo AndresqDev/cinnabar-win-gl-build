@@ -334,7 +334,9 @@ pub(in crate::chunk) fn encode_model_template_words(runtime_assets: &RuntimeAsse
         u32::try_from(runtime_assets.model_templates().len()).unwrap_or(u32::MAX);
     let base_quad_count = u32::try_from(runtime_assets.model_quads().len()).unwrap_or(u32::MAX);
     let material_count = u32::try_from(runtime_assets.materials().len()).unwrap_or(0);
-    let compat_templates = if meshing::compatibility_model_faces_enabled() {
+    let compat_templates = if meshing::compatibility_model_faces_enabled()
+        || meshing::compatibility_compact_faces_enabled()
+    {
         material_count
             .checked_mul(assets::COMPAT_CUBE_TEMPLATE_FACES)
             .unwrap_or(0)

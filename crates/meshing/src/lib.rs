@@ -52,12 +52,28 @@ pub fn compatibility_terrain_enabled() -> bool {
     })
 }
 
-/// The stable compatibility path converts terrain cube faces to model references. This is
-/// the default because it has already been validated on the legacy Intel target; the cube
-/// path remains an explicit opt-in experiment until it passes the same native validation.
+/// The full model-ref path remains available as an explicit fallback. It is selected when
+/// `CINNABAR_HEAVY_MODEL_TERRAIN` is truthy.
 #[must_use]
 pub fn compatibility_model_faces_enabled() -> bool {
-    compatibility_terrain_enabled() && !compatibility_cube_terrain_enabled()
+    compatibility_terrain_enabled()
+        && !compatibility_cube_terrain_enabled()
+        && std::env::var("CINNABAR_HEAVY_MODEL_TERRAIN").is_ok_and(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+}
+
+/// The compact compatibility path: one 12-byte compat face per exposed cube face, with no
+/// model draw-ref or model-lighting indirection. This is the default heavy terrain route;
+/// the full model-ref path can be forced with `CINNABAR_HEAVY_MODEL_TERRAIN=1`.
+#[must_use]
+pub fn compatibility_compact_faces_enabled() -> bool {
+    compatibility_terrain_enabled()
+        && !compatibility_cube_terrain_enabled()
+        && !compatibility_model_faces_enabled()
 }
 
 /// Opt-in for the lighter cube+greedy path. It is not enabled by default because the old
@@ -103,7 +119,7 @@ pub use lighting::{
 pub use liquid::{CameraMedium, LiquidLevel, sample_camera_medium};
 pub use publication::{CHUNK_PUBLICATION_ORIGIN_BYTES, chunk_publication_byte_len};
 pub use types::{
-    ChunkMesh, ChunkMeshStreamError, ChunkMeshStreams, DiagnosticGeometryCount,
+    ChunkMesh, ChunkMeshStreamError, ChunkMeshStreams, CompatFace, DiagnosticGeometryCount,
     DiagnosticGeometrySummary, Face, FaceConnectivity, LIGHT_SAMPLE_SHADE_FACE_SHIFT,
     MAX_DIAGNOSTIC_IDENTITIES_PER_MESH, MODEL_REF_FLAG_RANDOM_OFFSET, Neighbourhood,
     PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,

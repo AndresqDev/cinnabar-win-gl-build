@@ -11,8 +11,9 @@ use bevy::{
     },
 };
 use meshing::{
-    ChunkBiomeTintIdentity, ChunkMesh, CubeQuadLayout, Face, PackedBiomeRecord, PackedLiquidQuad,
-    PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting, chunk_publication_byte_len,
+    ChunkBiomeTintIdentity, ChunkMesh, CompatFace, CubeQuadLayout, Face, PackedBiomeRecord,
+    PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
+    chunk_publication_byte_len,
 };
 use render_api::{PublicationPermit, PublicationPermitStage, PublicationServiceConfig};
 use render_model::{

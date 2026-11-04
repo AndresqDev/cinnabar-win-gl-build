@@ -1,10 +1,67 @@
 //! Heavy compatibility conversion from the cube stream to synthetic model faces.
 
 use crate::{
-    PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting, SIDE,
+    CompatFace, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting, SIDE,
     contributors::pack_model_transform,
 };
 use assets::{COMPAT_CUBE_TEMPLATE_FACES, Material, compat_cube_template_id};
+
+/// Packs every one-block compatibility face into the compact 12-byte stream. The whole
+/// conversion is validated before mutating `out`, so a failure leaves the cube fallback intact.
+pub(crate) fn append_compact_faces(
+    cube_quads: &[PackedQuad],
+    cube_lighting: &[PackedQuadLighting],
+    materials: &[Material],
+    template_base: u32,
+    out: &mut Vec<CompatFace>,
+) -> bool {
+    if cube_quads.len() != cube_lighting.len() {
+        return false;
+    }
+    let Some(material_count) = u32::try_from(materials.len()).ok() else {
+        return false;
+    };
+    let Some(template_end) = material_count
+        .checked_mul(COMPAT_CUBE_TEMPLATE_FACES)
+        .and_then(|count| template_base.checked_add(count))
+    else {
+        return false;
+    };
+    if template_end > u32::from(u16::MAX) + 1 {
+        return false;
+    }
+    if cube_quads.iter().any(|quad| {
+        quad.width() != 1
+            || quad.height() != 1
+            || quad
+                .origin()
+                .iter()
+                .any(|coordinate| *coordinate >= SIDE as u8)
+            || materials.get(quad.material_id() as usize).is_none()
+    }) {
+        return false;
+    }
+
+    let mut next = Vec::with_capacity(out.len() + cube_quads.len());
+    next.extend_from_slice(out);
+    for (quad, lighting) in cube_quads.iter().zip(cube_lighting) {
+        let template_id = compat_cube_template_id(
+            template_base,
+            quad.material_id(),
+            quad.face().index() as u32,
+        );
+        let Ok(template_id) = u16::try_from(template_id) else {
+            return false;
+        };
+        next.push(CompatFace::new(
+            quad.origin(),
+            template_id,
+            lighting.samples(),
+        ));
+    }
+    *out = next;
+    true
+}
 
 /// Appends one synthetic model reference per one-block cube face.
 ///

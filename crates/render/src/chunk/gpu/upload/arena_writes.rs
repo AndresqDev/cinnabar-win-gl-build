@@ -16,6 +16,7 @@ enum Part {
     ModelLighting,
     ModelDraw,
     TransparentModelDraw,
+    CompatFaces,
     Liquid,
     LiquidLighting,
     CubeLighting,
@@ -33,6 +34,7 @@ impl Part {
             | Self::ModelLighting
             | Self::ModelDraw
             | Self::TransparentModelDraw
+            | Self::CompatFaces
             | Self::Liquid
             | Self::LiquidLighting
             | Self::CubeLighting => (ArenaStream::GeometryStreams, GEOMETRY_STREAM_WORD_BYTES),
@@ -106,6 +108,11 @@ impl ArenaWrites {
             Part::ModelLighting,
             plan.model_lighting_start,
             Payload::Lighting(Arc::clone(&instance.model_lighting)),
+        );
+        self.encode(
+            Part::CompatFaces,
+            plan.compat_faces_start,
+            instance.compat_faces.iter().map(|face| (*face).words()),
         );
         for (part, start, records) in [
             (

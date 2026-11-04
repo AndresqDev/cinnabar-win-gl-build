@@ -14,6 +14,7 @@ pub struct ChunkRenderInstance {
     pub model_lighting: Arc<[PackedQuadLighting]>,
     pub model_draw_refs: Arc<[PackedModelDrawRef]>,
     pub transparent_model_draw_refs: Arc<[PackedModelDrawRef]>,
+    pub compat_faces: Arc<[CompatFace]>,
     pub liquid_quads: Arc<[PackedLiquidQuad]>,
     pub liquid_lighting: Arc<[PackedQuadLighting]>,
     pub has_depth_liquid: bool,
@@ -39,14 +40,24 @@ impl ChunkRenderInstance {
         self.biome = biome;
         self.tint_identity = tint_identity;
         self.cube_layout = mesh.cube_layout();
-        let (cubes, cube_light, models, model_light, draws, transparent, liquids, liquid_light) =
-            mesh.into_streams();
+        let (
+            cubes,
+            cube_light,
+            models,
+            model_light,
+            draws,
+            transparent,
+            compat_faces,
+            liquids,
+            liquid_light,
+        ) = mesh.into_streams();
         self.cube_quads = cubes.into();
         self.cube_lighting = cube_light.into();
         self.model_refs = models.into();
         self.model_lighting = model_light.into();
         self.model_draw_refs = draws.into();
         self.transparent_model_draw_refs = transparent.into();
+        self.compat_faces = compat_faces.into();
         self.depth_liquid_start = liquids
             .iter()
             .position(|quad| quad.is_depth_writing())
@@ -100,6 +111,11 @@ impl ChunkRenderInstance {
     #[must_use]
     pub fn transparent_model_draw_refs(&self) -> &[PackedModelDrawRef] {
         &self.transparent_model_draw_refs
+    }
+
+    #[must_use]
+    pub fn compat_faces(&self) -> &[CompatFace] {
+        &self.compat_faces
     }
 
     #[must_use]

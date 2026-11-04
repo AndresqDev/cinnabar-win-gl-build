@@ -104,6 +104,7 @@ fn instance_stream_counts(instance: &ChunkRenderInstance) -> Option<GeometryStre
         model_lighting: instance.model_lighting.len().try_into().ok()?,
         model_draw: instance.model_draw_refs.len().try_into().ok()?,
         transparent_model_draw: instance.transparent_model_draw_refs.len().try_into().ok()?,
+        compat_faces: instance.compat_faces.len().try_into().ok()?,
         liquid: instance.liquid_quads.len().try_into().ok()?,
         liquid_lighting: instance.liquid_lighting.len().try_into().ok()?,
     })

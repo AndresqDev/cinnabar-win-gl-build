@@ -234,6 +234,51 @@ impl PackedModelRef {
     }
 }
 
+/// One compatibility face with an inline quad lighting record.
+///
+/// This is the compact form used when the whole chunk is terrain compatibility geometry.
+/// The header stores a 12-bit block position and a 16-bit absolute synthetic template id.
+/// The two following words carry the four corner light/AO samples. There is no draw-ref,
+/// visible-mask or lighting-base indirection.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct CompatFace {
+    header: u32,
+    light: [u16; 4],
+}
+
+impl CompatFace {
+    /// Builds a compact face from a unit block origin, its synthetic template and light samples.
+    #[must_use]
+    pub const fn new(origin: [u8; 3], template_id: u16, light: [u16; 4]) -> Self {
+        let position =
+            (origin[0] as u32 & 0xf) | ((origin[1] as u32 & 0xf) << 4) | ((origin[2] as u32 & 0xf) << 8);
+        Self {
+            header: position | ((template_id as u32) << 12),
+            light,
+        }
+    }
+
+    /// Three u32 words, in the same order the GPU stream consumes them.
+    #[must_use]
+    pub const fn words(self) -> [u32; 3] {
+        [
+            self.header,
+            self.light[0] as u32 | ((self.light[1] as u32) << 16),
+            self.light[2] as u32 | ((self.light[3] as u32) << 16),
+        ]
+    }
+
+    /// The four corner light/AO samples.
+    #[must_use]
+    pub const fn light_samples(self) -> [u16; 4] {
+        self.light
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<CompatFace>() == 12);
+const _: () = assert!(std::mem::align_of::<CompatFace>() == 4);
+
 /// One exact visible-quad draw indirection into the packed model-ref stream.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -693,6 +738,7 @@ pub struct ChunkMesh {
     pub(crate) model_refs: Box<[PackedModelRef]>,
     pub(crate) model_lighting: Box<[PackedQuadLighting]>,
     pub(crate) model_draw_refs: Box<ModelDrawRefs>,
+    pub(crate) compat_faces: Box<[CompatFace]>,
     pub(crate) liquid_quads: Box<[PackedLiquidQuad]>,
     pub(crate) liquid_lighting: Box<[PackedQuadLighting]>,
     pub(crate) connectivity: FaceConnectivity,
@@ -720,6 +766,7 @@ pub type ChunkMeshStreams = (
     Box<[PackedQuadLighting]>,
     Box<[PackedModelDrawRef]>,
     Box<[PackedModelDrawRef]>,
+    Box<[CompatFace]>,
     Box<[PackedLiquidQuad]>,
     Box<[PackedQuadLighting]>,
 );
@@ -803,6 +850,7 @@ impl ChunkMesh {
                 opaque: model_draw_refs.into_boxed_slice(),
                 transparent: Box::new([]),
             }),
+            compat_faces: Box::default(),
             liquid_quads: liquid_quads.into_boxed_slice(),
             liquid_lighting: liquid_lighting.into_boxed_slice(),
             connectivity,
@@ -851,6 +899,11 @@ impl ChunkMesh {
     }
 
     #[must_use]
+    pub fn compat_faces(&self) -> &[CompatFace] {
+        &self.compat_faces
+    }
+
+    #[must_use]
     pub fn with_transparent_model_draw_refs(mut self, draw_refs: Vec<PackedModelDrawRef>) -> Self {
         self.model_draw_refs.transparent = draw_refs.into_boxed_slice();
         self
@@ -879,6 +932,7 @@ impl ChunkMesh {
             && self.model_lighting.is_empty()
             && self.model_draw_refs.opaque.is_empty()
             && self.model_draw_refs.transparent.is_empty()
+            && self.compat_faces.is_empty()
             && self.liquid_quads.is_empty()
             && self.liquid_lighting.is_empty()
     }
@@ -916,6 +970,7 @@ impl ChunkMesh {
             self.model_lighting,
             opaque,
             transparent,
+            self.compat_faces,
             self.liquid_quads,
             self.liquid_lighting,
         )

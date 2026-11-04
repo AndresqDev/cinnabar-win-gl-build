@@ -17,6 +17,7 @@ pub struct MeshOutputBounds {
     model_templates: Box<[u64]>,
     fallback_model: u64,
     compatibility_cube: u64,
+    compatibility_compact: u64,
 }
 
 impl MeshOutputBounds {
@@ -65,6 +66,11 @@ impl MeshOutputBounds {
             } else {
                 0
             },
+            compatibility_compact: if crate::compatibility_compact_faces_enabled() {
+                compatibility_compact_bound()
+            } else {
+                0
+            },
         }
     }
 
@@ -99,10 +105,12 @@ impl MeshOutputBounds {
         // overstates every heavy chunk and reduces mesh-worker concurrency. The replacement
         // bound below is the larger of the two and therefore still covers a conversion that
         // has to fall back to cubes.
-        let terrain = if self.compatibility_cube == 0 {
-            plain_bound()
-        } else {
+        let terrain = if self.compatibility_compact != 0 {
+            plain_bound() - plain_cube_bound() + self.compatibility_compact
+        } else if self.compatibility_cube != 0 {
             plain_bound() - plain_cube_bound() + self.compatibility_cube
+        } else {
+            plain_bound()
         };
         terrain + BLOCKS_PER_SUB_CHUNK as u64 * MAX_SELECTED_MODEL_TEMPLATES as u64 * model_bytes
     }
@@ -127,6 +135,7 @@ pub fn mesh_output_byte_len(mesh: &ChunkMesh, biome: &PackedBiomeRecord) -> u64 
         + bytes::<PackedModelDrawRef>(
             (mesh.model_draw_refs().len() + mesh.transparent_model_draw_refs().len()) as u64,
         )
+        + bytes::<crate::CompatFace>(mesh.compat_faces().len() as u64)
         + bytes::<PackedLiquidQuad>(mesh.liquid_quads().len() as u64)
         + bytes::<PackedQuadLighting>(mesh.liquid_lighting().len() as u64)
         + bytes::<DiagnosticGeometryCount>(mesh.diagnostic_geometry().entries().len() as u64)
@@ -153,6 +162,17 @@ fn compatibility_cube_bound() -> u64 {
         * (bytes::<PackedModelRef>(1)
             + bytes::<PackedQuadLighting>(1)
             + bytes::<PackedModelDrawRef>(1))
+}
+
+/// One compact compatibility face: header plus four inline light samples. Keep the
+/// reservation at least as large as the cube fallback, because conversion can abort
+/// transactionally and leave the cube stream in place.
+fn compatibility_compact_bound() -> u64 {
+    let compact = u64::from(
+        u32::try_from(std::mem::size_of::<crate::CompatFace>()).unwrap_or(u32::MAX),
+    );
+    let cube = bytes::<PackedQuad>(1) + bytes::<PackedQuadLighting>(1);
+    BLOCKS_PER_SUB_CHUNK as u64 * Face::ALL.len() as u64 * compact.max(cube)
 }
 
 /// The cube-quad and cube-lighting portion of [`plain_bound`]. A heavy chunk

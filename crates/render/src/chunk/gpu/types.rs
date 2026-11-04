@@ -16,6 +16,7 @@ pub(in crate::chunk) struct GpuChunkAllocation {
     pub(in crate::chunk) model_lighting_range: Option<Range<u32>>,
     pub(in crate::chunk) model_draw_range: Option<Range<u32>>,
     pub(in crate::chunk) transparent_model_draw_range: Option<Range<u32>>,
+    pub(in crate::chunk) compat_faces_range: Option<Range<u32>>,
     pub(in crate::chunk) liquid_range: Option<Range<u32>>,
     pub(in crate::chunk) liquid_lighting_range: Option<Range<u32>>,
     pub(in crate::chunk) has_depth_liquid: bool,
@@ -35,6 +36,7 @@ pub(in crate::chunk) struct StreamAddresses {
     pub(in crate::chunk) model_lighting: Option<Range<u32>>,
     pub(in crate::chunk) model_draw: Option<Range<u32>>,
     pub(in crate::chunk) transparent_model_draw: Option<Range<u32>>,
+    pub(in crate::chunk) compat_faces: Option<Range<u32>>,
     pub(in crate::chunk) liquid: Option<Range<u32>>,
     pub(in crate::chunk) liquid_lighting: Option<Range<u32>>,
 }
@@ -49,6 +51,7 @@ pub(in crate::chunk) fn direct_stream_addresses(
         model_lighting: allocation.model_lighting_range.clone(),
         model_draw: allocation.model_draw_range.clone(),
         transparent_model_draw: allocation.transparent_model_draw_range.clone(),
+        compat_faces: allocation.compat_faces_range.clone(),
         liquid: allocation.liquid_range.clone(),
         liquid_lighting: allocation.liquid_lighting_range.clone(),
     }
@@ -112,6 +115,7 @@ pub(in crate::chunk) fn shared_stream_ranges_disjoint(addresses: &StreamAddresse
         addresses.model_lighting.as_ref(),
         addresses.model_draw.as_ref(),
         addresses.transparent_model_draw.as_ref(),
+        addresses.compat_faces.as_ref(),
         addresses.liquid.as_ref(),
         addresses.liquid_lighting.as_ref(),
         addresses.cube_lighting.as_ref(),
@@ -427,15 +431,46 @@ pub(in crate::chunk) fn model_draw_command(
     })
 }
 
+pub(in crate::chunk) fn compat_model_draw_command(
+    allocation: &GpuChunkAllocation,
+) -> Option<DrawIndexedIndirectArgs> {
+    let faces = allocation.compat_faces_range.as_ref()?;
+    let words_per_face =
+        (std::mem::size_of::<meshing::CompatFace>() as u32) / GEOMETRY_STREAM_WORD_BYTES as u32;
+    let word_count = faces.end.checked_sub(faces.start)?;
+    if word_count == 0 || !word_count.is_multiple_of(words_per_face) {
+        return None;
+    }
+    let instance_count = word_count.checked_div(words_per_face)?;
+    (instance_count != 0).then_some(DrawIndexedIndirectArgs {
+        index_count: MODEL_INDEX_COUNT,
+        instance_count,
+        first_index: 0,
+        base_vertex: allocation
+            .metadata_index
+            .checked_mul(4)
+            .and_then(|value| i32::try_from(value).ok())?,
+        // Compact draws use chunk-local face ordinals; model.wesl takes the absolute word
+        // base from ChunkOrigin.stream_bases.x.
+        first_instance: 0,
+    })
+}
+
 pub(in crate::chunk) fn model_direct_draw_command(
     allocation: &GpuChunkAllocation,
 ) -> Option<DrawIndexedIndirectArgs> {
+    if allocation.cube_layout.is_compact_faces() {
+        return compat_model_draw_command(allocation);
+    }
     model_draw_command(allocation, direct_stream_addresses(allocation))
 }
 
 pub(in crate::chunk) fn model_mdi_draw_command(
     allocation: &GpuChunkAllocation,
 ) -> Option<DrawIndexedIndirectArgs> {
+    if allocation.cube_layout.is_compact_faces() {
+        return compat_model_draw_command(allocation);
+    }
     model_draw_command(allocation, mdi_stream_addresses(allocation))
 }
 
@@ -584,6 +619,7 @@ pub(in crate::chunk) fn gpu_chunk_origin(
     cube_lighting_word_start: u32,
     liquid_word_start: u32,
     liquid_lighting_word_start: u32,
+    compat_word_start: Option<u32>,
 ) -> Option<GpuChunkOrigin> {
     if !cube_lighting_word_start.is_multiple_of(2)
         || !liquid_word_start.is_multiple_of(4)
@@ -591,6 +627,13 @@ pub(in crate::chunk) fn gpu_chunk_origin(
     {
         return None;
     }
+    let cube_base = if let Some(compat) = compat_word_start {
+        // The high bit tells model.wesl to decode compact compatibility faces from this
+        // word base instead of reading a PackedModelDrawRef.
+        0x8000_0000 | compat
+    } else {
+        cube_quad_base
+    };
     Some(GpuChunkOrigin {
         value: [
             origin[0],
@@ -599,7 +642,7 @@ pub(in crate::chunk) fn gpu_chunk_origin(
             i32::try_from(biome_start).ok()?,
         ],
         stream_bases: [
-            cube_quad_base,
+            cube_base,
             cube_lighting_word_start / 2,
             liquid_word_start / 4,
             liquid_lighting_word_start / 2,
@@ -667,6 +710,7 @@ pub(in crate::chunk) struct ArenaAllocation {
     pub(in crate::chunk) model_lighting_range: Option<Range<u32>>,
     pub(in crate::chunk) model_draw_range: Option<Range<u32>>,
     pub(in crate::chunk) transparent_model_draw_range: Option<Range<u32>>,
+    pub(in crate::chunk) compat_faces_range: Option<Range<u32>>,
     pub(in crate::chunk) liquid_range: Option<Range<u32>>,
     pub(in crate::chunk) liquid_lighting_range: Option<Range<u32>>,
     pub(in crate::chunk) quad_capacity: u32,
@@ -774,6 +818,7 @@ impl ArenaAllocation {
             || self.model_lighting_range.is_some()
             || self.model_draw_range.is_some()
             || self.transparent_model_draw_range.is_some()
+            || self.compat_faces_range.is_some()
         {
             mask = mask | ChunkStreamMask::MODEL;
         }

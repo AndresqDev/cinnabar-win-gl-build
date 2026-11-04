@@ -99,6 +99,8 @@ pub struct CubeQuadLayout {
     /// stream is empty. The renderer may then apply the same facing-run culling to model
     /// draw references.
     compat_model: bool,
+    /// True when the layout belongs to the compact 12-byte compatibility face stream.
+    compact_faces: bool,
 }
 
 impl CubeQuadLayout {
@@ -122,6 +124,7 @@ impl CubeQuadLayout {
                 end
             }),
             compat_model: false,
+            compact_faces: false,
         }
     }
 
@@ -132,10 +135,23 @@ impl CubeQuadLayout {
         self
     }
 
+    /// Marks this layout as the face partition of the compact compatibility stream.
+    #[must_use]
+    pub const fn with_compact_faces(mut self) -> Self {
+        self.compact_faces = true;
+        self
+    }
+
     /// Whether the solid face partition belongs to a compatibility model stream.
     #[must_use]
     pub const fn is_compat_model(self) -> bool {
         self.compat_model
+    }
+
+    /// Whether the solid face partition belongs to the compact compatibility stream.
+    #[must_use]
+    pub const fn is_compact_faces(self) -> bool {
+        self.compact_faces
     }
 
     #[must_use]
@@ -174,7 +190,7 @@ impl CubeQuadLayout {
     /// This layout when `quads` honour it under `materials`, otherwise the all-two-sided default.
     #[must_use]
     pub fn checked(self, quads: &[PackedQuad], materials: &[Material]) -> Self {
-        if self.compat_model {
+        if self.compat_model || self.compact_faces {
             return self;
         }
         let honoured = quads.len() >= self.solid_len() as usize

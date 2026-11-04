@@ -11,6 +11,7 @@ pub(in crate::chunk) struct GeometryStreamCounts {
     pub(in crate::chunk) model_lighting: u32,
     pub(in crate::chunk) model_draw: u32,
     pub(in crate::chunk) transparent_model_draw: u32,
+    pub(in crate::chunk) compat_faces: u32,
     pub(in crate::chunk) liquid: u32,
     pub(in crate::chunk) liquid_lighting: u32,
 }
@@ -24,6 +25,7 @@ pub(in crate::chunk) struct GeometryStreamLayout {
     pub(in crate::chunk) model_lighting_offset: u32,
     pub(in crate::chunk) model_draw_offset: u32,
     pub(in crate::chunk) transparent_model_draw_offset: u32,
+    pub(in crate::chunk) compat_faces_offset: u32,
     pub(in crate::chunk) liquid_offset: u32,
     pub(in crate::chunk) liquid_lighting_offset: u32,
     pub(in crate::chunk) cube_lighting_offset: u32,
@@ -50,9 +52,17 @@ impl GeometryStreamCounts {
             .checked_add(self.transparent_model_draw.checked_mul(
                 (PACKED_MODEL_DRAW_REF_BYTES / GEOMETRY_STREAM_WORD_BYTES) as u32,
             )?)?;
+        // Compact draws address their faces locally: the origin carries the word base and
+        // the draw's instance index is the face ordinal. No stream-relative alignment is needed.
+        let compat_faces_offset = transparent_model_draw_end;
+        let compat_faces_end = compat_faces_offset.checked_add(
+            self.compat_faces
+                .checked_mul((std::mem::size_of::<meshing::CompatFace>() as u32)
+                    / GEOMETRY_STREAM_WORD_BYTES as u32)?,
+        )?;
         // Aligned even without liquid: every origin record derives a liquid record base from it.
         let liquid_offset =
-            checked_align_up(transparent_model_draw_end, SHARED_GEOMETRY_ALIGNMENT_WORDS)?;
+            checked_align_up(compat_faces_end, SHARED_GEOMETRY_ALIGNMENT_WORDS)?;
         let liquid_lighting_offset =
             liquid_offset
                 .checked_add(self.liquid.checked_mul(
@@ -71,6 +81,7 @@ impl GeometryStreamCounts {
             model_lighting_offset,
             model_draw_offset,
             transparent_model_draw_offset,
+            compat_faces_offset,
             liquid_offset,
             liquid_lighting_offset,
             cube_lighting_offset,

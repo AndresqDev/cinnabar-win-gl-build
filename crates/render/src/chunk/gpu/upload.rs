@@ -317,6 +317,10 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             );
             continue;
         };
+        let Ok(compat_faces_required) = u32::try_from(instance.compat_faces.len()) else {
+            bevy::log::error!("sub-chunk compat-face stream exceeds the u32 instance range");
+            continue;
+        };
         let Ok(liquid_required) = u32::try_from(instance.liquid_quads.len()) else {
             bevy::log::error!("sub-chunk liquid stream exceeds the u32 instance range");
             continue;
@@ -367,6 +371,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             model_lighting: model_lighting_required,
             model_draw: model_draw_required,
             transparent_model_draw: transparent_model_draw_required,
+            compat_faces: compat_faces_required,
             liquid: liquid_required,
             liquid_lighting: liquid_lighting_required,
         };
@@ -534,6 +539,11 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             transparent_model_draw_required
                 * (PACKED_MODEL_DRAW_REF_BYTES / GEOMETRY_STREAM_WORD_BYTES) as u32,
         );
+        let compat_faces_range = checked_geometry_range(
+            plan.compat_faces_start,
+            compat_faces_required * (std::mem::size_of::<meshing::CompatFace>() as u32)
+                / GEOMETRY_STREAM_WORD_BYTES as u32,
+        );
         let liquid_range = checked_geometry_range(
             plan.liquid_start,
             liquid_required * (PACKED_LIQUID_QUAD_BYTES / GEOMETRY_STREAM_WORD_BYTES) as u32,
@@ -559,6 +569,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             plan.cube_lighting_start,
             plan.liquid_start,
             plan.liquid_lighting_start,
+            (compat_faces_required != 0).then_some(plan.compat_faces_start),
         )
         .expect("aligned arena layout and bounded biome offset produce a valid origin record");
         writes.collect_chunk(instance, &plan, metadata_index, biome_words, origin);
@@ -588,6 +599,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
             model_lighting_range,
             model_draw_range,
             transparent_model_draw_range,
+            compat_faces_range,
             liquid_range,
             liquid_lighting_range,
             has_depth_liquid: instance.has_depth_liquid,
@@ -613,6 +625,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
                 model_lighting_range: gpu.model_lighting_range.clone(),
                 model_draw_range: gpu.model_draw_range.clone(),
                 transparent_model_draw_range: gpu.transparent_model_draw_range.clone(),
+                compat_faces_range: gpu.compat_faces_range.clone(),
                 liquid_range: gpu.liquid_range.clone(),
                 liquid_lighting_range: gpu.liquid_lighting_range.clone(),
                 quad_capacity: plan.quad_capacity,
@@ -625,6 +638,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
                         model_lighting: model_lighting_required,
                         model_draw: model_draw_required,
                         transparent_model_draw: transparent_model_draw_required,
+                        compat_faces: compat_faces_required,
                         liquid: liquid_required,
                         liquid_lighting: liquid_lighting_required,
                     }
@@ -737,6 +751,10 @@ pub(in crate::chunk) fn chunk_instance_upload_byte_len(instance: &ChunkRenderIns
         .saturating_add(buffer_byte_len(
             instance.transparent_model_draw_refs.len(),
             PACKED_MODEL_DRAW_REF_BYTES,
+        ))
+        .saturating_add(buffer_byte_len(
+            instance.compat_faces.len(),
+            std::mem::size_of::<meshing::CompatFace>() as u64,
         ))
         .saturating_add(buffer_byte_len(
             instance.liquid_quads.len(),

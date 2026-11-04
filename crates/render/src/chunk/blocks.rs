@@ -252,6 +252,7 @@ fn instances(mesh: &BlockMesh) -> Vec<ChunkRenderInstance> {
                 model_lighting: Arc::from([]),
                 model_draw_refs: Arc::from([]),
                 transparent_model_draw_refs: Arc::from([]),
+                compat_faces: Arc::from([]),
                 liquid_quads: Arc::from([]),
                 liquid_lighting: Arc::from([]),
                 has_depth_liquid: false,

@@ -81,7 +81,7 @@ use render_model::{
 };
 use {
     crate::{
-        PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
+        CompatFace, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
         atmosphere_render::{AtmosphereGpu, install_atmosphere},
     },
     render_scene::{
