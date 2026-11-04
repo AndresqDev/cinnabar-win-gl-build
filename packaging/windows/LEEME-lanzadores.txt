@@ -1,4 +1,4 @@
-Cinnabar DX11 a617018 - lanzadores por modo
+Cinnabar DX11 9361a75 - lanzadores por modo
 ============================================
 
 Extrae estos archivos en la misma carpeta que cinnabar.exe.
@@ -28,6 +28,7 @@ Modo pesado:
   - terreno convertido a referencias de modelo;
   - mismo camino de muestreo que las escaleras;
   - UV locales, sin greedy y sin mipmaps;
+  - cota estricta de radio en DX11, sin activar la carga progresiva de ANGLE;
   - es el modo que se probo en Proton.
 
 Modo normal:
