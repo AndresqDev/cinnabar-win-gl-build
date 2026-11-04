@@ -99,7 +99,8 @@ jobs:
           Copy-Item (Join-Path $dir "LICENSE") (Join-Path $out "Electron-LICENSE.txt") -Force
           Copy-Item (Join-Path $dir "LICENSES.chromium.html") `
             (Join-Path $out "THIRD_PARTY_LICENSES.chromium.html") -Force
-          Copy-Item "packaging/windows/run-dx11.bat" $out -Force
+          Copy-Item "packaging/windows/*.bat" $out -Force
+          Copy-Item "packaging/windows/LEEME-lanzadores.txt" $out -Force
 
           Get-ChildItem $out | Format-Table Name, Length
 

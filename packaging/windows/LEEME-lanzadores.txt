@@ -1,0 +1,48 @@
+Cinnabar DX11 c8c7ed7 - lanzadores por modo
+============================================
+
+Extrae estos archivos en la misma carpeta que cinnabar.exe.
+No los pongas en una subcarpeta.
+
+Archivos:
+
+  _assets.bat          Ruta del pack de assets compilado.
+  run-heavy.bat        Modo pesado, sin trazas.
+  run-heavy-traces.bat Modo pesado, con trazas.
+  run-normal.bat       Modo normal, sin trazas.
+  run-normal-traces.bat Modo normal, con trazas.
+
+Antes de empezar:
+
+  Abre _assets.bat con Notepad y revisa CINNABAR_ASSETS.
+  Por defecto usa:
+
+    %LOCALAPPDATA%\Cinnabar\assets\compiled\vanilla-v2225.mcbea
+
+  Si tu archivo .mcbea esta en otro sitio, cambia esa linea.
+
+Modo pesado:
+
+  - terreno convertido a referencias de modelo;
+  - mismo camino de muestreo que las escaleras;
+  - UV locales, sin greedy y sin mipmaps;
+  - es el modo que se probo en Proton.
+
+Modo normal:
+
+  - desactiva CINNABAR_HEAVY_TERRAIN y CINNABAR_STABLE_TERRAIN;
+  - usa el camino anterior de cubos;
+  - sirve para comparar.
+
+Trazas:
+
+  - se guardan en:
+      %LOCALAPPDATA%\Cinnabar\traces\heavy
+      %LOCALAPPDATA%\Cinnabar\traces\normal
+  - no mezcles las carpetas.
+  - ademas de las trazas, envia:
+      %LOCALAPPDATA%\Cinnabar\logs\client.log
+      %LOCALAPPDATA%\Cinnabar\logs\client-*.log
+      report.json y capturas.
+
+No uses --address. Entra por el flujo normal del menu y del mundo.
