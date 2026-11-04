@@ -40,6 +40,29 @@ impl ClosedSendLog {
     }
 }
 
+/// The heavy model-face path multiplies per-chunk mesh, upload and draw work. A desktop
+/// render-distance setting that is harmless for the cube path can otherwise request thousands
+/// of model-face chunks at once on legacy Intel hardware. Keep the server/UI setting intact but
+/// cap only the radius this client actually requests. `0` disables the cap.
+fn compatibility_render_radius(configured: i32) -> i32 {
+    if !meshing::compatibility_terrain_enabled() {
+        return configured;
+    }
+    static LIMIT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        let configured_limit = std::env::var("CINNABAR_HEAVY_MAX_RENDER_DISTANCE")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(4);
+        configured_limit.clamp(0, i32::from(render_api::MAX_VIEW_RADIUS_CHUNKS))
+    });
+    if limit == 0 {
+        configured
+    } else {
+        configured.min(limit)
+    }
+}
+
 /// Sends the selected radius after joining and whenever it changes, ramping through rings while
 /// startup is still settling instead of requesting the whole target at once.
 pub(crate) fn apply_render_distance(
@@ -59,13 +82,14 @@ pub(crate) fn apply_render_distance(
         return;
     };
     let session = ui.session_id();
-    let target_radius = i32::from(
+    let configured_radius = i32::from(
         settings
             .user_settings_update()
             .1
             .video
             .render_distance_chunks,
     );
+    let target_radius = compatibility_render_radius(configured_radius);
     // Menus have no stream; checking the session before `as_mut` keeps `ClientWorld` unchanged.
     if session == 0 {
         progressive.reset();
@@ -80,10 +104,12 @@ pub(crate) fn apply_render_distance(
         closed_send_log.reset();
         return;
     };
-    // DX11 uses the original join order: request the configured radius immediately and let
-    // the stream admit the publisher view without the progressive/ANGLE cap. The progressive
-    // ramp remains available for the GL/ANGLE path below.
-    if render::gl_compat::dx11() {
+    // DX11 normally uses the original join order: request the configured radius immediately
+    // and let the stream admit the publisher view without the progressive/ANGLE cap. The
+    // heavy model-face path is the exception: its per-chunk output is much larger, so it must
+    // ramp and back off like the GL compatibility path instead of flooding a legacy GPU with
+    // the full render-distance ring at once.
+    if render::gl_compat::dx11() && !meshing::compatibility_terrain_enabled() {
         stream.set_progressive_view(false);
         stream.set_startup_priority(false);
         let radius = u8::try_from(target_radius).unwrap_or(u8::MAX);
@@ -105,7 +131,7 @@ pub(crate) fn apply_render_distance(
     // The server's publisher can describe a much larger view than this client requested. On the
     // GL compatibility path that would defeat the progressive ramp and recreate the join burst;
     // cap admission and retention to the requested radius while the ramp grows it.
-    if render::gl_compat::gl() {
+    if render::gl_compat::gl() || meshing::compatibility_terrain_enabled() {
         stream.set_progressive_view(true);
     }
 

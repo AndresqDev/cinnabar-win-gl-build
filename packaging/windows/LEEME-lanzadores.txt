@@ -20,6 +20,8 @@ Antes de empezar:
     %LOCALAPPDATA%\Cinnabar\assets\compiled\vanilla-v2225.mcbea
 
   Si tu archivo .mcbea esta en otro sitio, cambia esa linea.
+  Tambien puedes ajustar CINNABAR_HEAVY_MAX_RENDER_DISTANCE.
+  Por defecto es 4 chunks; 0 desactiva la cota.
 
 Modo pesado:
 
