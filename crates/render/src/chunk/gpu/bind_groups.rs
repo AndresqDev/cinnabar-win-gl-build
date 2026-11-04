@@ -329,10 +329,11 @@ pub(in crate::chunk) fn chunk_sampler_descriptor() -> SamplerDescriptor<'static>
     }
 }
 
-pub(in crate::chunk) fn encode_model_template_words(assets: &RuntimeAssets) -> Vec<u32> {
-    let base_template_count = u32::try_from(assets.model_templates().len()).unwrap_or(u32::MAX);
-    let base_quad_count = u32::try_from(assets.model_quads().len()).unwrap_or(u32::MAX);
-    let material_count = u32::try_from(assets.materials().len()).unwrap_or(0);
+pub(in crate::chunk) fn encode_model_template_words(runtime_assets: &RuntimeAssets) -> Vec<u32> {
+    let base_template_count =
+        u32::try_from(runtime_assets.model_templates().len()).unwrap_or(u32::MAX);
+    let base_quad_count = u32::try_from(runtime_assets.model_quads().len()).unwrap_or(u32::MAX);
+    let material_count = u32::try_from(runtime_assets.materials().len()).unwrap_or(0);
     let compat_templates = if meshing::compatibility_terrain_enabled() {
         material_count
             .checked_mul(assets::COMPAT_CUBE_TEMPLATE_FACES)
@@ -345,7 +346,7 @@ pub(in crate::chunk) fn encode_model_template_words(assets: &RuntimeAssets) -> V
     let mut words =
         Vec::with_capacity((1 + template_count as usize).saturating_add(quad_count as usize * 12));
     words.push(template_count);
-    for template in assets.model_templates() {
+    for template in runtime_assets.model_templates() {
         words.extend([template.quad_start, template.quad_count, template.flags]);
     }
     for material in 0..compat_templates / assets::COMPAT_CUBE_TEMPLATE_FACES {
@@ -360,11 +361,11 @@ pub(in crate::chunk) fn encode_model_template_words(assets: &RuntimeAssets) -> V
             words.extend([quad_start, 1, 0]);
         }
     }
-    for quad in assets.model_quads() {
+    for quad in runtime_assets.model_quads() {
         push_compat_model_quad(&mut words, *quad);
     }
     for material in 0..compat_templates / assets::COMPAT_CUBE_TEMPLATE_FACES {
-        let two_sided = assets
+        let two_sided = runtime_assets
             .materials()
             .get(material as usize)
             .is_some_and(|material| material.flags & assets::MATERIAL_FLAG_TWO_SIDED != 0);
