@@ -76,6 +76,9 @@ pub struct MeshOptions<'a> {
     /// Keeps every biome-tinted cube face one block wide. Set when the sub-chunk's biome
     /// record is mixed, so the renderer can blend its tint once per face instead of per pixel.
     pub split_tinted_faces: bool,
+    /// Emits one quad per cube face instead of merging identical runs. Diagnostic fallback
+    /// for atlas/texture-sampling stability; it deliberately gives up greedy meshing.
+    pub force_single_block_faces: bool,
     /// Draws every leaf with its cutout, two-sided material, keeping one quad per shared
     /// plane instead of opaque deep leaves. Set while a shader pack renders the world.
     pub cutout_leaves: bool,
@@ -255,6 +258,7 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
                     &mut diagnostic_geometry,
                     visuals.materials(),
                     options.split_tinted_faces,
+                    options.force_single_block_faces,
                 ),
             );
         }

@@ -259,13 +259,27 @@ pub(in crate::chunk) fn build_chunk_texture_assets(
         .assets()
         .materials()
         .iter()
-        .map(|material| MaterialGpu {
-            texture: gpu_texture_reference(assets.assets(), material.texture),
-            flags: material.flags,
-            animation: material.animation,
-            variation_start: material.variation_start,
-            variation_count: material.variation_count,
-            variation_weight: material.variation_weight,
+        .enumerate()
+        .map(|(index, material)| {
+            let texture = gpu_texture_reference(assets.assets(), material.texture);
+            render_scene::graphics_trace_line!(
+                render_scene::graphics_trace::Channel::Texture,
+                "material texture index={} page={} layer={} raw={:#010x} encoded={:#010x} flags={:#010x}",
+                index,
+                material.texture.page(),
+                material.texture.layer(),
+                material.texture.raw(),
+                texture,
+                material.flags,
+            );
+            MaterialGpu {
+                texture,
+                flags: material.flags,
+                animation: material.animation,
+                variation_start: material.variation_start,
+                variation_count: material.variation_count,
+                variation_weight: material.variation_weight,
+            }
         })
         .collect::<Vec<_>>();
     let animation_words = assets

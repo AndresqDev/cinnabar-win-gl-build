@@ -112,6 +112,7 @@ impl MeshSnapshot {
             ::meshing::MeshOptions {
                 rendering: self.rendering,
                 split_tinted_faces: biome.uniform_tint_index().is_none(),
+                force_single_block_faces: stable_terrain_requested(),
                 cutout_leaves: self.java_meshing.is_some(),
                 water_filled: self.java_meshing.as_deref().unwrap_or_default(),
                 overlays: &overlays,
@@ -131,6 +132,21 @@ impl MeshSnapshot {
 
 pub(in crate::stream) fn mesh_offset_index([x, y, z]: [i8; 3]) -> usize {
     (usize::from((x + 1) as u8) * 3 + usize::from((y + 1) as u8)) * 3 + usize::from((z + 1) as u8)
+}
+
+/// Opt-in compatibility mode for drivers that mis-sample the merged cube path.
+/// It emits one cube face per block and the renderer switches to local, non-repeating UVs.
+pub(in crate::stream) fn stable_terrain_requested() -> bool {
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var_os("CINNABAR_STABLE_TERRAIN").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    })
 }
 
 /// The owner that retains a mesh candidate until dispatch can examine it.

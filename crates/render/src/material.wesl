@@ -172,8 +172,29 @@ fn sample_terrain(page: texture_2d<f32>, image_sampler: sampler, reference: u32,
 fn sample_terrain_cube(page: texture_2d<f32>, image_sampler: sampler, reference: u32, uv: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     let dimensions = textureDimensions(page, 0);
     let scale = terrain_atlas_gradient_scale(reference, dimensions);
-    // Greedy quads expose UVs in block extents. A 2D atlas is clamped, so fold
-    // every block back into the source tile before addressing the atlas cell.
-    let local_uv = fract(uv) * texture_uv_scale(reference);
-    return textureSampleGrad(page, image_sampler, terrain_atlas_uv_local(reference, local_uv, dimensions), dx * scale, dy * scale);
+    @if(STABLE_TERRAIN) {
+        // Compatibility mode forces one quad per block and uses the same local
+        // UV contract as model.wesl. Never fold an authored block span here.
+        let local_uv = clamp(uv, vec2(0.0), vec2(1.0 - 1.0 / 16384.0))
+            * texture_uv_scale(reference);
+        return textureSampleGrad(
+            page,
+            image_sampler,
+            terrain_atlas_uv_local(reference, local_uv, dimensions),
+            dx * scale,
+            dy * scale,
+        );
+    }
+    @if(!STABLE_TERRAIN) {
+        // Greedy quads expose UVs in block extents. A 2D atlas is clamped, so fold
+        // every block back into the source tile before addressing the atlas cell.
+        let local_uv = fract(uv) * texture_uv_scale(reference);
+        return textureSampleGrad(
+            page,
+            image_sampler,
+            terrain_atlas_uv_local(reference, local_uv, dimensions),
+            dx * scale,
+            dy * scale,
+        );
+    }
 }

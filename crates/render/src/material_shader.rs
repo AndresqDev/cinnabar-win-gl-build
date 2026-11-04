@@ -73,8 +73,24 @@ pub(crate) fn chunk_atlas_views_fit(limits: &wgpu::Limits) -> bool {
         && limits.max_bindings_per_bind_group > BIOME_QUERY_TABLES_BINDING
 }
 
+/// Opt-in terrain compatibility mode for drivers that mis-sample merged cube faces.
+/// It is deliberately read once at renderer startup, together with the shader defines.
+pub(crate) fn stable_terrain_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CINNABAR_STABLE_TERRAIN").is_some_and(|value| {
+            let value = value.to_string_lossy();
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    })
+}
+
 /// Terrain samples nearest texels and interpolates only between mip levels.
 pub(crate) fn native_leaf_sampler_descriptor() -> wgpu::SamplerDescriptor<'static> {
+    let stable = stable_terrain_enabled();
     wgpu::SamplerDescriptor {
         label: Some("native terrain leaf sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -82,8 +98,16 @@ pub(crate) fn native_leaf_sampler_descriptor() -> wgpu::SamplerDescriptor<'stati
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         min_filter: wgpu::FilterMode::Nearest,
         mag_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::MipmapFilterMode::Linear,
-        lod_max_clamp: (assets::VANILLA_TERRAIN_MIP_COUNT - 1) as f32,
+        mipmap_filter: if stable {
+            wgpu::MipmapFilterMode::Nearest
+        } else {
+            wgpu::MipmapFilterMode::Linear
+        },
+        lod_max_clamp: if stable {
+            0.0
+        } else {
+            (assets::VANILLA_TERRAIN_MIP_COUNT - 1) as f32
+        },
         ..Default::default()
     }
 }

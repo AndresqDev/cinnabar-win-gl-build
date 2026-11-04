@@ -14,6 +14,8 @@ use crate::chunk::*;
 use bevy::color::ColorToPacked;
 pub(in crate::chunk) use reload::prepare_chunk_texture_assets;
 
+static BIND_GROUP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use render_scene::{
     BiomeTint, ChunkAnimationClock, ChunkBiomeTints, ChunkRenderInstance, ChunkTextureAssets,
     ChunkTextureBindingIdentity, ChunkTexturePreparation, ChunkTextureReload, TextureMipUploadPlan,
@@ -476,6 +478,15 @@ pub(in crate::chunk) fn prepare_chunk_bind_group(
     arena.bind_group = Some(bind_group);
     arena.transparent_bind_group = Some(transparent_bind_group);
     arena.bind_group_buffers = Some(buffers);
+    let generation = BIND_GROUP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    render_scene::graphics_trace_line!(
+        render_scene::graphics_trace::Channel::Texture,
+        "bind group rebuilt generation={} carrier_pointer={:#x} carrier_revision={} stable_terrain={}",
+        generation,
+        texture_assets.identity.carrier.pointer,
+        texture_assets.identity.carrier.revision,
+        crate::material_shader::stable_terrain_enabled(),
+    );
 }
 
 /// Builds the canonical terrain bindings for both world and independently placed geometry.

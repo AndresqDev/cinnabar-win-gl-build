@@ -90,6 +90,7 @@ pub(crate) struct CubeMeshOutput<'a> {
     diagnostic_geometry: &'a mut DiagnosticGeometryAccumulator,
     materials: &'a [assets::Material],
     split_tinted_faces: bool,
+    force_single_block_faces: bool,
 }
 
 impl<'a> CubeMeshOutput<'a> {
@@ -98,12 +99,14 @@ impl<'a> CubeMeshOutput<'a> {
         diagnostic_geometry: &'a mut DiagnosticGeometryAccumulator,
         materials: &'a [assets::Material],
         split_tinted_faces: bool,
+        force_single_block_faces: bool,
     ) -> Self {
         Self {
             streams,
             diagnostic_geometry,
             materials,
             split_tinted_faces,
+            force_single_block_faces,
         }
     }
 }
@@ -322,7 +325,8 @@ pub(crate) fn greedy_slice(
             let material = output.materials[material_id as usize];
             // Each isotropic face owns its block-position hash. Merging even
             // identical material/light records would repeat one block's UVs.
-            let positional = material.variation_count > 1
+            let positional = output.force_single_block_faces
+                || material.variation_count > 1
                 || material.flags & assets::MATERIAL_FLAG_ISOTROPIC != 0
                 // Native leaf faces have block-local rotations and clamped
                 // atlas edges. A merged quad would stretch/clamp its mask.

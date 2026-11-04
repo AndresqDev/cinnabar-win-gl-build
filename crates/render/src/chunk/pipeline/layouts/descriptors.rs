@@ -126,6 +126,17 @@ pub(in crate::chunk) fn build(compact: bool) -> [RenderPipelineDescriptor; 5] {
             }
         }
     }
+    if crate::material_shader::stable_terrain_enabled() {
+        // Pair the non-greedy mesher with a local-UV, LOD-zero sampling path. The flag
+        // reaches both terrain and model programs because material.wesl is composed into
+        // both, while the model UV path itself remains unchanged.
+        for descriptor in &mut descriptors {
+            descriptor.vertex.shader_defs.push("STABLE_TERRAIN".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("STABLE_TERRAIN".into());
+            }
+        }
+    }
     descriptors
 }
 

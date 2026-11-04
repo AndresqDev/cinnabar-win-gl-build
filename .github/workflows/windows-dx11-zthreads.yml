@@ -6,8 +6,6 @@ name: Windows DX11 ZThreads experimental
 
 on:
   workflow_dispatch:
-  push:
-    branches: [dx11-bevy-compat]
 
 permissions:
   contents: read
