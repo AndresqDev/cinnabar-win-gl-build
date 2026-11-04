@@ -122,6 +122,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
         .next()
         .map(|view| view.world_from_view.translation())
         .unwrap_or(Vec3::ZERO);
+    let candidate_count = candidates.len();
     let selected = plan_gpu_chunk_updates(
         candidates,
         &arena.allocations,
@@ -676,7 +677,7 @@ pub(in crate::chunk) fn prepare_gpu_chunks(
     render_scene::graphics_trace_line!(
         render_scene::graphics_trace::Channel::Chunk,
         "prepare_gpu_chunks candidates={} examined={} admitted={} deferred={} validated={} range_plans={} migrations={} growth_wait={} stats={:?}",
-        candidates.len(),
+        candidate_count,
         candidates_examined,
         successful_updates.len(),
         upload_stats.candidates_deferred,
