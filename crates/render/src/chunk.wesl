@@ -656,7 +656,8 @@ fn cutout_terrain_cube(page: texture_2d<f32>, texture_ref: u32, uv: vec2<f32>, d
     let dimensions = textureDimensions(page, 0);
     let scale = terrain_atlas_gradient_scale(texture_ref, dimensions);
     @if(STABLE_TERRAIN) {
-        let local_uv = clamp(uv, vec2(0.0), vec2(1.0 - CUBE_UV_EDGE_INSET))
+        let tile_uv = uv - floor(uv);
+        let local_uv = clamp(tile_uv, vec2(0.0), vec2(1.0 - CUBE_UV_EDGE_INSET))
             * texture_uv_scale(texture_ref);
         return cutout_alpha_2d(
             page,

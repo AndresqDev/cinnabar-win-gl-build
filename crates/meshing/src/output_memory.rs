@@ -60,7 +60,7 @@ impl MeshOutputBounds {
         Self {
             model_templates: model_templates.into_boxed_slice(),
             fallback_model,
-            compatibility_cube: if crate::compatibility_terrain_enabled() {
+            compatibility_cube: if crate::compatibility_model_faces_enabled() {
                 compatibility_cube_bound()
             } else {
                 0

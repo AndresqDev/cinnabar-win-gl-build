@@ -173,9 +173,10 @@ fn sample_terrain_cube(page: texture_2d<f32>, image_sampler: sampler, reference:
     let dimensions = textureDimensions(page, 0);
     let scale = terrain_atlas_gradient_scale(reference, dimensions);
     @if(STABLE_TERRAIN) {
-        // Compatibility mode forces one quad per block and uses the same local
-        // UV contract as model.wesl. Never fold an authored block span here.
-        let local_uv = clamp(uv, vec2(0.0), vec2(1.0 - 1.0 / 16384.0))
+        // Greedy quads span several blocks. Repeat the local tile once per block and
+        // stop just inside its edge so the clamped atlas cell cannot sample a neighbour.
+        let tile_uv = uv - floor(uv);
+        let local_uv = clamp(tile_uv, vec2(0.0), vec2(1.0 - 1.0 / 16384.0))
             * texture_uv_scale(reference);
         return textureSampleGrad(
             page,

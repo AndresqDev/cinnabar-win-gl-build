@@ -140,6 +140,15 @@ impl Specializer<RenderPipeline> for ChunkPipelineSpecializer {
         } else {
             render_scene::SCENE_COLOR_FORMAT
         };
+        // The heavy compatibility path keeps one block face per quad and therefore uses the
+        // same local-UV contract as the model shader. Without this define the cube shader
+        // folds UV 1.0 back to zero and samples the wrong atlas edge.
+        if crate::material_shader::stable_terrain_enabled() {
+            descriptor.vertex.shader_defs.push("STABLE_TERRAIN".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("STABLE_TERRAIN".into());
+            }
+        }
         #[cfg(feature = "enhanced")]
         if render_model::enhanced_rendering_enabled() && key.enhanced {
             descriptor

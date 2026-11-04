@@ -52,6 +52,20 @@ pub fn compatibility_terrain_enabled() -> bool {
     })
 }
 
+/// The cube path is the default compatibility route: it keeps the native cube streams and
+/// the existing face-direction/backface culling. The model-ref conversion remains available
+/// as an explicit fallback for adapters where the cube sampler is the only broken part.
+#[must_use]
+pub fn compatibility_model_faces_enabled() -> bool {
+    compatibility_terrain_enabled()
+        && std::env::var("CINNABAR_HEAVY_MODEL_TERRAIN").is_ok_and(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+}
+
 pub use biome::{
     BIOME_NEIGHBOUR_SLOT_COUNT, BiomeBlendSample, ChunkBiomeTintIdentity,
     MAX_PACKED_BIOME_RECORD_WORDS, PackedBiomeRecord, biome_neighbour_index, biome_volume_index,

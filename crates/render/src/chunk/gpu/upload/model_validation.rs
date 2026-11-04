@@ -58,7 +58,7 @@ impl ModelValidationCache {
             assets.assets().model_templates(),
             assets.assets().model_quads(),
             assets.assets().materials(),
-            meshing::compatibility_terrain_enabled(),
+            meshing::compatibility_model_faces_enabled(),
         );
         if self.entries.len() < limit || self.entries.contains_key(&entity) {
             self.entries.insert(
