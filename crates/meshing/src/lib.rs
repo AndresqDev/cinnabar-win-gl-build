@@ -35,16 +35,20 @@ const SIDE: usize = world::SUB_CHUNK_SIDE;
 pub fn compatibility_terrain_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        ["CINNABAR_HEAVY_TERRAIN", "CINNABAR_STABLE_TERRAIN"]
+        let override_value = ["CINNABAR_HEAVY_TERRAIN", "CINNABAR_STABLE_TERRAIN"]
             .into_iter()
-            .any(|name| {
-                std::env::var_os(name).is_some_and(|value| {
-                    !matches!(
-                        value.to_string_lossy().to_ascii_lowercase().as_str(),
-                        "" | "0" | "false" | "off" | "no"
-                    )
-                })
+            .filter_map(|name| std::env::var_os(name))
+            .map(|value| {
+                !matches!(
+                    value.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off" | "no"
+                )
             })
+            .reduce(|left, right| left || right);
+        // The Windows DX11 artifact is the compatibility target. Keep other
+        // platforms opt-in so test runners and ordinary Linux builds retain the
+        // existing terrain route unless explicitly requested.
+        override_value.unwrap_or(cfg!(target_os = "windows"))
     })
 }
 
