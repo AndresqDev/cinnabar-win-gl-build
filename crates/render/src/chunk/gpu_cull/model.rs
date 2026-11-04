@@ -45,15 +45,18 @@ pub fn cull_workgroup(limits: &wgpu::Limits) -> Option<u32> {
 }
 /// Facing slots never form more than three separate solid runs.
 pub const MAX_SOLID_RUNS: u32 = 3;
+/// A compatibility model stream can emit three facing runs plus its two-sided tail.
+pub const MAX_MODEL_RUNS: u32 = 4;
 /// Words per `DrawIndexedIndirectArgs`.
 pub const ARGS_WORDS: u32 = 5;
 pub const STREAM_COUNT: usize = 4;
 pub const PHASE_COUNT: usize = 2;
-/// Draw fields follow the bits needed for the solid run count.
+/// Draw fields follow the bits needed for the solid and model run counts.
 pub const DECISION_CUTOUT_SHIFT: u32 = u32::BITS - MAX_SOLID_RUNS.leading_zeros();
 pub const DECISION_SOLID_MASK: u32 = (1 << DECISION_CUTOUT_SHIFT) - 1;
 pub const DECISION_MODEL_SHIFT: u32 = DECISION_CUTOUT_SHIFT + 1;
-pub const DECISION_LIQUID_SHIFT: u32 = DECISION_MODEL_SHIFT + 1;
+pub const DECISION_MODEL_MASK: u32 = (1 << 2) - 1;
+pub const DECISION_LIQUID_SHIFT: u32 = DECISION_MODEL_SHIFT + 2;
 /// Feedback distinguishes a frustum-visible candidate from an occluded one.
 pub const DECISION_CANDIDATE: u32 = 1 << (DECISION_LIQUID_SHIFT + 1);
 pub const DECISION_HIDDEN: u32 = DECISION_CANDIDATE << 1;
@@ -108,6 +111,7 @@ impl CullStream {
     pub const fn draws_per_record(self) -> u32 {
         match self {
             Self::Solid => MAX_SOLID_RUNS,
+            Self::Model => MAX_MODEL_RUNS,
             _ => 1,
         }
     }
@@ -181,6 +185,8 @@ pub struct CullRecord {
     solid_ends: [u32; 3],
     model_start: u32,
     model_count: u32,
+    model_solid_ends: [u32; 3],
+    model_compat: u32,
     liquid_start: u32,
     liquid_count: u32,
     live: u32,
@@ -197,6 +203,9 @@ pub struct CullRecordSource {
     /// Cumulative local solid-run ends in `CubeQuadLayout::SOLID_FACE_ORDER`.
     pub solid_ends: [u32; 6],
     pub model: Range<u32>,
+    /// Cumulative local model-draw-run ends for a pure compatibility model stream.
+    pub model_solid_ends: [u32; 6],
+    pub model_compat: bool,
     pub liquid: Range<u32>,
 }
 
@@ -206,6 +215,15 @@ impl CullRecord {
         let cube_len = source.cube.end.checked_sub(source.cube.start)?;
         let ends = source.solid_ends;
         if ends.windows(2).any(|pair| pair[0] > pair[1]) || ends[5] > cube_len || ends[5] > 0xffff {
+            return None;
+        }
+        let model_count = source.model.end.checked_sub(source.model.start)?;
+        let model_ends = source.model_solid_ends;
+        if source.model_compat
+            && (model_ends.windows(2).any(|pair| pair[0] > pair[1])
+                || model_ends[5] > model_count
+                || model_ends[5] > 0xffff)
+        {
             return None;
         }
         let pack = |bound: [i32; 3]| -> Option<u32> {
@@ -218,6 +236,8 @@ impl CullRecord {
                 })
         };
         let pairs = std::array::from_fn(|index| ends[2 * index] | (ends[2 * index + 1] << 16));
+        let model_pairs =
+            std::array::from_fn(|index| model_ends[2 * index] | (model_ends[2 * index + 1] << 16));
         let live = !source.cube.is_empty() || !source.model.is_empty() || !source.liquid.is_empty();
         Some(Self {
             origin: source.origin,
@@ -228,7 +248,9 @@ impl CullRecord {
             cube_end: source.cube.end,
             solid_ends: pairs,
             model_start: source.model.start,
-            model_count: source.model.end.checked_sub(source.model.start)?,
+            model_count,
+            model_solid_ends: model_pairs,
+            model_compat: u32::from(source.model_compat),
             liquid_start: source.liquid.start,
             liquid_count: source.liquid.end.checked_sub(source.liquid.start)?,
             live: u32::from(live),
@@ -241,6 +263,10 @@ impl CullRecord {
 
     fn solid_end(&self, slot: usize) -> u32 {
         (self.solid_ends[slot / 2] >> (16 * (slot % 2))) & 0xffff
+    }
+
+    fn model_solid_end(&self, slot: usize) -> u32 {
+        (self.model_solid_ends[slot / 2] >> (16 * (slot % 2))) & 0xffff
     }
 
     /// Most draws the kernels can emit for this record in each stream, from any eye.
@@ -258,7 +284,13 @@ impl CullRecord {
         [
             solid_slots.min(MAX_SOLID_RUNS),
             u32::from(!self.cutout().is_empty()),
-            u32::from(self.model_count != 0),
+            if self.model_count == 0 {
+                0
+            } else if self.model_compat != 0 {
+                MAX_MODEL_RUNS
+            } else {
+                1
+            },
             u32::from(self.liquid_count != 0),
         ]
     }
@@ -278,6 +310,44 @@ impl CullRecord {
                 continue;
             }
             let range = self.cube_start + start..self.cube_start + end;
+            match runs.last_mut() {
+                Some(run) if run.end == range.start => run.end = range.end,
+                _ => runs.push(range),
+            }
+        }
+        runs
+    }
+
+    /// Merged absolute model-draw runs: compatibility terrain follows camera-facing faces,
+    /// followed by every two-sided quad; carrier model streams keep one complete run.
+    pub fn model_runs(&self, facing: u8) -> Vec<Range<u32>> {
+        if self.model_count == 0 {
+            return Vec::new();
+        }
+        if self.model_compat == 0 {
+            return vec![self.model()];
+        }
+        let mut runs: Vec<Range<u32>> = Vec::new();
+        for slot in 0..6 {
+            let face = solid_slot_face(slot);
+            let start = if slot == 0 {
+                0
+            } else {
+                self.model_solid_end(slot - 1)
+            };
+            let end = self.model_solid_end(slot);
+            if facing & (1 << face) == 0 || start == end {
+                continue;
+            }
+            let range = self.model_start + start..self.model_start + end;
+            match runs.last_mut() {
+                Some(run) if run.end == range.start => run.end = range.end,
+                _ => runs.push(range),
+            }
+        }
+        let two_sided = self.model_solid_end(5);
+        if two_sided < self.model_count {
+            let range = self.model_start + two_sided..self.model_start + self.model_count;
             match runs.last_mut() {
                 Some(run) if run.end == range.start => run.end = range.end,
                 _ => runs.push(range),
@@ -496,9 +566,11 @@ pub fn reference_args(
         for run in record.solid_runs(camera.facing(record.origin)) {
             args[CullStream::Solid as usize].push(draw(CullStream::Solid, run));
         }
+        for run in record.model_runs(camera.facing(record.origin)) {
+            args[CullStream::Model as usize].push(draw(CullStream::Model, run));
+        }
         for (stream, range) in [
             (CullStream::Cutout, record.cutout()),
-            (CullStream::Model, record.model()),
             (CullStream::Liquid, record.liquid()),
         ] {
             if !range.is_empty() {

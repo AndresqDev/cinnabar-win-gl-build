@@ -95,6 +95,10 @@ pub fn is_single_sided_opaque(materials: &[Material], id: u32) -> bool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CubeQuadLayout {
     solid_ends: [u32; 6],
+    /// True when the solid layout belongs to a compatibility model stream and the cube
+    /// stream is empty. The renderer may then apply the same facing-run culling to model
+    /// draw references.
+    compat_model: bool,
 }
 
 impl CubeQuadLayout {
@@ -117,7 +121,21 @@ impl CubeQuadLayout {
                 end = end.saturating_add(counts[face as usize]);
                 end
             }),
+            compat_model: false,
         }
+    }
+
+    /// Marks this layout as the face partition of a compatibility model stream.
+    #[must_use]
+    pub const fn with_compat_model(mut self) -> Self {
+        self.compat_model = true;
+        self
+    }
+
+    /// Whether the solid face partition belongs to a compatibility model stream.
+    #[must_use]
+    pub const fn is_compat_model(self) -> bool {
+        self.compat_model
     }
 
     #[must_use]
@@ -156,6 +174,9 @@ impl CubeQuadLayout {
     /// This layout when `quads` honour it under `materials`, otherwise the all-two-sided default.
     #[must_use]
     pub fn checked(self, quads: &[PackedQuad], materials: &[Material]) -> Self {
+        if self.compat_model {
+            return self;
+        }
         let honoured = quads.len() >= self.solid_len() as usize
             && Self::SOLID_FACE_ORDER.into_iter().all(|face| {
                 let range = self.solid_range(face);

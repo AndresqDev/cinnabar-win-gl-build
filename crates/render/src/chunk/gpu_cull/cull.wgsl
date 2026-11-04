@@ -21,6 +21,7 @@ const DECISION_HIDDEN: u32 = CULL_DECISION_HIDDEN;
 const DECISION_SOLID_MASK: u32 = CULL_DECISION_SOLID_MASK;
 const DECISION_CUTOUT_SHIFT: u32 = CULL_DECISION_CUTOUT_SHIFT;
 const DECISION_MODEL_SHIFT: u32 = CULL_DECISION_MODEL_SHIFT;
+const DECISION_MODEL_MASK: u32 = CULL_DECISION_MODEL_MASK;
 const DECISION_LIQUID_SHIFT: u32 = CULL_DECISION_LIQUID_SHIFT;
 const OCCLUSION_WORDS: u32 = WORKGROUP / 32u;
 
@@ -37,6 +38,8 @@ struct CullRecord {
     solid_ends: array<u32, 3>,
     model_start: u32,
     model_count: u32,
+    model_solid_ends: array<u32, 3>,
+    model_compat: u32,
     liquid_start: u32,
     liquid_count: u32,
     live: u32,
@@ -95,6 +98,10 @@ fn load_record(index: u32) -> CullRecord {
     record.solid_ends[2] = records[index].solid_ends[2];
     record.model_start = records[index].model_start;
     record.model_count = records[index].model_count;
+    record.model_solid_ends[0] = records[index].model_solid_ends[0];
+    record.model_solid_ends[1] = records[index].model_solid_ends[1];
+    record.model_solid_ends[2] = records[index].model_solid_ends[2];
+    record.model_compat = records[index].model_compat;
     record.liquid_start = records[index].liquid_start;
     record.liquid_count = records[index].liquid_count;
     record.live = records[index].live;
@@ -290,6 +297,93 @@ fn write_args(index: u32, stream: u32, record: CullRecord, first: u32, count: u3
     }
 }
 
+fn model_solid_end(record: CullRecord, slot: u32) -> u32 {
+    return (record.model_solid_ends[slot / 2u] >> (16u * (slot % 2u))) & 0xffffu;
+}
+
+// Compatibility model streams follow the same facing runs as cube terrain, then draw their
+// two-sided tail. Carrier model streams stay one complete run.
+fn model_runs(record: CullRecord, write: bool, base: u32) -> u32 {
+    if (record.model_count == 0u) {
+        return 0u;
+    }
+    if (record.model_compat == 0u) {
+        if (write) {
+            write_args(base, 2u, record, record.model_start, record.model_count);
+        }
+        return 1u;
+    }
+    let facing = facing_mask(record_origin(record));
+    var runs = 0u;
+    var run_start = 0u;
+    var run_end = 0u;
+    var open = false;
+    for (var slot = 0u; slot < 6u; slot++) {
+        var start = 0u;
+        if (slot != 0u) {
+            start = model_solid_end(record, slot - 1u);
+        }
+        let end = model_solid_end(record, slot);
+        if ((facing & (1u << solid_slot_face(slot))) == 0u || start == end) {
+            continue;
+        }
+        if (open && run_end == start) {
+            run_end = end;
+            continue;
+        }
+        if (open) {
+            if (write) {
+                write_args(
+                    base + runs,
+                    2u,
+                    record,
+                    record.model_start + run_start,
+                    run_end - run_start,
+                );
+            }
+            runs++;
+        }
+        run_start = start;
+        run_end = end;
+        open = true;
+    }
+    let two_sided = model_solid_end(record, 5u);
+    if (two_sided < record.model_count) {
+        if (open && run_end == two_sided) {
+            run_end = record.model_count;
+        } else {
+            if (open) {
+                if (write) {
+                    write_args(
+                        base + runs,
+                        2u,
+                        record,
+                        record.model_start + run_start,
+                        run_end - run_start,
+                    );
+                }
+                runs++;
+            }
+            run_start = two_sided;
+            run_end = record.model_count;
+            open = true;
+        }
+    }
+    if (open) {
+        if (write) {
+            write_args(
+                base + runs,
+                2u,
+                record,
+                record.model_start + run_start,
+                run_end - run_start,
+            );
+        }
+        runs++;
+    }
+    return runs;
+}
+
 fn cutout_range(record: CullRecord) -> vec2<u32> {
     if (record.cube_start == record.cube_end) {
         return vec2(0u);
@@ -301,7 +395,7 @@ fn cutout_range(record: CullRecord) -> vec2<u32> {
 fn unpack_draws(draws: u32) -> vec4<u32> {
     return vec4(draws & DECISION_SOLID_MASK,
         (draws >> DECISION_CUTOUT_SHIFT) & 1u,
-        (draws >> DECISION_MODEL_SHIFT) & 1u,
+        (draws >> DECISION_MODEL_SHIFT) & DECISION_MODEL_MASK,
         (draws >> DECISION_LIQUID_SHIFT) & 1u);
 }
 
@@ -325,7 +419,7 @@ fn record_decision(slot: u32) -> u32 {
     }
     let solid = solid_runs(record, false, 0u);
     let cutout = u32(cutout_range(record).y != 0u);
-    let model = u32(record.model_count != 0u);
+    let model = model_runs(record, false, 0u);
     let liquid = u32(record.liquid_count != 0u);
     return solid | (cutout << DECISION_CUTOUT_SHIFT)
         | (model << DECISION_MODEL_SHIFT) | (liquid << DECISION_LIQUID_SHIFT) | feedback;
@@ -422,7 +516,7 @@ fn cull_emit(
         write_args(offset.y, 1u, record, cutout.x, cutout.y);
     }
     if (mine.z != 0u) {
-        write_args(offset.z, 2u, record, record.model_start, record.model_count);
+        model_runs(record, true, offset.z);
     }
     if (mine.w != 0u) {
         write_args(offset.w, 3u, record, record.liquid_start, record.liquid_count);

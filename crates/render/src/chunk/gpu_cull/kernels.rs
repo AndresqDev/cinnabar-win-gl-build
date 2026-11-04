@@ -7,9 +7,9 @@ use wgpu::util::DeviceExt;
 
 use super::model::{
     CULL_STORAGE_BINDINGS, CullPhase, CullViewUniform, DECISION_CANDIDATE, DECISION_CUTOUT_SHIFT,
-    DECISION_DRAWS, DECISION_HIDDEN, DECISION_LIQUID_SHIFT, DECISION_MODEL_SHIFT,
-    DECISION_SOLID_MASK, FRUSTUM_ABSOLUTE_SLACK, FRUSTUM_RELATIVE_SLACK, HIZ_PADDING, PHASE_COUNT,
-    PYRAMID_WORKGROUP, cull_workgroup, group_count,
+    DECISION_DRAWS, DECISION_HIDDEN, DECISION_LIQUID_SHIFT, DECISION_MODEL_MASK,
+    DECISION_MODEL_SHIFT, DECISION_SOLID_MASK, FRUSTUM_ABSOLUTE_SLACK, FRUSTUM_RELATIVE_SLACK,
+    HIZ_PADDING, PHASE_COUNT, PYRAMID_WORKGROUP, cull_workgroup, group_count,
 };
 
 const PYRAMID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
@@ -33,6 +33,10 @@ pub fn cull_shader_source(workgroup: u32) -> String {
         .replace(
             "CULL_DECISION_MODEL_SHIFT",
             &format!("{DECISION_MODEL_SHIFT}u"),
+        )
+        .replace(
+            "CULL_DECISION_MODEL_MASK",
+            &format!("{DECISION_MODEL_MASK}u"),
         )
         .replace(
             "CULL_DECISION_LIQUID_SHIFT",

@@ -542,11 +542,19 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
             )
         });
         if converted {
-            // The model stream now owns every cube face. Keep the layout empty so
-            // no stale solid/cutout range can reach the cube pipeline.
+            // The model stream now owns every cube face. Preserve the face partition so the
+            // renderer can cull compatibility model draw references by camera direction.
+            // Only pure terrain chunks are marked: chunks with carrier models or overlays
+            // must keep their complete model draw range.
+            let compatibility_only =
+                model_refs.is_empty() && transparent_model_draw_refs.is_empty();
             quads.clear();
             cube_lighting.clear();
-            layout = crate::CubeQuadLayout::default();
+            layout = if compatibility_only {
+                layout.with_compat_model()
+            } else {
+                crate::CubeQuadLayout::default()
+            };
         }
     }
     ChunkMesh {
