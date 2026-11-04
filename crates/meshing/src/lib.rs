@@ -52,13 +52,20 @@ pub fn compatibility_terrain_enabled() -> bool {
     })
 }
 
-/// The cube path is the default compatibility route: it keeps the native cube streams and
-/// the existing face-direction/backface culling. The model-ref conversion remains available
-/// as an explicit fallback for adapters where the cube sampler is the only broken part.
+/// The stable compatibility path converts terrain cube faces to model references. This is
+/// the default because it has already been validated on the legacy Intel target; the cube
+/// path remains an explicit opt-in experiment until it passes the same native validation.
 #[must_use]
 pub fn compatibility_model_faces_enabled() -> bool {
+    compatibility_terrain_enabled() && !compatibility_cube_terrain_enabled()
+}
+
+/// Opt-in for the lighter cube+greedy path. It is not enabled by default because the old
+/// stable-cube route had a shader-define regression on the legacy target.
+#[must_use]
+pub fn compatibility_cube_terrain_enabled() -> bool {
     compatibility_terrain_enabled()
-        && std::env::var("CINNABAR_HEAVY_MODEL_TERRAIN").is_ok_and(|value| {
+        && std::env::var("CINNABAR_HEAVY_CUBE_TERRAIN").is_ok_and(|value| {
             !matches!(
                 value.to_ascii_lowercase().as_str(),
                 "" | "0" | "false" | "off" | "no"

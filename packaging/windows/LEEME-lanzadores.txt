@@ -25,12 +25,12 @@ Antes de empezar:
 
 Modo pesado:
 
-  - terreno por cubos con greedy meshing y muestreo local estable;
-  - culling de caras por direccion de camara y caras traseras;
-  - UV locales por bloque, sin mipmaps y sin mezclar celdas del atlas;
+  - terreno convertido a referencias de modelo, la ruta ya validada en Intel;
+  - mismo camino de muestreo que las escaleras;
+  - UV locales, sin mipmaps y sin mezclar celdas del atlas;
   - cota estricta de radio en DX11, sin activar la carga progresiva de ANGLE;
-  - el camino de referencias de modelo queda como fallback:
-      CINNABAR_HEAVY_MODEL_TERRAIN=1
+  - experimento opcional de cubos+greedy, solo para comparar:
+      CINNABAR_HEAVY_CUBE_TERRAIN=1
 
 Modo normal:
 
