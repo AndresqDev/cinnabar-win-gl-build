@@ -162,6 +162,7 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
             model_refs: Box::new([]),
             model_lighting: Box::new([]),
             model_draw_refs: Box::default(),
+            compat_faces: Box::new([]),
             liquid_quads: Box::new([]),
             liquid_lighting: Box::new([]),
             connectivity: cave_connectivity(&facts, |_| true),
