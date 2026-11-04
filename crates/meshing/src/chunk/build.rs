@@ -536,7 +536,7 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
     let mut compat_faces = Vec::new();
     if options.compatibility_compact_faces {
         let template_base = u32::try_from(visuals.model_templates().len()).ok();
-        let converted = template_base.is_some_and(|template_base| {
+        let converted_compact = template_base.is_some_and(|template_base| {
             compatibility_only
                 && super::compatibility::append_compact_faces(
                     &quads,
@@ -546,12 +546,36 @@ fn mesh_sub_chunk_core<S: crate::lighting::MeshLightSampler + ?Sized>(
                     &mut compat_faces,
                 )
         });
-        if converted {
+        if converted_compact {
             quads.clear();
             cube_lighting.clear();
             layout = layout.with_compact_faces();
         } else {
-            compat_faces.clear();
+            // Mixed chunks (stairs, overlays, carrier models) cannot use the compact
+            // face-only layout. Fall back to the validated model-ref route, never to the
+            // old cube sampler that reintroduced the block texture bug.
+            let converted_model = template_base.is_some_and(|template_base| {
+                super::compatibility::append_model_faces(
+                    &quads,
+                    &cube_lighting,
+                    visuals.materials(),
+                    template_base,
+                    &mut model_refs,
+                    &mut model_lighting,
+                    &mut model_draw_refs,
+                )
+            });
+            if converted_model {
+                quads.clear();
+                cube_lighting.clear();
+                layout = if compatibility_only {
+                    layout.with_compat_model()
+                } else {
+                    crate::CubeQuadLayout::default()
+                };
+            } else {
+                compat_faces.clear();
+            }
         }
     } else if options.compatibility_model_faces {
         let template_base = u32::try_from(visuals.model_templates().len()).ok();

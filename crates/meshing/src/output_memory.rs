@@ -165,14 +165,17 @@ fn compatibility_cube_bound() -> u64 {
 }
 
 /// One compact compatibility face: header plus four inline light samples. Keep the
-/// reservation at least as large as the cube fallback, because conversion can abort
-/// transactionally and leave the cube stream in place.
+/// reservation at least as large as the cube fallback and the full model-ref fallback,
+/// because mixed chunks and conversion failures can use either route.
 fn compatibility_compact_bound() -> u64 {
     let compact = u64::from(
         u32::try_from(std::mem::size_of::<crate::CompatFace>()).unwrap_or(u32::MAX),
     );
     let cube = bytes::<PackedQuad>(1) + bytes::<PackedQuadLighting>(1);
-    BLOCKS_PER_SUB_CHUNK as u64 * Face::ALL.len() as u64 * compact.max(cube)
+    let model = bytes::<PackedModelRef>(1)
+        + bytes::<PackedQuadLighting>(1)
+        + bytes::<PackedModelDrawRef>(1);
+    BLOCKS_PER_SUB_CHUNK as u64 * Face::ALL.len() as u64 * compact.max(cube).max(model)
 }
 
 /// The cube-quad and cube-lighting portion of [`plain_bound`]. A heavy chunk
