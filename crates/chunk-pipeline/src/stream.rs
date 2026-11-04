@@ -479,6 +479,10 @@ pub struct WorldStream {
     /// radius. The progressive GL path uses this so a server-side publisher update cannot flood
     /// the join with an entire view before the client has asked for it.
     progressive_view: bool,
+    /// Hard cap for the requested radius without the progressive/ANGLE ramp. The DX11 heavy
+    /// path keeps its full-radius join order but must not retain a publisher view larger than
+    /// its legacy-GPU budget.
+    strict_requested_radius: bool,
     last_retention_center: Option<ChunkKey>,
     last_retention_radius: Option<i32>,
     local_player_chunk: Option<ChunkKey>,

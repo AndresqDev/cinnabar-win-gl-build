@@ -299,11 +299,23 @@ impl WorldStream {
         self.request_chunk_retention();
     }
 
+    /// Caps admission and retention at the requested radius without enabling the progressive
+    /// ramp. The DX11 heavy path uses the normal full-radius join but still needs a hard budget
+    /// when a server grant or publisher scope exceeds the requested view.
+    pub fn set_strict_requested_radius(&mut self, enabled: bool) {
+        if self.strict_requested_radius == enabled {
+            return;
+        }
+        self.strict_requested_radius = enabled;
+        self.request_chunk_retention();
+    }
+
     /// The radius retention keeps once the server confirms one: the wider of the server's and the
-    /// player's normally, or the requested radius cap for the progressive client view.
+    /// player's normally, or the requested radius cap for the progressive client view and the
+    /// strict DX11 heavy path.
     pub(super) fn retained_radius(&self) -> Option<i32> {
         self.chunk_radius.map(|server| {
-            if self.progressive_view {
+            if self.progressive_view || self.strict_requested_radius {
                 server.min(self.requested_radius.unwrap_or(0))
             } else {
                 self.requested_radius
@@ -534,7 +546,7 @@ impl WorldStream {
             (Some(radius), None) | (None, Some(radius)) => radius,
             (None, None) => render_api::UNGRANTED_VIEW_RADIUS_CHUNKS,
         };
-        let radius = if self.progressive_view {
+        let radius = if self.progressive_view || self.strict_requested_radius {
             radius.min(self.requested_radius.unwrap_or(0))
         } else {
             radius

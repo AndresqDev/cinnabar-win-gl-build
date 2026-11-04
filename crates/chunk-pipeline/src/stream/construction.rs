@@ -170,6 +170,7 @@ impl WorldStream {
             chunk_radius: None,
             requested_radius: None,
             progressive_view: false,
+            strict_requested_radius: false,
             last_retention_center: None,
             last_retention_radius: None,
             local_player_chunk: None,

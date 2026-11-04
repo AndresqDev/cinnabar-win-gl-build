@@ -115,6 +115,7 @@ pub(crate) fn apply_render_distance(
         if stream.requested_radius() != Some(i32::from(radius)) {
             stream.set_requested_radius(i32::from(radius));
         }
+        stream.set_strict_requested_radius(meshing::compatibility_terrain_enabled());
         let revision = (session, radius);
         if *sent != Some(revision) {
             let packet = protocol::request_chunk_radius_packet(

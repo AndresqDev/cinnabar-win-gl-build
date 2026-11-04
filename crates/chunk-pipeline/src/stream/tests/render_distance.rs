@@ -121,6 +121,26 @@ fn requested_radius_sets_render_distance_whatever_the_server_grants() {
 
 /// Retention keeps the wider radius: what the player asked for beyond a smaller grant, and every
 /// column a larger grant still counts as sent.
+/// The DX11 heavy path uses the normal full-radius join but caps a larger server grant and
+/// publisher scope at the requested radius without enabling the progressive/ANGLE ramp.
+#[test]
+fn strict_requested_radius_caps_a_larger_grant_and_publisher_scope() {
+    let mut stream = stream();
+    stream.set_requested_radius(4);
+    stream.set_strict_requested_radius(true);
+    stream
+        .submit(1, WorldEvent::ChunkRadiusUpdated(10))
+        .expect("admit a larger granted radius");
+    submit_publisher(&mut stream, 2, 160);
+
+    assert_eq!(stream.retained_radius(), Some(4));
+    assert_eq!(stream.active_radius_chunks(), 4);
+
+    stream.set_strict_requested_radius(false);
+    assert_eq!(stream.retained_radius(), Some(10));
+    assert_eq!(stream.active_radius_chunks(), 10);
+}
+
 #[test]
 fn retention_keeps_the_wider_of_the_requested_and_granted_radius() {
     let mut stream = stream();
