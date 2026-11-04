@@ -43,35 +43,47 @@ pub(crate) fn append_model_faces(
     }) {
         return false;
     }
-    let mut next_refs = Vec::with_capacity(model_refs.len() + cube_quads.len());
-    next_refs.extend_from_slice(model_refs);
-    let mut next_lighting = Vec::with_capacity(model_lighting.len() + cube_quads.len());
-    next_lighting.extend_from_slice(model_lighting);
-    let mut next_draws = Vec::with_capacity(opaque_draws.len() + cube_quads.len());
-    next_draws.extend_from_slice(opaque_draws);
+    // Every fallible check has passed. Append in place so an ordinary terrain chunk does not
+    // allocate and copy the carrier model stream three times just to keep the old vectors for a
+    // failure that can no longer happen. Capacity is reserved once; the pushes below only index
+    // records already proven to fit in `u32`.
+    let added = cube_quads.len();
+    let Some(model_ref_end) = model_refs.len().checked_add(added) else {
+        return false;
+    };
+    let Some(lighting_end) = model_lighting.len().checked_add(added) else {
+        return false;
+    };
+    let Some(draw_end) = opaque_draws.len().checked_add(added) else {
+        return false;
+    };
+    if u32::try_from(model_ref_end).is_err()
+        || u32::try_from(lighting_end).is_err()
+        || u32::try_from(draw_end).is_err()
+    {
+        return false;
+    }
+    model_refs.reserve(added);
+    model_lighting.reserve(added);
+    opaque_draws.reserve(added);
     for (quad, lighting) in cube_quads.iter().zip(cube_lighting) {
-        let Ok(model_ref_index) = u32::try_from(next_refs.len()) else {
-            return false;
-        };
-        let Ok(lighting_base_index) = u32::try_from(next_lighting.len()) else {
-            return false;
-        };
+        let model_ref_index = u32::try_from(model_refs.len())
+            .expect("compatibility model-ref range was checked before appending");
+        let lighting_base_index = u32::try_from(model_lighting.len())
+            .expect("compatibility lighting range was checked before appending");
         let template_id = compat_cube_template_id(
             template_base,
             quad.material_id(),
             quad.face().index() as u32,
         );
-        next_refs.push(PackedModelRef::new(
+        model_refs.push(PackedModelRef::new(
             pack_model_transform(quad.origin(), 0),
             template_id,
             lighting_base_index,
             1,
         ));
-        next_lighting.push(*lighting);
-        next_draws.push(PackedModelDrawRef::new(model_ref_index, 0));
+        model_lighting.push(*lighting);
+        opaque_draws.push(PackedModelDrawRef::new(model_ref_index, 0));
     }
-    *model_refs = next_refs;
-    *model_lighting = next_lighting;
-    *opaque_draws = next_draws;
     true
 }

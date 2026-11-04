@@ -94,9 +94,17 @@ impl MeshOutputBounds {
             })
             .max()
             .unwrap_or(0);
-        plain_bound()
-            + self.compatibility_cube
-            + BLOCKS_PER_SUB_CHUNK as u64 * MAX_SELECTED_MODEL_TEMPLATES as u64 * model_bytes
+        // The compatibility conversion is transactional: a chunk emits either the ordinary
+        // cube stream or the synthetic model stream, never both. Reserving both paths at once
+        // overstates every heavy chunk and reduces mesh-worker concurrency. The replacement
+        // bound below is the larger of the two and therefore still covers a conversion that
+        // has to fall back to cubes.
+        let terrain = if self.compatibility_cube == 0 {
+            plain_bound()
+        } else {
+            plain_bound() - plain_cube_bound() + self.compatibility_cube
+        };
+        terrain + BLOCKS_PER_SUB_CHUNK as u64 * MAX_SELECTED_MODEL_TEMPLATES as u64 * model_bytes
     }
 
     /// What `overlays` cell overlays can add to a sub-chunk's mesh: each draws one model.
@@ -138,13 +146,21 @@ fn model_part_bound(quads: u64, offset_prefix: bool) -> u64 {
 
 /// Reserves every exposed cube face rewritten as one model ref, one lighting
 /// record and one draw record. The heavy path emits these instead of the cube
-/// stream, so admission must include both sides of that conversion.
+/// stream, so admission replaces the cube portion of [`plain_bound`] with this.
 fn compatibility_cube_bound() -> u64 {
     BLOCKS_PER_SUB_CHUNK as u64
         * Face::ALL.len() as u64
         * (bytes::<PackedModelRef>(1)
             + bytes::<PackedQuadLighting>(1)
             + bytes::<PackedModelDrawRef>(1))
+}
+
+/// The cube-quad and cube-lighting portion of [`plain_bound`]. A heavy chunk
+/// drops exactly this part when the transactional conversion succeeds.
+fn plain_cube_bound() -> u64 {
+    BLOCKS_PER_SUB_CHUNK as u64
+        * Face::ALL.len() as u64
+        * (bytes::<PackedQuad>(1) + bytes::<PackedQuadLighting>(1))
 }
 
 /// Reserves all cube and liquid faces, plus the largest packed biome descriptor.
@@ -154,11 +170,10 @@ fn plain_bound() -> u64 {
         + bytes::<ModelDrawRefs>(1)
         + bytes::<DiagnosticGeometryCount>(MAX_DIAGNOSTIC_IDENTITIES_PER_MESH as u64)
         + bytes::<u32>(MAX_PACKED_BIOME_RECORD_WORDS as u64)
+        + plain_cube_bound()
         + BLOCKS_PER_SUB_CHUNK as u64
             * Face::ALL.len() as u64
-            * (bytes::<PackedQuad>(1)
-                + bytes::<PackedLiquidQuad>(1)
-                + 2 * bytes::<PackedQuadLighting>(1))
+            * (bytes::<PackedLiquidQuad>(1) + bytes::<PackedQuadLighting>(1))
 }
 
 /// Converts an owned stream length to bytes without depending on wire layout literals.
