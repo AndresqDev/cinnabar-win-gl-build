@@ -16,6 +16,7 @@ use crate::{
 pub struct MeshOutputBounds {
     model_templates: Box<[u64]>,
     fallback_model: u64,
+    compatibility_cube: u64,
 }
 
 impl MeshOutputBounds {
@@ -59,6 +60,11 @@ impl MeshOutputBounds {
         Self {
             model_templates: model_templates.into_boxed_slice(),
             fallback_model,
+            compatibility_cube: if crate::compatibility_terrain_enabled() {
+                compatibility_cube_bound()
+            } else {
+                0
+            },
         }
     }
 
@@ -89,6 +95,7 @@ impl MeshOutputBounds {
             .max()
             .unwrap_or(0);
         plain_bound()
+            + self.compatibility_cube
             + BLOCKS_PER_SUB_CHUNK as u64 * MAX_SELECTED_MODEL_TEMPLATES as u64 * model_bytes
     }
 
@@ -127,6 +134,17 @@ fn model_part_bound(quads: u64, offset_prefix: bool) -> u64 {
             0
         }
         + quads * (bytes::<PackedQuadLighting>(1) + bytes::<PackedModelDrawRef>(1))
+}
+
+/// Reserves every exposed cube face rewritten as one model ref, one lighting
+/// record and one draw record. The heavy path emits these instead of the cube
+/// stream, so admission must include both sides of that conversion.
+fn compatibility_cube_bound() -> u64 {
+    BLOCKS_PER_SUB_CHUNK as u64
+        * Face::ALL.len() as u64
+        * (bytes::<PackedModelRef>(1)
+            + bytes::<PackedQuadLighting>(1)
+            + bytes::<PackedModelDrawRef>(1))
 }
 
 /// Reserves all cube and liquid faces, plus the largest packed biome descriptor.
