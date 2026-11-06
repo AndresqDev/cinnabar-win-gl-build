@@ -1261,7 +1261,9 @@ launches. Native Windows startup, update and crash-restart acceptance remains in
   Intel DX12 drivers older than the `24.x` branch also use direct terrain draws: HD Graphics 520
   with driver `23.20.16.4905` faulted in counted GPU-cull draws and drew no opaque terrain with
   CPU-culled indirect draws. The fallback is unconfirmed on that hardware, and the version bound
-  is from one report.
+  is from one report. Haswell integrated graphics, including the HD 4400, are also pinned to
+  direct terrain draws with CPU face culling; GPU model face culling is disabled and the compact
+  12-byte terrain stream is opt-in. Native HD 4400 acceptance remains open.
   Full-app terrain streaming, shader-pack compatibility and fallback performance acceptance
   remain incomplete across physical devices.
   Android packages the Dragonfly local-world server and resolves it from the APK's native-library

@@ -145,16 +145,18 @@ pub(in crate::chunk) fn install(app: &mut App) {
     };
     let info = adapter.get_info();
     let unstable = gpu_cull_unstable(info.vendor);
-    let forced_cpu = cpu_culling_required(
-        info.vendor,
-        env_compat::var_os(CPU_CULLING_ENV).is_some_and(|value| value != "0"),
-        &device.limits(),
-    );
+    let direct_required = direct_draws_required(&info);
+    let forced_cpu = direct_required
+        || cpu_culling_required(
+            info.vendor,
+            env_compat::var_os(CPU_CULLING_ENV).is_some_and(|value| value != "0"),
+            &device.limits(),
+        );
     let draw_mode = select_chunk_draw_mode(
         adapter.get_downlevel_capabilities().flags,
         device.features(),
         Backends::from(info.backend),
-        direct_draws_required(&info),
+        direct_required,
     );
     let submission = gpu_cull_submission(
         draw_mode,
@@ -170,7 +172,6 @@ pub(in crate::chunk) fn install(app: &mut App) {
         forced_cpu,
         &device.limits(),
     ));
-    let direct_required = direct_draws_required(&info);
     bevy::log::info!(
         ?draw_mode,
         gpu_cull = ?submission,

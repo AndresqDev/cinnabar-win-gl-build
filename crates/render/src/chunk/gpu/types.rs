@@ -587,11 +587,19 @@ pub(in crate::chunk) fn model_direct_draw_commands(
         return Some(vec![full]);
     }
     let facing = meshing::sub_chunk_facing_faces(chunk_origin(allocation.key), camera);
-    let mut runs: Vec<Range<u32>> = layout.solid_runs(facing).collect();
+    let solid_count = layout.solid_len().min(full.instance_count);
+    let mut runs: Vec<Range<u32>> = layout
+        .solid_runs(facing)
+        .filter_map(|run| {
+            let start = run.start.min(solid_count);
+            let end = run.end.min(solid_count);
+            (start < end).then_some(start..end)
+        })
+        .collect();
     // Alpha-tested and two-sided model faces are not part of the directional partition. They
     // remain visible from every side and must always be appended after the solid runs.
-    if layout.solid_len() < full.instance_count {
-        runs.push(layout.solid_len()..full.instance_count);
+    if solid_count < full.instance_count {
+        runs.push(solid_count..full.instance_count);
     }
     Some(
         runs.into_iter()
