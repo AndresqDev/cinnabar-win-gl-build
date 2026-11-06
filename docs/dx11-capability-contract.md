@@ -13,6 +13,8 @@
 | Alcance | `wgpu-hal` DX11 y su integración con Cinnabar |
 | Compilación local | Ninguna; este documento no aprueba una build |
 
+> Límites y fallos específicos del Intel HD 4400: [`intel-hd-4400-dx11-limitations.md`](intel-hd-4400-dx11-limitations.md).
+
 Este documento concreta el contrato de la Puerta 0 del
 [plan de estabilización](dx11-backend-plan.md). El plan lo llama
 `dx11-contract.md`; se usa `dx11-capability-contract.md` para distinguirlo de
