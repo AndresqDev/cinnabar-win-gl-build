@@ -1,4 +1,4 @@
-Cinnabar DX11 c1078b7 - lanzadores por modo
+Cinnabar DX11 - lanzadores por modo
 ============================================
 
 Extrae estos archivos en la misma carpeta que cinnabar.exe.
