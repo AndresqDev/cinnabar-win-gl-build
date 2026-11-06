@@ -207,7 +207,7 @@ Este es el cambio de Cinnabar más sospechoso para la regresión visual:
 1. Detectar Intel Haswell/HD 4400 por `vendor == 0x8086` y nombre/ID de adaptador.
 2. Forzar `ChunkDrawMode::Direct` para esa GPU.
 3. No habilitar GPU culling, `MultiDrawIndirect`, `INDIRECT_FIRST_INSTANCE` ni `MULTI_DRAW_INDIRECT_COUNT`.
-4. Usar CPU frustum culling; opcionalmente CPU face culling si se necesita rendimiento.
+4. Usar CPU frustum culling y CPU face culling para las caras direccionales de modelos.
 5. Registrar en el log qué política se aplicó.
 
 Variables de diagnóstico implementadas:
