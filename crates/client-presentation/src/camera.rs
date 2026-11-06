@@ -8,7 +8,7 @@ use bevy::{
         touch::Touches,
     },
     prelude::*,
-    render::render_resource::TextureUsages,
+    render::{render_resource::TextureUsages, view::NoIndirectDrawing},
     window::{PrimaryWindow, Window},
 };
 use ui::UserSettings;
@@ -124,6 +124,30 @@ fn window_aspect(window: &Window) -> f32 {
     }
 }
 
+/// Whether Bevy's entity renderer must avoid its indirect/GPU-preprocessing path. The DX11
+/// backend and the explicit compatibility switch use CPU preprocessing so entity batching
+/// follows the same well-tested direct path as terrain on the Intel HD 4400.
+fn entity_direct_draws_required() -> bool {
+    let enabled = |value: Option<String>| {
+        value.is_some_and(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+    };
+    let dx11 = |value: Option<String>| {
+        value.is_some_and(|value| {
+            value
+                .split(',')
+                .any(|backend| backend.trim().eq_ignore_ascii_case("dx11"))
+        })
+    };
+    enabled(std::env::var("CINNABAR_FORCE_DIRECT_DRAWS").ok())
+        || enabled(std::env::var("CINNABAR_CPU_CULLING").ok())
+        || dx11(std::env::var("WGPU_BACKEND").ok())
+}
+
 /// Spawns the camera with the selected perspective and portable anti-aliasing.
 pub fn spawn_fly_camera(
     mut commands: Commands,
@@ -156,6 +180,9 @@ pub fn spawn_fly_camera(
             settings.perspective(),
         ),
     ));
+    if entity_direct_draws_required() {
+        entity.insert(NoIndirectDrawing);
+    }
     if settings.smaa_mode() == ui::SmaaMode::Smaa {
         entity.insert(Smaa::default());
     }

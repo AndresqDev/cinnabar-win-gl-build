@@ -68,7 +68,10 @@ fn visible(shape: Shape, origin: vec3<f32>) -> bool {
     if shape.flags.w==ARROW_KIND_VALUEu && shape.data.z*shape.data.z<ARROW_MIN_LENGTH_SQUARED_VALUE { return false; }
     if shape.flags.y!=ALL_DIMENSIONS_VALUEu && shape.flags.y!=frame.dimension { return false; }
     if shape.lifetime.x>=0.0 && frame.epoch+globals.time>=shape.lifetime.x { return false; }
-    if attached(shape) && (shape.flags.z>=arrayLength(&actors) || actors[shape.flags.z].valid==0u) { return false; }
+    if attached(shape) {
+        if shape.flags.z>=arrayLength(&actors) { return false; }
+        if actors[shape.flags.z].valid==0u { return false; }
+    }
     var position=origin;
     if shape.flags.w==BOX_KIND_VALUEu { position-=0.5*(shape.transform[0]+shape.transform[1]+shape.transform[2]).xyz; }
     let delta=position-view.world_position;

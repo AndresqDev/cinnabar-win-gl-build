@@ -81,7 +81,8 @@ use render_model::{
 };
 use {
     crate::{
-        CompatFace, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad, PackedQuadLighting,
+        CompatFace, PackedLiquidQuad, PackedModelDrawRef, PackedModelRef, PackedQuad,
+        PackedQuadLighting,
         atmosphere_render::{AtmosphereGpu, install_atmosphere},
     },
     render_scene::{
@@ -171,11 +172,11 @@ use gpu::types::{
     cutout_indirect_command, depth_liquid_direct_draw_command, depth_liquid_draw_command,
     depth_liquid_mdi_draw_command, diagnostic_draw_mode, direct_draws_required,
     direct_stream_addresses, extracted_camera_identity, gpu_chunk_origin, mdi_stream_addresses,
-    metadata_base_vertex, model_direct_draw_command, model_draw_command, model_mdi_draw_command,
-    model_ref_count_for_witness, opaque_allocation_is_drawable, select_chunk_draw_mode,
-    shared_stream_ranges_disjoint, solid_indirect_commands, stamp_liquid_metadata_index,
-    summarize_model_workload, transparent_liquid_direct_draw_command,
-    transparent_model_direct_draw_command,
+    metadata_base_vertex, model_direct_draw_command, model_direct_draw_commands,
+    model_draw_command, model_mdi_draw_command, model_ref_count_for_witness,
+    opaque_allocation_is_drawable, select_chunk_draw_mode, shared_stream_ranges_disjoint,
+    solid_indirect_commands, stamp_liquid_metadata_index, summarize_model_workload,
+    transparent_liquid_direct_draw_command, transparent_model_direct_draw_command,
 };
 #[allow(unused_imports)]
 use gpu::upload::model_validation::validate_partitioned_model_streams;

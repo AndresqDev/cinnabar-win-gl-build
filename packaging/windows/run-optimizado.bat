@@ -14,14 +14,17 @@ if not exist "%CINNABAR_ASSETS%" (
     exit /b 1
 )
 
-rem Ruta compacta de terreno y cota estricta para DX11.
+rem Ruta estable de modelos completos, draws directos y cota estricta para DX11.
+rem Un lanzador opt-in puede definir estas variables antes de llamar a este archivo.
 set "WGPU_BACKEND=dx11"
 set "WGPU_VALIDATION_INDIRECT_CALL=0"
+set "CINNABAR_FORCE_DIRECT_DRAWS=1"
+set "CINNABAR_CPU_CULLING=1"
 set "CINNABAR_HEAVY_TERRAIN=1"
 set "CINNABAR_STABLE_TERRAIN="
 set "CINNABAR_HEAVY_MAX_RENDER_DISTANCE=4"
-set "CINNABAR_HEAVY_MODEL_TERRAIN=0"
-set "CINNABAR_HEAVY_CUBE_TERRAIN=0"
+if not defined CINNABAR_HEAVY_MODEL_TERRAIN set "CINNABAR_HEAVY_MODEL_TERRAIN=1"
+if not defined CINNABAR_HEAVY_CUBE_TERRAIN set "CINNABAR_HEAVY_CUBE_TERRAIN=0"
 
 rem Sin diagnosticos ni trazas para no penalizar el rendimiento.
 set "CINNABAR_RENDER_DIAGNOSTICS=0"

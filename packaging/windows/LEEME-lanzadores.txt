@@ -6,12 +6,13 @@ No los pongas en una subcarpeta.
 
 Archivos:
 
-  _assets.bat          Ruta del pack de assets compilado.
-  run-optimizado.bat   Ruta compacta, sin diagnosticos, radio 4.
-  run-heavy.bat        Modo pesado, sin trazas.
-  run-heavy-traces.bat Modo pesado, con trazas.
-  run-normal.bat       Modo normal, sin trazas.
-  run-normal-traces.bat Modo normal, con trazas.
+  _assets.bat               Ruta del pack de assets compilado.
+  run-optimizado.bat        Ruta estable de modelos completos, draws directos, radio 4.
+  run-compacto-experimental.bat  Ruta compacta opt-in, solo para pruebas A/B.
+  run-heavy.bat             Modo pesado, sin trazas.
+  run-heavy-traces.bat      Modo pesado, con trazas.
+  run-normal.bat            Modo normal, sin trazas.
+  run-normal-traces.bat     Modo normal, con trazas.
 
 Antes de empezar:
 
@@ -24,14 +25,16 @@ Antes de empezar:
   Tambien puedes ajustar CINNABAR_HEAVY_MAX_RENDER_DISTANCE.
   Por defecto es 4 chunks; 0 desactiva la cota.
 
-Modo pesado:
+Modo pesado y estable:
 
-  - terreno compacto de 12 bytes por cara, sin indirecciones de modelo;
-  - mismo camino de muestreo que las escaleras;
+  - ruta de modelos completa, sin culling GPU ni draws indirectos;
+  - culling direccional de caras en CPU con draws directos;
   - UV locales, sin mipmaps y sin mezclar celdas del atlas;
   - cota estricta de radio en DX11, sin activar la carga progresiva de ANGLE;
-  - si aparece un problema, fuerza el camino de modelos completo ya validado:
-      CINNABAR_HEAVY_MODEL_TERRAIN=1
+  - `CINNABAR_FORCE_DIRECT_DRAWS=1` y `CINNABAR_CPU_CULLING=1` ya estan activos;
+  - el camino compacto de 12 bytes por cara queda opt-in:
+      run-compacto-experimental.bat
+    No se debe publicar como estable hasta validarlo en la HD 4400 nativa;
   - experimento opcional de cubos+greedy, solo para comparar:
       CINNABAR_HEAVY_CUBE_TERRAIN=1
 

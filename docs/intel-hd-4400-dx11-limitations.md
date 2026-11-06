@@ -3,7 +3,7 @@
 | Campo | Valor |
 | --- | --- |
 | Fecha | 2026-11-06 |
-| Estado | Investigación para corrección; no aprueba una build ni una release |
+| Estado | Corrección implementada en la rama; pendiente de build CI y validación nativa |
 | Objetivo | Documentar lo que el HD 4400 no soporta o soporta mal, los fallos conocidos que afectan a Cinnabar y las correcciones necesarias en la ruta DX11 |
 | Alcance | Intel HD Graphics 4400 (Haswell GT2), Windows nativo, Linux/Mesa y Wine/Proton/DXVK |
 | Documento relacionado | [`dx11-capability-contract.md`](dx11-capability-contract.md) |
@@ -210,20 +210,27 @@ Este es el cambio de Cinnabar más sospechoso para la regresión visual:
 4. Usar CPU frustum culling; opcionalmente CPU face culling si se necesita rendimiento.
 5. Registrar en el log qué política se aplicó.
 
-Propuesta de variable de diagnóstico:
+Variables de diagnóstico implementadas:
 
 ```text
 CINNABAR_FORCE_DIRECT_DRAWS=1
+CINNABAR_CPU_CULLING=1
 ```
 
-Y política automática para `Intel HD Graphics 4400`/Haswell.
+La política automática reconoce Intel Haswell/HD 4400 por nombre y por los IDs PCI Haswell (`0x0A16` para la HD 4400). El resultado se registra al arrancar con `terrain draw path`, incluyendo backend, adaptador y `draw_mode`. `CINNABAR_CPU_CULLING=1` también fuerza draws directos: no tiene sentido hacer culling en CPU y enviar el resultado por un camino indirecto.
+
+La cámara también inserta `NoIndirectDrawing` cuando se usa DX11 o cualquiera de esas variables, de modo que las entidades de Bevy usan preprocesado CPU en lugar de indirect.
 
 ### 5.2 Culling de modelos
 
-- Desactivar `compat_model`/`compact_faces` en el `CullRecord` para Intel.
-- Mantener el draw completo de las referencias de modelo.
-- Si se quiere recuperar rendimiento, implementar culling de caras **en CPU** con rangos validados y un solo draw por rango; no depender del compute/indirect.
-- No marcar `model_compat` si el backend no tiene culling GPU validado.
+Implementado:
+
+- el `CullRecord` de GPU ya no marca `model_compat` ni `model_solid_ends`; el modelo se dibuja completo si el culling GPU se usa en otra GPU;
+- la ruta directa de modelos aplica **culling direccional de caras en CPU** con `CubeQuadLayout::solid_runs`, y emite uno o varios draws directos;
+- las caras alpha-tested/two-sided se añaden siempre como cola visible;
+- no se usa `MultiDrawIndirect`, ni compute shader de culling, ni `INDIRECT_FIRST_INSTANCE` en la ruta Intel.
+
+El compacto sigue siendo opt-in (`CINNABAR_HEAVY_MODEL_TERRAIN=0` y `CINNABAR_HEAVY_CUBE_TERRAIN=0`). La ruta estable del lanzador usa modelos completos.
 
 ### 5.3 Shaders
 

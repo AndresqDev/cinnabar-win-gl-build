@@ -225,14 +225,9 @@ pub(in crate::chunk) fn cull_record(
     }
     if let Some(draw) = model_mdi_draw_command(allocation) {
         source.model = draw.first_instance..draw.first_instance + draw.instance_count;
-        if allocation.quad_range.is_empty()
-            && (allocation.cube_layout.is_compat_model()
-                || allocation.cube_layout.is_compact_faces())
-        {
-            source.model_solid_ends = CubeQuadLayout::SOLID_FACE_ORDER
-                .map(|face| allocation.cube_layout.solid_range(face).end);
-            source.model_compat = true;
-        }
+        // Model face culling is intentionally CPU-only. Keep the whole model span in the GPU
+        // cull record so a driver that mishandles the model cull kernel can never hide faces.
+        // The direct model draw path applies camera-facing face runs itself.
         include(MODEL_BOUNDS);
     }
     if let Some(draw) = depth_liquid_mdi_draw_command(allocation) {

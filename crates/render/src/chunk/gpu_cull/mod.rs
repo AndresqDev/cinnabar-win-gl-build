@@ -170,12 +170,16 @@ pub(in crate::chunk) fn install(app: &mut App) {
         forced_cpu,
         &device.limits(),
     ));
+    let direct_required = direct_draws_required(&info);
     bevy::log::info!(
         ?draw_mode,
         gpu_cull = ?submission,
         direct_occlusion = direct.0,
         forced_cpu,
         gpu_cull_unstable = unstable,
+        direct_required,
+        backend = ?info.backend,
+        adapter = %info.name,
         "terrain draw path"
     );
     render_app

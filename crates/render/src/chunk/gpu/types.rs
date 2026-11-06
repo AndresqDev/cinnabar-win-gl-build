@@ -149,15 +149,69 @@ const INTEL_VENDOR_ID: u32 = 0x8086;
 /// HD Graphics 520 with `23.20.16.4905` faulted in the counted GPU-cull draws and drew no
 /// opaque terrain with CPU-culled indirect draws.
 const INTEL_DX12_INDIRECT_DRIVER_MAJOR: u32 = 24;
+/// Forces direct terrain draws for diagnostics and for adapters whose indirect path is not
+/// stable. Entity preprocessing is switched by the camera implementation.
+const FORCE_DIRECT_DRAWS_ENV: &str = "CINNABAR_FORCE_DIRECT_DRAWS";
+/// CPU culling is only meaningful when the matching draw path is direct, so requesting it
+/// also opts out of GPU culling and indirect submission.
+const CPU_CULLING_ENV: &str = "CINNABAR_CPU_CULLING";
 
-/// Keeps Apple expansion costs, proprietary Adreno Vulkan failures and legacy Intel DX12
-/// driver failures on direct terrain draws.
+/// Keeps Apple expansion costs, proprietary Adreno Vulkan failures, legacy Intel DX12
+/// driver failures and Haswell Intel integrated GPUs on direct terrain draws.
 pub(in crate::chunk) fn direct_draws_required(info: &wgpu::AdapterInfo) -> bool {
-    apple_gpu_identity(info.vendor, &info.driver, &info.name)
+    force_direct_draws()
+        || cpu_culling_requested()
+        || apple_gpu_identity(info.vendor, &info.driver, &info.name)
         || (info.backend == wgpu::Backend::Vulkan
             && info.vendor == QUALCOMM_VENDOR_ID
             && info.driver == QUALCOMM_VULKAN_DRIVER)
         || legacy_intel_dx12_driver(info)
+        || intel_haswell_integrated(info)
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Reads the explicit diagnostic escape hatch without making indirect/indirect-count
+/// behaviour depend on an unknown driver feature.
+fn force_direct_draws() -> bool {
+    env_truthy(FORCE_DIRECT_DRAWS_ENV)
+}
+
+fn cpu_culling_requested() -> bool {
+    env_truthy(CPU_CULLING_ENV)
+}
+
+/// Haswell integrated graphics have documented incomplete Vulkan support and a history of
+/// indirect/MDI misrendering. The HD 4400 is the primary compatibility target; matching the
+/// family also keeps the closely related Haswell parts on the same conservative route.
+fn intel_haswell_integrated(info: &wgpu::AdapterInfo) -> bool {
+    if info.vendor != INTEL_VENDOR_ID {
+        return false;
+    }
+    // Haswell mobile/desktop GT1-GT3 PCI IDs. The HD 4400 is 0x0A16; keep its close relatives
+    // on the same path because the driver and Vulkan limitations are shared.
+    const HASWELL_DEVICE_IDS: &[u32] = &[
+        0x0402, 0x0412, 0x0416, 0x041E, 0x0422, 0x0426, 0x042A, 0x042E, 0x0A02, 0x0A06, 0x0A0E,
+        0x0A12, 0x0A16, 0x0A1E, 0x0A22, 0x0A26, 0x0A2A, 0x0A2E, 0x0A32, 0x0A36, 0x0D02, 0x0D06,
+        0x0D0E, 0x0D12, 0x0D16, 0x0D1A, 0x0D1E, 0x0D22, 0x0D26,
+    ];
+    if HASWELL_DEVICE_IDS.contains(&info.device) {
+        return true;
+    }
+    let name = info.name.to_ascii_lowercase();
+    name.contains("hd graphics 4400")
+        || name.contains("hd graphics 4600")
+        || name.contains("hd graphics 5000")
+        || name.contains("iris graphics 5100")
+        || name.contains("iris pro graphics 5200")
+        || name.contains("haswell")
 }
 
 /// Recognizes a DX12 Intel adapter whose dotted driver version predates the `24.x` branch.
@@ -216,6 +270,18 @@ mod direct_draw_tests {
         }
     }
 
+    fn named_adapter(
+        name: &str,
+        vendor: u32,
+        backend: wgpu::Backend,
+        driver: &str,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.into(),
+            ..adapter(vendor, backend, driver)
+        }
+    }
+
     #[test]
     fn proprietary_adreno_vulkan_preserves_terrain_with_direct_draws() {
         let flags = DownlevelFlags::BASE_VERTEX | DownlevelFlags::INDIRECT_EXECUTION;
@@ -258,6 +324,39 @@ mod direct_draw_tests {
                 "{driver}",
             );
         }
+    }
+
+    #[test]
+    fn haswell_hd_4400_draws_terrain_directly() {
+        let flags = DownlevelFlags::BASE_VERTEX | DownlevelFlags::INDIRECT_EXECUTION;
+        let features =
+            WgpuFeatures::INDIRECT_FIRST_INSTANCE | WgpuFeatures::MULTI_DRAW_INDIRECT_COUNT;
+        for name in [
+            "Intel(R) HD Graphics 4400 (HSW GT2)",
+            "Intel HD Graphics 4600",
+            "Intel(R) Iris(TM) Pro Graphics 5200",
+        ] {
+            let info = named_adapter(name, INTEL_VENDOR_ID, wgpu::Backend::Dx11, "31.0.101.2135");
+            assert!(direct_draws_required(&info), "{name}");
+            assert_eq!(
+                select_chunk_draw_mode(
+                    flags,
+                    features,
+                    Backends::DX11,
+                    direct_draws_required(&info)
+                ),
+                ChunkDrawMode::Direct,
+                "{name}",
+            );
+        }
+        let mut info = named_adapter(
+            "Intel(R) HD Graphics Family",
+            INTEL_VENDOR_ID,
+            wgpu::Backend::Dx11,
+            "31.0.101.2135",
+        );
+        info.device = 0x0A16;
+        assert!(direct_draws_required(&info));
     }
 
     #[test]
@@ -463,6 +562,48 @@ pub(in crate::chunk) fn model_direct_draw_command(
         return compat_model_draw_command(allocation);
     }
     model_draw_command(allocation, direct_stream_addresses(allocation))
+}
+
+/// Direct draw commands for the model faces that can face `camera`.
+///
+/// This is the model equivalent of [`solid_indirect_commands`]: the camera-facing face runs
+/// are selected on the CPU and each run is submitted as a normal direct draw. It deliberately
+/// does not depend on GPU culling, multi-draw-indirect or `INDIRECT_FIRST_INSTANCE`. A missing
+/// camera or a layout without a compatibility face partition keeps the previous full draw.
+pub(in crate::chunk) fn model_direct_draw_commands(
+    allocation: &GpuChunkAllocation,
+    camera: Option<[f64; 3]>,
+) -> Option<Vec<DrawIndexedIndirectArgs>> {
+    let full = if allocation.cube_layout.is_compact_faces() {
+        compat_model_draw_command(allocation)?
+    } else {
+        model_draw_command(allocation, direct_stream_addresses(allocation))?
+    };
+    let Some(camera) = camera else {
+        return Some(vec![full]);
+    };
+    let layout = allocation.cube_layout;
+    if !layout.is_compact_faces() && !layout.is_compat_model() {
+        return Some(vec![full]);
+    }
+    let facing = meshing::sub_chunk_facing_faces(chunk_origin(allocation.key), camera);
+    let mut runs: Vec<Range<u32>> = layout.solid_runs(facing).collect();
+    // Alpha-tested and two-sided model faces are not part of the directional partition. They
+    // remain visible from every side and must always be appended after the solid runs.
+    if layout.solid_len() < full.instance_count {
+        runs.push(layout.solid_len()..full.instance_count);
+    }
+    Some(
+        runs.into_iter()
+            .map(|run| DrawIndexedIndirectArgs {
+                index_count: MODEL_INDEX_COUNT,
+                instance_count: run.end - run.start,
+                first_index: 0,
+                base_vertex: full.base_vertex,
+                first_instance: full.first_instance + run.start,
+            })
+            .collect(),
+    )
 }
 
 pub(in crate::chunk) fn model_mdi_draw_command(

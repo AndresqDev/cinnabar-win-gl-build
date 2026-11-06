@@ -52,28 +52,32 @@ pub fn compatibility_terrain_enabled() -> bool {
     })
 }
 
-/// The full model-ref path remains available as an explicit fallback. It is selected when
-/// `CINNABAR_HEAVY_MODEL_TERRAIN` is truthy.
+fn env_flag(name: &str) -> Option<bool> {
+    std::env::var_os(name).map(|value| {
+        !matches!(
+            value.to_string_lossy().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// The full model-ref path is the stable heavy-terrain default. It is explicitly disabled with
+/// `CINNABAR_HEAVY_MODEL_TERRAIN=0`, which opts into the compact compatibility stream.
 #[must_use]
 pub fn compatibility_model_faces_enabled() -> bool {
     compatibility_terrain_enabled()
         && !compatibility_cube_terrain_enabled()
-        && std::env::var("CINNABAR_HEAVY_MODEL_TERRAIN").is_ok_and(|value| {
-            !matches!(
-                value.to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "off" | "no"
-            )
-        })
+        && env_flag("CINNABAR_HEAVY_MODEL_TERRAIN").unwrap_or(true)
 }
 
-/// The compact compatibility path: one 12-byte compat face per exposed cube face, with no
-/// model draw-ref or model-lighting indirection. This is the default heavy terrain route;
-/// the full model-ref path can be forced with `CINNABAR_HEAVY_MODEL_TERRAIN=1`.
+/// The compact compatibility path is opt-in: one 12-byte compat face per exposed cube face,
+/// with no model draw-ref or model-lighting indirection. Set
+/// `CINNABAR_HEAVY_MODEL_TERRAIN=0` until it passes native HD 4400 validation.
 #[must_use]
 pub fn compatibility_compact_faces_enabled() -> bool {
     compatibility_terrain_enabled()
         && !compatibility_cube_terrain_enabled()
-        && !compatibility_model_faces_enabled()
+        && env_flag("CINNABAR_HEAVY_MODEL_TERRAIN") == Some(false)
 }
 
 /// Opt-in for the lighter cube+greedy path. It is not enabled by default because the old

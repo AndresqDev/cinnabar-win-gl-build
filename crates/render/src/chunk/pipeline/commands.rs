@@ -1,3 +1,5 @@
+use bevy::ecs::query::Has;
+
 use crate::chunk::transparent::liquid::{
     transparent_frame_draw_for_range, transparent_frame_draws,
 };
@@ -551,12 +553,17 @@ impl<P: PhaseItem> RenderCommand<P> for DrawPackedModel {
         SRes<ActiveFrameProbe>,
         SRes<ActiveVisibilityFrameProbe>,
     );
-    type ViewQuery = OpaqueChunkViewQuery;
+    type ViewQuery = (
+        Entity,
+        Read<ViewUniformOffset>,
+        Read<ExtractedView>,
+        Has<render_scene::EnhancedRendering>,
+    );
     type ItemQuery = Read<GpuChunkAllocation>;
 
     fn render<'w>(
         item: &P,
-        (view_entity, view_offset): ROQueryItem<'w, '_, Self::ViewQuery>,
+        (view_entity, view_offset, view, enhanced): ROQueryItem<'w, '_, Self::ViewQuery>,
         allocation: Option<ROQueryItem<'w, '_, Self::ItemQuery>>,
         (arena, frame_probe, visibility_probe): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
@@ -574,17 +581,20 @@ impl<P: PhaseItem> RenderCommand<P> for DrawPackedModel {
         if !frame_probe.accepts(item.entity(), identity) {
             return RenderCommandResult::Skip;
         }
-        let Some(draw) = model_direct_draw_command(allocation) else {
+        let camera = super::solid::solid_cull_camera(view, enhanced);
+        let Some(draws) = model_direct_draw_commands(allocation, camera) else {
             return RenderCommandResult::Skip;
         };
         pass.set_bind_group(0, bind_group, &[view_offset.offset]);
         pass.set_index_buffer(arena.model_index_buffer.slice(..), IndexFormat::Uint32);
         pass.set_vertex_buffer(0, arena.vertex_offset_buffer.slice(..));
-        pass.draw_indexed(
-            draw.first_index..draw.first_index + draw.index_count,
-            draw.base_vertex,
-            draw.first_instance..draw.first_instance + draw.instance_count,
-        );
+        for draw in draws {
+            pass.draw_indexed(
+                draw.first_index..draw.first_index + draw.index_count,
+                draw.base_vertex,
+                draw.first_instance..draw.first_instance + draw.instance_count,
+            );
+        }
         frame_probe.record_direct_streams(item.entity(), identity, ChunkStreamMask::MODEL);
         record_visibility_direct_submission(
             visibility_probe.into_inner(),

@@ -394,7 +394,11 @@ fn model_corner_position(quad: ModelQuad, corner: u32) -> vec3<f32> {
 fn model_quad_within_tile(quad: ModelQuad) -> bool {
     var within = true;
     for (var component = 0u; component < 8u; component += 1u) {
-        within = within && packed_u16(quad.template_quad_base + 6u, component) <= 4096u;
+        // Keep the shader-safe nested form: the Intel Naga bug can evaluate the right-hand
+        // side of && even after `within` becomes false.
+        if (within) {
+            within = packed_u16(quad.template_quad_base + 6u, component) <= 4096u;
+        }
     }
     return within;
 }
